@@ -1,0 +1,77 @@
+"""Public package-2C close-gate and lease API."""
+
+from matrix_auto_cutter.phase2.close_gate.contracts import (
+    CloseGateBusy,
+    CloseGateCancelled,
+    CloseGateClosed,
+    CloseGateDeletePending,
+    CloseGateDiagnostic,
+    CloseGateDisappeared,
+    CloseGateErrorCategory,
+    CloseGateErrorCode,
+    CloseGateFailure,
+    CloseGateInaccessible,
+    CloseGateResult,
+    CloseGateUnknownWin32Error,
+    CloseGateUnstable,
+    CloseGateUnsupported,
+    RecheckCancelled,
+    RecheckClosed,
+    RecheckDeletePending,
+    RecheckOk,
+    RecheckResult,
+    RecheckUnknownWin32Error,
+    RecheckUnstable,
+    RecheckUnsupported,
+)
+from matrix_auto_cutter.phase2.close_gate.gate import run_close_gate
+from matrix_auto_cutter.phase2.close_gate.lease import CloseGateLease
+from matrix_auto_cutter.phase2.close_gate.waiting import (
+    MINIMUM_STABILITY_INTERVAL_SECONDS,
+    SystemWaitClock,
+    WaitClockPort,
+)
+from matrix_auto_cutter.phase2.close_gate.win32_native import NativeCloseGateWin32Port
+from matrix_auto_cutter.phase2.close_gate.win32_port import (
+    ERROR_DELETE_PENDING,
+    ERROR_INVALID_HANDLE,
+    STATUS_DELETE_PENDING,
+    CloseGateWin32Failure,
+    CloseGateWin32Port,
+)
+
+__all__ = [
+    "ERROR_DELETE_PENDING",
+    "ERROR_INVALID_HANDLE",
+    "MINIMUM_STABILITY_INTERVAL_SECONDS",
+    "STATUS_DELETE_PENDING",
+    "CloseGateBusy",
+    "CloseGateCancelled",
+    "CloseGateClosed",
+    "CloseGateDeletePending",
+    "CloseGateDiagnostic",
+    "CloseGateDisappeared",
+    "CloseGateErrorCategory",
+    "CloseGateErrorCode",
+    "CloseGateFailure",
+    "CloseGateInaccessible",
+    "CloseGateLease",
+    "CloseGateResult",
+    "CloseGateUnknownWin32Error",
+    "CloseGateUnstable",
+    "CloseGateUnsupported",
+    "CloseGateWin32Failure",
+    "CloseGateWin32Port",
+    "NativeCloseGateWin32Port",
+    "RecheckCancelled",
+    "RecheckClosed",
+    "RecheckDeletePending",
+    "RecheckOk",
+    "RecheckResult",
+    "RecheckUnknownWin32Error",
+    "RecheckUnstable",
+    "RecheckUnsupported",
+    "SystemWaitClock",
+    "WaitClockPort",
+    "run_close_gate",
+]
