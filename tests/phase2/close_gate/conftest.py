@@ -143,6 +143,14 @@ class FakeCloseGatePort(FakePort):
         key, _ = self.handles[handle.value]
         return Win32Ok(self.delete_pending_override or self.nodes[key].delete_pending)
 
+    def set_file_offset(self, handle: OwnedHandle, offset: int) -> Win32Result[int]:
+        failed = self._error("SetFilePointerEx")
+        if failed is not None:
+            return failed
+        key, _ = self.handles[handle.value]
+        self.handles[handle.value] = (key, offset)
+        return Win32Ok(offset)
+
 
 def make_source(
     port: FakeCloseGatePort,

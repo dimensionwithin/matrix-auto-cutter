@@ -29,6 +29,7 @@ class CloseGateWin32Port(Win32Port, Protocol):
     """The package-2A port plus reliable handle-bound delete-pending evidence."""
 
     query_delete_pending: Callable[[OwnedHandle], Win32Result[bool]]
+    set_file_offset: Callable[[OwnedHandle, int], Win32Result[int]]
 
 
 def ntstatus_from_failure(error: Win32Failure) -> int | None:

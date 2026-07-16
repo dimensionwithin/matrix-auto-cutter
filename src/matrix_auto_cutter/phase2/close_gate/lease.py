@@ -51,7 +51,7 @@ from matrix_auto_cutter.phase2.snapshots import (
     SameInstanceUnchanged,
     compare_snapshots,
 )
-from matrix_auto_cutter.phase2.win32_port import OwnedHandle, Win32Err
+from matrix_auto_cutter.phase2.win32_port import OwnedHandle, Win32Err, Win32Result
 
 _LEASE_ISSUER_SEAL: Final = object()
 
@@ -274,7 +274,58 @@ class _LeaseRecord:
     condition: Condition = field(default_factory=lambda: Condition(Lock()))
     state: str = "open"
     active_rechecks: int = 0
+    io_active: bool = False
     close_diagnostics: tuple[CloseGateDiagnostic, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _LeaseIoUnavailable:
+    """Internal fail-closed reason for an unavailable lease I/O session."""
+
+    reason: str
+
+
+class _LeaseIoSession:
+    """Short-lived exclusive I/O facade that never exposes the raw source handle."""
+
+    __slots__ = ("_active", "_lease", "_record")
+
+    def __init__(self, lease: CloseGateLease, record: _LeaseRecord) -> None:
+        self._lease = lease
+        self._record = record
+        self._active = True
+
+    def _require_active(self) -> OwnedHandle:
+        if not self._active:
+            raise RuntimeError("lease I/O session is no longer active")
+        source = self._record.resources.source_handle
+        if source is None or source.closed:
+            raise RuntimeError("lease source handle is unavailable")
+        return source
+
+    def position(self, offset: int) -> Win32Result[int]:
+        """Position the same held handle without exposing it to package 2D."""
+        return self._record.port.set_file_offset(self._require_active(), offset)
+
+    def read(self, maximum_bytes: int) -> Win32Result[bytes]:
+        """Read a caller-bounded block from the same held handle."""
+        return self._record.port.read_file(self._require_active(), maximum_bytes)
+
+    def recheck(self, cancellation: CancellationToken) -> RecheckResult:
+        """Use the existing authenticated lease recheck while this session is active."""
+        self._require_active()
+        return _LEASE_AUTHORITY.recheck(self._lease, cancellation)
+
+    def commit(self, cancellation: CancellationToken) -> bool:
+        """Linearize successful I/O publication against close and cancellation."""
+        self._require_active()
+        with self._record.condition:
+            if self._record.state != "open" or not self._record.io_active:
+                return False
+            return cancellation.begin_irreversible_commit() is not None
+
+    def _deactivate(self) -> None:
+        self._active = False
 
 
 def _closed_failure() -> CloseGateFailure:
@@ -364,6 +415,36 @@ class _LeaseAuthorityRegistry:
             return False
         with record.condition:
             return record.state == "open"
+
+    def run_io[IoResultT](
+        self,
+        lease: CloseGateLease,
+        cancellation: CancellationToken,
+        operation: Callable[[_LeaseIoSession], IoResultT],
+    ) -> IoResultT | _LeaseIoUnavailable:
+        """Run one exclusive same-handle I/O operation under lease authority."""
+        record = self._record(lease)
+        if record is None:
+            return _LeaseIoUnavailable("lease_not_authorized")
+        with record.condition:
+            if record.state != "open":
+                return _LeaseIoUnavailable("lease_closed")
+            if cancellation.is_cancelled:
+                return _LeaseIoUnavailable("cancelled")
+            source = record.resources.source_handle
+            if source is None or source.closed:
+                return _LeaseIoUnavailable("source_handle_unavailable")
+            if record.io_active:
+                return _LeaseIoUnavailable("lease_io_already_active")
+            record.io_active = True
+        session = _LeaseIoSession(lease, record)
+        try:
+            return operation(session)
+        finally:
+            session._deactivate()
+            with record.condition:
+                record.io_active = False
+                record.condition.notify_all()
 
     def recheck(self, lease: CloseGateLease, cancellation: CancellationToken) -> RecheckResult:
         record = self._record(lease)
@@ -478,7 +559,7 @@ class _LeaseAuthorityRegistry:
                 record.condition.wait()
             if not first_closer:
                 return record.close_diagnostics
-            while record.active_rechecks:
+            while record.active_rechecks or record.io_active:
                 record.condition.wait()
         diagnostics = record.resources.close()
         with record.condition:
@@ -514,3 +595,12 @@ def _issue_close_gate_lease(
         s2,
         lease_id_factory=lease_id_factory,
     )
+
+
+def _run_lease_io[IoResultT](
+    lease: CloseGateLease,
+    cancellation: CancellationToken,
+    operation: Callable[[_LeaseIoSession], IoResultT],
+) -> IoResultT | _LeaseIoUnavailable:
+    """Run an authenticated exclusive lease-handle I/O callback."""
+    return _LEASE_AUTHORITY.run_io(lease, cancellation, operation)
