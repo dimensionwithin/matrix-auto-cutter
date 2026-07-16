@@ -1,0 +1,41 @@
+"""Media-profile public re-exports live in :mod:`contracts`."""
+
+from matrix_auto_cutter.phase2.probe.contracts import (
+    CanonicalJsonArray,
+    CanonicalJsonObject,
+    Disposition,
+    ExactTime,
+    FinalizedStreamSelection,
+    FormatProfile,
+    MediaProfile,
+    MediaStream,
+    ProbeDiagnosticProfile,
+    ProgramProfile,
+    Rational,
+    RotationEvidence,
+    SideData,
+    StreamSelectionStatus,
+    StreamType,
+    TagProjection,
+    TagProjectionStatus,
+)
+
+__all__ = [
+    "CanonicalJsonArray",
+    "CanonicalJsonObject",
+    "Disposition",
+    "ExactTime",
+    "FinalizedStreamSelection",
+    "FormatProfile",
+    "MediaProfile",
+    "MediaStream",
+    "ProbeDiagnosticProfile",
+    "ProgramProfile",
+    "Rational",
+    "RotationEvidence",
+    "SideData",
+    "StreamSelectionStatus",
+    "StreamType",
+    "TagProjection",
+    "TagProjectionStatus",
+]
