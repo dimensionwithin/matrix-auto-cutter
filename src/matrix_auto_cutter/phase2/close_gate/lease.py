@@ -274,7 +274,9 @@ class _LeaseRecord:
     condition: Condition = field(default_factory=lambda: Condition(Lock()))
     state: str = "open"
     active_rechecks: int = 0
+    active_usages: int = 0
     io_active: bool = False
+    close_requested: bool = False
     close_diagnostics: tuple[CloseGateDiagnostic, ...] = ()
 
 
@@ -283,6 +285,48 @@ class _LeaseIoUnavailable:
     """Internal fail-closed reason for an unavailable lease I/O session."""
 
     reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class _LeaseUsageUnavailable:
+    """Internal fail-closed reason for an unavailable integration usage."""
+
+    reason: str
+
+
+class _LeaseUsageSession:
+    """Handle-free long-lived lease usage for package integration."""
+
+    __slots__ = ("_active", "_lease", "_record")
+
+    def __init__(self, lease: CloseGateLease, record: _LeaseRecord) -> None:
+        self._lease = lease
+        self._record = record
+        self._active = True
+
+    def _require_active(self) -> None:
+        if not self._active:
+            raise RuntimeError("lease integration usage is no longer active")
+
+    def recheck(self, cancellation: CancellationToken) -> RecheckResult:
+        """Measure through the existing authenticated same-handle recheck."""
+        self._require_active()
+        return _LEASE_AUTHORITY.recheck(self._lease, cancellation)
+
+    def commit(self, cancellation: CancellationToken) -> bool:
+        """Order the integration commit against close and cancellation."""
+        self._require_active()
+        with self._record.condition:
+            if (
+                self._record.state != "open"
+                or self._record.close_requested
+                or self._record.active_usages <= 0
+            ):
+                return False
+            return cancellation.begin_irreversible_commit() is not None
+
+    def _deactivate(self) -> None:
+        self._active = False
 
 
 class _LeaseIoSession:
@@ -446,6 +490,49 @@ class _LeaseAuthorityRegistry:
                 record.io_active = False
                 record.condition.notify_all()
 
+    def run_usage[UsageResultT](
+        self,
+        lease: CloseGateLease,
+        project_id: str,
+        cancellation: CancellationToken,
+        operation: Callable[[_LeaseUsageSession], UsageResultT],
+    ) -> UsageResultT | _LeaseUsageUnavailable:
+        """Hold every gate ownership live across one complete integration operation."""
+        record = self._record(lease)
+        if record is None:
+            return _LeaseUsageUnavailable("lease_not_authorized")
+        with record.condition:
+            resources = record.resources
+            project_lock = resources.project_lock
+            path_lock = resources.path_lock
+            ownership = resources.source_ownership
+            source = resources.source_handle
+            if record.state != "open" or record.close_requested:
+                return _LeaseUsageUnavailable("lease_closed")
+            if cancellation.is_cancelled:
+                return _LeaseUsageUnavailable("cancelled")
+            if project_lock is None or not project_lock.held or project_lock.key != project_id:
+                return _LeaseUsageUnavailable("project_ownership_unavailable")
+            if path_lock is None or not path_lock.held:
+                return _LeaseUsageUnavailable("path_ownership_unavailable")
+            if (
+                ownership is None
+                or ownership.handle.closed
+                or ownership.key != f"{lease.volume_id}-{lease.file_id}"
+            ):
+                return _LeaseUsageUnavailable("source_ownership_unavailable")
+            if source is None or source.closed:
+                return _LeaseUsageUnavailable("source_handle_unavailable")
+            record.active_usages += 1
+        session = _LeaseUsageSession(lease, record)
+        try:
+            return operation(session)
+        finally:
+            session._deactivate()
+            with record.condition:
+                record.active_usages -= 1
+                record.condition.notify_all()
+
     def recheck(self, lease: CloseGateLease, cancellation: CancellationToken) -> RecheckResult:
         record = self._record(lease)
         if record is None:
@@ -552,19 +639,23 @@ class _LeaseAuthorityRegistry:
             raise TypeError("lease was not issued by this close-gate authority")
         first_closer = False
         with record.condition:
-            if record.state == "open":
-                record.state = "closing"
+            if record.state == "open" and not record.close_requested:
                 first_closer = True
-            while not first_closer and record.state == "closing":
+                record.close_requested = True
+                while record.active_usages:
+                    record.condition.wait()
+                record.state = "closing"
+            while not first_closer and (record.close_requested or record.state == "closing"):
                 record.condition.wait()
             if not first_closer:
                 return record.close_diagnostics
-            while record.active_rechecks or record.io_active:
+            while record.active_rechecks or record.io_active or record.active_usages:
                 record.condition.wait()
         diagnostics = record.resources.close()
         with record.condition:
             record.close_diagnostics = diagnostics
             record.state = "closed"
+            record.close_requested = False
             object.__setattr__(lease, "_close_result", diagnostics)
             record.condition.notify_all()
         with self._lock:
@@ -604,3 +695,13 @@ def _run_lease_io[IoResultT](
 ) -> IoResultT | _LeaseIoUnavailable:
     """Run an authenticated exclusive lease-handle I/O callback."""
     return _LEASE_AUTHORITY.run_io(lease, cancellation, operation)
+
+
+def _run_lease_usage[UsageResultT](
+    lease: CloseGateLease,
+    project_id: str,
+    cancellation: CancellationToken,
+    operation: Callable[[_LeaseUsageSession], UsageResultT],
+) -> UsageResultT | _LeaseUsageUnavailable:
+    """Run a handle-free integration callback while all lease ownership remains live."""
+    return _LEASE_AUTHORITY.run_usage(lease, project_id, cancellation, operation)
