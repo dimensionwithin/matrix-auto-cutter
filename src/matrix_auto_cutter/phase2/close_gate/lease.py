@@ -325,6 +325,23 @@ class _LeaseUsageSession:
                 return False
             return cancellation.begin_irreversible_commit() is not None
 
+    def run_project_locked[ResultT](
+        self,
+        operation: Callable[[ProjectLockLease], ResultT],
+    ) -> ResultT:
+        """Run a private callback with the already-held authentic Project Lock."""
+        self._require_active()
+        with self._record.condition:
+            project_lock = self._record.resources.project_lock
+            if project_lock is None or not project_lock.held:
+                raise RuntimeError("project ownership is unavailable")
+        return operation(project_lock)
+
+    def matches_port(self, port: object) -> bool:
+        """Return whether this usage belongs to the exact supplied OS adapter."""
+        self._require_active()
+        return self._record.port is port
+
     def _deactivate(self) -> None:
         self._active = False
 

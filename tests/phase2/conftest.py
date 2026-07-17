@@ -204,6 +204,7 @@ class FakePort:
                 "\\\\?\\" + node.path,
                 node.filesystem,
                 node.drive_type,
+                number_of_links=1,
             )
         )
 

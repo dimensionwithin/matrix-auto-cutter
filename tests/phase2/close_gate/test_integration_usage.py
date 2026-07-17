@@ -104,6 +104,35 @@ def test_integration_usage_authenticates_every_ownership_and_deactivates_session
         leaked.recheck(token)
     with pytest.raises(RuntimeError):
         leaked.commit(token)
+    with pytest.raises(RuntimeError):
+        leaked.run_project_locked(lambda lock: lock.held)
+    with pytest.raises(RuntimeError):
+        leaked.matches_port(close_port)
+
+    assert lease_module._run_lease_usage(
+        lease,
+        PROJECT_A,
+        token,
+        lambda session: (session.matches_port(close_port), session.matches_port(object())),
+    ) == (True, False)
+
+    assert lease_module._run_lease_usage(
+        lease,
+        PROJECT_A,
+        token,
+        lambda session: session.run_project_locked(lambda lock: lock.held),
+    )
+
+    def missing_project(session):
+        held_project = record.resources.project_lock
+        record.resources.project_lock = None
+        try:
+            with pytest.raises(RuntimeError, match="project ownership"):
+                session.run_project_locked(lambda lock: lock.held)
+        finally:
+            record.resources.project_lock = held_project
+
+    lease_module._run_lease_usage(lease, PROJECT_A, token, missing_project)
 
     assert lease_module._run_lease_usage(
         lease,

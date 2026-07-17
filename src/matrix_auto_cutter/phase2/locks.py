@@ -42,10 +42,11 @@ from matrix_auto_cutter.phase2.win32_port import (
 
 
 class LockKind(StrEnum):
-    """Package-2A lock kinds only."""
+    """Package-2A ownership lock kinds."""
 
     PROJECT = "project"
     PATH = "path"
+    TARGET = "target"
 
 
 class LockLease:
@@ -103,7 +104,9 @@ class LockLease:
     @property
     def kind(self) -> LockKind:
         """Return the runtime capability kind, not caller-controlled metadata."""
-        return LockKind.PROJECT if isinstance(self, ProjectLockLease) else LockKind.PATH
+        if isinstance(self, ProjectLockLease):
+            return LockKind.PROJECT
+        return LockKind.TARGET if isinstance(self, TargetLockLease) else LockKind.PATH
 
     @property
     def held(self) -> bool:
@@ -158,6 +161,12 @@ class ProjectLockLease(LockLease):
 
 class PathLockLease(LockLease):
     """Path serialization capability that can never authorize project mutation."""
+
+    __slots__ = ()
+
+
+class TargetLockLease(LockLease):
+    """Target serialization capability in the reserved target namespace."""
 
     __slots__ = ()
 
@@ -258,7 +267,13 @@ class _LockAuthorityRegistry:
         handle: OwnedHandle,
     ) -> LockLease:
         token = object()
-        lease_type = ProjectLockLease if kind is LockKind.PROJECT else PathLockLease
+        lease_type = (
+            ProjectLockLease
+            if kind is LockKind.PROJECT
+            else TargetLockLease
+            if kind is LockKind.TARGET
+            else PathLockLease
+        )
         lease = object.__new__(lease_type)
         lease._initialize(key, ownership_path, handle, token, _seal=_LOCK_ISSUER_SEAL)
         record = _AcquisitionRecord(lease, kind, key, ownership_path, handle, token)
@@ -276,7 +291,13 @@ class _LockAuthorityRegistry:
         )
 
     def _matches(self, lease: LockLease, record: _AcquisitionRecord | None) -> bool:
-        expected_kind = LockKind.PROJECT if isinstance(lease, ProjectLockLease) else LockKind.PATH
+        expected_kind = (
+            LockKind.PROJECT
+            if isinstance(lease, ProjectLockLease)
+            else LockKind.TARGET
+            if isinstance(lease, TargetLockLease)
+            else LockKind.PATH
+        )
         return (
             self._identity_matches(lease, record)
             and record is not None
@@ -438,7 +459,11 @@ def _roots(
             )
         )
     base = local.value.rstrip("\\") + "\\DimensionWithin\\MatrixAutoCutter\\locks"
-    plural = "projects" if kind is LockKind.PROJECT else "paths"
+    plural = "projects"
+    if kind is LockKind.TARGET:
+        plural = "targets"
+    elif kind is LockKind.PATH:
+        plural = "paths"
     ownership = ensure_directory_tree(port, base + "\\ownership\\" + plural)
     if isinstance(ownership, PathRejected):
         if ownership.error.code is ErrorCode.PATH_ACCESS_DENIED:
@@ -611,6 +636,38 @@ def acquire_path_lock(
     return _acquire(
         port,
         LockKind.PATH,
+        key,
+        cancellation,
+        project_id=None,
+        timeout_seconds=timeout_seconds,
+        run_id=run_id,
+    )
+
+
+def acquire_target_lock(
+    port: Win32Port,
+    target: ValidatedPath,
+    cancellation: CancellationToken,
+    *,
+    timeout_seconds: float = 0,
+    run_id: UUID | None = None,
+) -> LockResult:
+    """Acquire a target ownership handle in the reserved target namespace."""
+    if target.role is not PathRole.EXTERNAL_TARGET_CREATE_ONLY:
+        return LockIoError(
+            failure(
+                ErrorCode.PATH_EVIDENCE_INSUFFICIENT,
+                ErrorCategory.POLICY,
+                "target_lock",
+                "a create-only external target capability is required",
+            )
+        )
+    key = path_lock_key(port, target)
+    if isinstance(key, PathRejected):
+        return LockIoError(key.error)
+    return _acquire(
+        port,
+        LockKind.TARGET,
         key,
         cancellation,
         project_id=None,

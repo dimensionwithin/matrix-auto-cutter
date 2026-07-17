@@ -103,6 +103,8 @@ PublishResult = (
     | PublishCancelled
 )
 
+RevisionValidator = Callable[[bytes], tuple[str, int] | None]
+
 
 def _root_from(path: ValidatedPath) -> ValidatedWorkspaceRoot:
     binding = path.root_binding
@@ -271,6 +273,206 @@ def _write_temp(
     if primary is not None:
         return AtomicPublishFailed(primary, _cleanup(port, temp, operation_id))
     return temp
+
+
+def _cleanup_external(
+    port: Win32Port,
+    temp: ValidatedPath,
+    owned_suffix: str,
+) -> tuple[ErrorDetail, ...]:
+    if (
+        temp.role is not PathRole.EXTERNAL_TARGET_CREATE_ONLY
+        or not owned_suffix
+        or not temp.canonical_dos_path.endswith(owned_suffix)
+    ):
+        return (
+            failure(
+                ErrorCode.ATOMIC_PUBLISH_INTEGRITY,
+                ErrorCategory.INTEGRITY,
+                "external_cleanup",
+                "external temp ownership could not be proven",
+            ),
+        )
+    deleted = secure_delete_file(port, temp)
+    if isinstance(deleted, SecureDeleteFailed):
+        if deleted.error.win32_code in {2, 3}:
+            return deleted.diagnostics[:8]
+        return (
+            failure(
+                ErrorCode.ATOMIC_PUBLISH_FAILED,
+                deleted.error.category,
+                deleted.error.phase,
+                deleted.error.message,
+                win32_code=deleted.error.win32_code,
+                cause=deleted.error.cause,
+            ),
+            *deleted.diagnostics,
+        )[:8]
+    return ()
+
+
+def cleanup_external_owned_temp(
+    port: Win32Port,
+    temp: ValidatedPath,
+    *,
+    owned_suffix: str,
+) -> tuple[ErrorDetail, ...]:
+    """Delete only one exact caller-bound external temp or return diagnostics."""
+    return _cleanup_external(port, temp, owned_suffix)
+
+
+def _write_external_temp(
+    port: Win32Port,
+    temp: ValidatedPath,
+    data: bytes,
+    owned_suffix: str,
+    cancellation: CancellationToken | None = None,
+) -> AtomicPublishFailed | PublishCancelled | None:
+    if temp.role is not PathRole.EXTERNAL_TARGET_CREATE_ONLY:
+        raise ValueError("external publish requires a create-only temp capability")
+    if cancellation is not None and cancellation.is_cancelled:
+        return PublishCancelled(
+            failure(
+                ErrorCode.CANCELLED,
+                ErrorCategory.CANCELLED,
+                "create_external_temp",
+                "external temp creation cancelled",
+            )
+        )
+    opened = port.open_file(
+        temp.long_path,
+        GENERIC_READ | GENERIC_WRITE,
+        0,
+        CREATE_NEW,
+        FILE_ATTRIBUTE_NORMAL,
+    )
+    if isinstance(opened, Win32Err):
+        return AtomicPublishFailed(_atomic_error(opened, "create_external_temp"))
+    primary: ErrorDetail | None = None
+    offset = 0
+    try:
+        while offset < len(data):
+            if cancellation is not None and cancellation.is_cancelled:
+                primary = failure(
+                    ErrorCode.CANCELLED,
+                    ErrorCategory.CANCELLED,
+                    "write_external_temp",
+                    "external temp write cancelled",
+                )
+                break
+            written = port.write_file(opened.value, data[offset:])
+            if isinstance(written, Win32Err):
+                primary = _atomic_error(written, "write_external_temp")
+                break
+            if written.value <= 0 or written.value > len(data) - offset:
+                primary = failure(
+                    ErrorCode.ATOMIC_PUBLISH_FAILED,
+                    ErrorCategory.IO,
+                    "write_external_temp",
+                    "partial write made no valid progress",
+                )
+                break
+            offset += written.value
+        if primary is None and cancellation is not None and cancellation.is_cancelled:
+            primary = failure(
+                ErrorCode.CANCELLED,
+                ErrorCategory.CANCELLED,
+                "write_external_temp",
+                "external temp write cancelled",
+            )
+        if primary is None:
+            flushed = port.flush_file(opened.value)
+            if isinstance(flushed, Win32Err):
+                primary = _atomic_error(flushed, "flush_external_temp")
+            elif cancellation is not None and cancellation.is_cancelled:
+                primary = failure(
+                    ErrorCode.CANCELLED,
+                    ErrorCategory.CANCELLED,
+                    "flush_external_temp",
+                    "external temp publish cancelled after flush",
+                )
+    finally:
+        closed = opened.value.close()
+        if primary is None and isinstance(closed, Win32Err):
+            primary = _atomic_error(closed, "close_external_temp")
+    if primary is not None:
+        cleanup = _cleanup_external(port, temp, owned_suffix)
+        if primary.code is ErrorCode.CANCELLED:
+            return PublishCancelled(primary, cleanup)
+        return AtomicPublishFailed(primary, cleanup)
+    return None
+
+
+def publish_external_create_if_absent(
+    port: Win32Port,
+    target: ValidatedPath,
+    temp: ValidatedPath,
+    data: bytes,
+    validator: Callable[[bytes], bool],
+    commit: Callable[[], ErrorDetail | None],
+    *,
+    owned_temp_suffix: str,
+    cancellation: CancellationToken | None = None,
+) -> PublishResult:
+    """Publish one exact same-directory external target without replacement."""
+    if (
+        target.role is not PathRole.EXTERNAL_TARGET_CREATE_ONLY
+        or temp.role is not PathRole.EXTERNAL_TARGET_CREATE_ONLY
+    ):
+        raise ValueError("external publish requires create-only target capabilities")
+    target_parent = target.canonical_dos_path.rpartition("\\")[0]
+    temp_parent = temp.canonical_dos_path.rpartition("\\")[0]
+    if target_parent != temp_parent or target.canonical_dos_path == temp.canonical_dos_path:
+        raise ValueError("external target and temp must be distinct same-directory paths")
+    written = _write_external_temp(port, temp, data, owned_temp_suffix, cancellation)
+    if written is not None:
+        return written
+    temp_check = validate_path(
+        port,
+        temp.canonical_dos_path,
+        PathRole.EXTERNAL_TARGET_CREATE_ONLY,
+        require_existing=True,
+        require_regular_file=True,
+    )
+    if isinstance(temp_check, PathRejected):
+        return AtomicPublishIntegrity(
+            _atomic_error(temp_check, "revalidate_external_temp", integrity=True),
+            (*temp_check.diagnostics, *_cleanup_external(port, temp, owned_temp_suffix))[:8],
+        )
+    commit_error = commit()
+    if commit_error is not None:
+        cleanup = _cleanup_external(port, temp, owned_temp_suffix)
+        if commit_error.code is ErrorCode.CANCELLED:
+            return PublishCancelled(commit_error, cleanup)
+        return AtomicPublishIntegrity(commit_error, cleanup)
+    moved = port.move_no_replace(temp.long_path, target.long_path)
+    if isinstance(moved, Win32Err):
+        cleanup = _cleanup_external(port, temp, owned_temp_suffix)
+        if moved.error.code in {ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS}:
+            return PublishAlreadyExists(
+                failure(
+                    ErrorCode.PROJECT_ALREADY_EXISTS,
+                    ErrorCategory.CONCURRENCY,
+                    "move_no_replace",
+                    moved.error.detail,
+                    win32_code=moved.error.code,
+                ),
+                cleanup,
+            )
+        return AtomicPublishFailed(_atomic_error(moved, "move_no_replace"), cleanup)
+    actual = _read_target(port, target, max(len(data), 1))
+    if isinstance(actual, _TargetReadFailed):
+        return AtomicPublishFailed(actual.error, actual.diagnostics)
+    if actual.data != data or not validator(actual.data):
+        return AtomicPublishIntegrity(
+            failure(
+                ErrorCode.ATOMIC_PUBLISH_INTEGRITY,
+                ErrorCategory.INTEGRITY,
+                "external_post_validate",
+                "published external target failed byte or schema validation",
+            )
+        )
+    return PublishOk(target, len(data))
 
 
 def publish_initial(
@@ -531,6 +733,119 @@ def _replace_project_cas_locked(
             )
         )
     return PublishOk(target, len(data))
+
+
+def replace_revision_cas(
+    port: Win32Port,
+    target: ValidatedPath,
+    expected_data: bytes,
+    replacement_data: bytes,
+    validator: RevisionValidator,
+    cancellation: CancellationToken,
+    *,
+    project_id: str,
+    expected_revision: int,
+    project_lock: object,
+    artifact: str,
+    maximum_bytes: int,
+    operation_id: UUID | None = None,
+) -> PublishResult:
+    """Replace one canonical R-artifact under a live matching Project Lock."""
+    from matrix_auto_cutter.phase2.locks import ProjectLockLease
+
+    if target.role is not PathRole.WORKSPACE_INTERNAL:
+        raise ValueError("revision CAS requires a workspace-internal target")
+    if maximum_bytes <= 0:
+        raise ValueError("revision CAS requires a positive bounded size")
+    if len(replacement_data) > maximum_bytes:
+        raise ValueError("replacement exceeds its bounded artifact size")
+    if not isinstance(project_lock, ProjectLockLease):
+        raise TypeError("a Project Lock lease is required")
+    guard = project_lock._project_mutation_authority(project_id)
+    if guard is None:
+        raise ValueError("a live matching Project Lock capability is required")
+    with guard:
+        first = _read_target(port, target, maximum_bytes)
+        if isinstance(first, _TargetReadFailed):
+            return AtomicPublishFailed(first.error, first.diagnostics)
+        first_binding = validator(first.data)
+        if first_binding is None:
+            return AtomicPublishIntegrity(
+                failure(
+                    ErrorCode.ATOMIC_PUBLISH_INTEGRITY,
+                    ErrorCategory.INTEGRITY,
+                    "cas_initial_validation",
+                    "current R-artifact is invalid",
+                )
+            )
+        if first.data != expected_data or first_binding != (project_id, expected_revision):
+            return CasConflict(
+                failure(
+                    ErrorCode.CAS_CONFLICT,
+                    ErrorCategory.CONCURRENCY,
+                    "cas",
+                    "expected R-artifact revision changed",
+                )
+            )
+        replacement_binding = validator(replacement_data)
+        if replacement_binding != (project_id, expected_revision + 1):
+            raise ValueError("replacement must preserve project and increment revision once")
+        op_id = operation_id or uuid4()
+        temp_result = _write_temp(port, target, artifact, op_id, replacement_data)
+        if isinstance(temp_result, AtomicPublishFailed):
+            return temp_result
+        temp = temp_result
+        second = _read_target(port, target, maximum_bytes)
+        if isinstance(second, _TargetReadFailed):
+            return AtomicPublishFailed(
+                second.error,
+                (*second.diagnostics, *_cleanup(port, temp, op_id))[:8],
+            )
+        same_instance = (first.file_id_128 is None and second.file_id_128 is None) or (
+            first.file_id_128 is not None
+            and second.file_id_128 is not None
+            and first.volume_serial == second.volume_serial
+            and first.file_id_128 == second.file_id_128
+        )
+        if second.data != first.data or not same_instance:
+            return CasConflict(
+                failure(
+                    ErrorCode.CAS_CONFLICT,
+                    ErrorCategory.CONCURRENCY,
+                    "cas_revalidate",
+                    "R-artifact changed before replace",
+                ),
+                _cleanup(port, temp, op_id),
+            )
+        if cancellation.begin_irreversible_commit() is None:
+            return PublishCancelled(
+                failure(
+                    ErrorCode.CANCELLED,
+                    ErrorCategory.CANCELLED,
+                    "replace",
+                    "operation cancelled",
+                ),
+                _cleanup(port, temp, op_id),
+            )
+        replaced = port.replace_file(target.long_path, temp.long_path, None)
+        if isinstance(replaced, Win32Err):
+            return AtomicPublishFailed(
+                _atomic_error(replaced, "ReplaceFileW"),
+                _cleanup(port, temp, op_id),
+            )
+        final = _read_target(port, target, maximum_bytes)
+        if isinstance(final, _TargetReadFailed):
+            return AtomicPublishFailed(final.error, final.diagnostics)
+        if final.data != replacement_data or validator(final.data) != replacement_binding:
+            return AtomicPublishIntegrity(
+                failure(
+                    ErrorCode.ATOMIC_PUBLISH_INTEGRITY,
+                    ErrorCategory.INTEGRITY,
+                    "post_replace",
+                    "replacement R-artifact state is unproven",
+                )
+            )
+        return PublishOk(target, len(replacement_data))
 
 
 def replace_project_cas(

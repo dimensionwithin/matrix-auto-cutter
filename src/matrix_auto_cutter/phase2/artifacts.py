@@ -72,7 +72,7 @@ class LockDiagnostic(CanonicalModel):
     project_id: CanonicalUuidText | UnavailableIdentity
     process_id: int = Field(ge=0)
     process_start_time_100ns: int = Field(ge=0)
-    lock_kind: Literal["project", "path"]
+    lock_kind: Literal["project", "path", "target"]
     redacted_key: str = Field(min_length=1, max_length=128)
     attempted_at_100ns: int = Field(ge=0)
     status: Literal["attempting", "acquired", "busy", "failed", "released"]

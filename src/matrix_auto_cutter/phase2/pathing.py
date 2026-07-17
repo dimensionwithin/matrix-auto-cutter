@@ -39,10 +39,11 @@ _DEVICE_PREFIXES = ("\\\\?\\", "\\\\.\\", "\\??\\", "\\\\?\\VOLUME{", "GLOBALROO
 
 
 class PathRole(StrEnum):
-    """The only two package-2A path capabilities."""
+    """Closed package-2A path capability roles."""
 
     WORKSPACE_INTERNAL = "workspace_internal"
     EXTERNAL_SOURCE_READ_ONLY = "external_source_read_only"
+    EXTERNAL_TARGET_CREATE_ONLY = "external_target_create_only"
 
 
 @dataclass(frozen=True, slots=True)
@@ -248,6 +249,40 @@ def validate_path(
     if not require_existing:
         return PathValidated(path, None)
     return _validate_handles(port, path, workspace_root, require_regular_file)
+
+
+def derive_external_target(
+    port: Win32Port,
+    source: ValidatedPath,
+    target_name: str,
+) -> PathResult:
+    """Derive one create-only sibling target from a validated external source."""
+    if source.role is not PathRole.EXTERNAL_SOURCE_READ_ONLY:
+        return _reject(
+            ErrorCode.PATH_EVIDENCE_INSUFFICIENT,
+            "external targets require a validated read-only source capability",
+        )
+    rejected = _validate_components((target_name,))
+    if rejected is not None:
+        return rejected
+    parent, separator, _ = source.canonical_dos_path.rpartition("\\")
+    if not separator:
+        return _reject(ErrorCode.PATH_INPUT_FORM, "source has no safe parent directory")
+    parent_check = validate_path(
+        port,
+        parent,
+        PathRole.EXTERNAL_SOURCE_READ_ONLY,
+        require_existing=True,
+    )
+    if isinstance(parent_check, PathRejected):
+        return parent_check
+    if parent_check.file_info is None or not parent_check.file_info.is_directory:
+        return _reject(ErrorCode.PATH_NOT_REGULAR, "source parent is not a directory")
+    return validate_path(
+        port,
+        parent + "\\" + target_name,
+        PathRole.EXTERNAL_TARGET_CREATE_ONLY,
+    )
 
 
 def _ancestors(canonical: str) -> tuple[str, ...]:

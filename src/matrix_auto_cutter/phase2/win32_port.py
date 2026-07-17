@@ -138,6 +138,7 @@ class RawFileInfo:
     filesystem_name: str
     drive_type: int
     file_type: int = FILE_TYPE_DISK
+    number_of_links: int | None = None
 
     @property
     def is_directory(self) -> bool:

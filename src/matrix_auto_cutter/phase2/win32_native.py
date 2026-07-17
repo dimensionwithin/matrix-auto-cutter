@@ -317,6 +317,7 @@ class NativeWin32Port:
                 filesystem_name=fs_buffer.value,
                 drive_type=int(self._kernel32.GetDriveTypeW(volume_buffer.value)),
                 file_type=file_type,
+                number_of_links=int(standard.NumberOfLinks),
             )
         )
 
