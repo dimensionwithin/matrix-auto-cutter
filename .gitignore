@@ -47,3 +47,37 @@ exports/
 tmp/
 *.log
 *.recording-journal.ndjson
+
+# secrets
+*.pem
+*.key
+*token*.json
+.youtube-token.json
+
+# data / db
+*.sqlite3
+*.db
+data/
+logs/
+
+# model weights
+*.gguf
+*.bin
+*.safetensors
+*.onnx
+*.pt
+*.ckpt
+
+# vendored SDKs / toolchains
+whisper.cpp/
+obs-sdk/
+llvm/
+
+# large media / binary assets (not repo content)
+*.webm
+*.zip
+*.mp4
+*.mov
+*.mkv
+*.wav
+*.mp3
