@@ -89,12 +89,12 @@ The following requirements are fixed unless Joshua explicitly changes them.
 
 ### 4.3 Local Paths
 
-- Repo/project location: `P:\DimensionWithin\Matrix Auto Cutter`
-- Raw video source folder: `F:\VIDEO ROHABLAGE`
+- Repo/project location: `D:\legacy\matrix-auto-cutter`
+- Raw video source folder: `D:\media`
 - Final export folder: `D:\workspace`
-- Existing overlay/design asset folder: `P:\DimensionWithin\Abo-Like Button & New Video Card etc`
-- Intro folder: `P:\DimensionWithin\DimensionWithin Intro`
-- Outro folder: `P:\DimensionWithin\DimensionWithin Outro`
+- Existing overlay/design asset folder: `D:\legacy\assets`
+- Intro folder: `D:\legacy\assets\intro`
+- Outro folder: `D:\legacy\assets\outro`
 
 ### 4.4 Local-First Requirement
 
@@ -546,10 +546,10 @@ Hard product facts:
 - Desired final length: 10–30 minutes
 - Content: chart/screen recording with small Pepe-avatar facecam bottom-right
 - Bottom-right area must not be covered by overlays
-- Source videos: F:\VIDEO ROHABLAGE
+- Source videos: D:\media
 - Exports: D:\workspace
-- Repo: P:\DimensionWithin\Matrix Auto Cutter
-- Existing assets: P:\DimensionWithin\Abo-Like Button & New Video Card etc
+- Repo: D:\legacy\matrix-auto-cutter
+- Existing assets: D:\legacy\assets
 - Uploaded overlay package: dimensionwithin-overlays-webm.zip
 - Uploaded intro asset: intro-sting-sovereign-1440p.webm
 - Uploaded stinger asset: stinger-sovereign-desk-2200ms-trackmatte-1440p.webm

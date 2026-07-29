@@ -95,7 +95,7 @@ def test_access_denied_on_source_ownership_is_not_busy(close_port, source_path) 
 
 def test_lock_diagnostic_file_does_not_prove_ownership(close_port, source_path) -> None:
     close_port.add_file(
-        r"C:\Local\DimensionWithin\MatrixAutoCutter\locks\diagnostics\fake.json",
+        r"C:\Root\locks\diagnostics\fake.json",
         b"not authority",
     )
     result = gate(close_port, source_path)

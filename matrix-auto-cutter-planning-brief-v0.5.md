@@ -71,7 +71,7 @@ Matrix Auto Cutter fügt in v1 kein Intro, Outro oder Stinger ein, ersetzt nicht
 
 - Zielsystem ist Windows; die Anwendung ist lokal und anklickbar, nicht CLI-only.
 - Eingabe ist primär eine abgeschlossene OBS-MP4. 2560×1440, 60 FPS und eine gemischte Audio-/Videodatei sind das Standardprofil; abweichende Quellen werden vor Analyse geprobt und entweder unterstützt oder mit klarer Begründung abgewiesen.
-- Die in v0.4 genannten Workflow-Vorgaben `F:\VIDEO ROHABLAGE` für Quellen und `D:\workspace` für Exporte bleiben konfigurierbare Standardpfade. Der tatsächliche Code-/Planungs-Root ist der in Abschnitt 2 belegte Root.
+- Die in v0.4 genannten Workflow-Vorgaben `D:\media` für Quellen und `D:\workspace` für Exporte bleiben konfigurierbare Standardpfade. Der tatsächliche Code-/Planungs-Root ist der in Abschnitt 2 belegte Root.
 - Keine Cloud-API und keine Internetpflicht für Analyse oder Rendering.
 - Qualität hat Vorrang vor Geschwindigkeit. Bekannte Zielhardware aus v0.4: Ryzen 9 3900X, RTX 3060, 64 GB RAM; CUDA-Verfügbarkeit wird geprüft und nicht vorausgesetzt.
 
@@ -205,7 +205,7 @@ Folgende v0.4-Aussagen sind ausdrücklich verworfen:
 - Intro-/Outro-Einfügung als automatische v1-Entscheidung entfällt.
 - das Fehlen eines separaten Outro-Assets braucht keinen Postproduktions-Fallback, weil v1 kein Outro einfügt.
 - Kanalmitglied und Community sind nicht austauschbar, sondern zwei getrennte CTA-Kategorien und Assets.
-- der in v0.4 genannte Repo-Pfad `P:\DimensionWithin\Matrix Auto Cutter` wird durch den tatsächlich geprüften Root `D:\workspace\matrix-auto-cutter` ersetzt.
+- der in v0.4 genannte Repo-Pfad `D:\legacy\matrix-auto-cutter` wird durch den tatsächlich geprüften Root `D:\workspace\matrix-auto-cutter` ersetzt.
 - die in v0.4 genannten externen Intro-, Outro- und Design-Assetordner sind keine v1-Laufzeitabhängigkeit. Kanonischer Postproduktionsbestand ist ausschließlich das relative, hashgeprüfte Manifest v0.5; OBS darf seine Produktionsassets unabhängig verwalten.
 
 Alle übrigen v0.4-Ziele gelten nur, soweit sie nicht dieser v0.5-Spezifikation widersprechen.
