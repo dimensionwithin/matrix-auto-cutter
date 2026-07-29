@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Callable
 from dataclasses import InitVar, dataclass, field
+from pathlib import Path
 from threading import Lock
 from uuid import UUID, uuid4
 
@@ -44,7 +46,18 @@ from matrix_auto_cutter.phase2.win32_port import (
     Win32Port,
 )
 
-DEFAULT_WORKSPACE_ROOT = r"F:\MatrixMarketAutoEdit\.matrix-auto-cutter"
+WORKSPACE_ROOT_ENV_VAR = "MATRIX_AUTO_CUTTER_WORKSPACE"
+
+
+def resolve_default_workspace_root() -> str:
+    """Resolve the default workspace root: env override, else a per-user default."""
+    override = os.environ.get(WORKSPACE_ROOT_ENV_VAR)
+    if override:
+        return override
+    return str(Path.home() / ".matrix-auto-cutter")
+
+
+DEFAULT_WORKSPACE_ROOT = resolve_default_workspace_root()
 
 
 @dataclass(frozen=True, slots=True)

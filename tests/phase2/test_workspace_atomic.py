@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from uuid import UUID
 
 import pytest
@@ -25,6 +26,7 @@ from matrix_auto_cutter.phase2.locks import (
 )
 from matrix_auto_cutter.phase2.pathing import PathRejected, PathRole, validate_path
 from matrix_auto_cutter.phase2.workspace import (
+    WORKSPACE_ROOT_ENV_VAR,
     InvalidProjectId,
     OrphanProjectDirectory,
     ProjectBindingMismatch,
@@ -41,6 +43,7 @@ from matrix_auto_cutter.phase2.workspace import (
     create_project,
     ensure_workspace,
     open_project,
+    resolve_default_workspace_root,
 )
 
 PROJECT_ID = "550e8400-e29b-41d4-a716-446655440000"
@@ -62,6 +65,16 @@ def created(fake_port, workspace: WorkspaceReady, project_id: str = PROJECT_ID) 
     )
     assert isinstance(result, ProjectCreated)
     return result
+
+
+def test_resolve_default_workspace_root_uses_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(WORKSPACE_ROOT_ENV_VAR, r"D:\CustomWorkspace")
+    assert resolve_default_workspace_root() == r"D:\CustomWorkspace"
+
+
+def test_resolve_default_workspace_root_falls_back_to_home(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(WORKSPACE_ROOT_ENV_VAR, raising=False)
+    assert resolve_default_workspace_root() == str(Path.home() / ".matrix-auto-cutter")
 
 
 def test_workspace_closed_layout_and_project_open(fake_port) -> None:
