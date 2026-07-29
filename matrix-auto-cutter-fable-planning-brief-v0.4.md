@@ -91,7 +91,7 @@ The following requirements are fixed unless Joshua explicitly changes them.
 
 - Repo/project location: `P:\DimensionWithin\Matrix Auto Cutter`
 - Raw video source folder: `F:\VIDEO ROHABLAGE`
-- Final export folder: `F:\MatrixMarketAutoEdit`
+- Final export folder: `D:\workspace`
 - Existing overlay/design asset folder: `P:\DimensionWithin\Abo-Like Button & New Video Card etc`
 - Intro folder: `P:\DimensionWithin\DimensionWithin Intro`
 - Outro folder: `P:\DimensionWithin\DimensionWithin Outro`
@@ -547,7 +547,7 @@ Hard product facts:
 - Content: chart/screen recording with small Pepe-avatar facecam bottom-right
 - Bottom-right area must not be covered by overlays
 - Source videos: F:\VIDEO ROHABLAGE
-- Exports: F:\MatrixMarketAutoEdit
+- Exports: D:\workspace
 - Repo: P:\DimensionWithin\Matrix Auto Cutter
 - Existing assets: P:\DimensionWithin\Abo-Like Button & New Video Card etc
 - Uploaded overlay package: dimensionwithin-overlays-webm.zip

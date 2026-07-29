@@ -232,8 +232,8 @@ Die unterschiedlichen Versionsnummern sind beabsichtigt. `1.0` im Journal oder i
   "source": {"path": "D:\\media\\recording.mp4", "file_name": "recording.mp4", "size_bytes": 12003400567, "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
   "obs_sidecar_path": "D:\\media\\recording.obs-events.json",
   "required_sidecar_schema_version": "1.1",
-  "workspace": "F:\\MatrixMarketAutoEdit\\.matrix-auto-cutter\\projects\\550e8400-e29b-41d4-a716-446655440000",
-  "export_directory": "F:\\MatrixMarketAutoEdit",
+  "workspace": "D:\\workspace\\.matrix-auto-cutter\\projects\\550e8400-e29b-41d4-a716-446655440000",
+  "export_directory": "D:\\workspace",
   "profile": "youtube_1440p60_v1",
   "source_immutable": true
 }
@@ -689,7 +689,7 @@ Alle Fehler tragen Code, deutschen Nutzertext, technischen Kontext, Artefakt-ID 
 ├─ cache\assets\<cache-key>\{overlay.mov,probe.json,validation.json}
 └─ models\faster-whisper-large-v3\...
 
-F:\MatrixMarketAutoEdit\.matrix-auto-cutter\projects\<project-id>\
+D:\workspace\.matrix-auto-cutter\projects\<project-id>\
 ├─ project.json
 ├─ job.json
 ├─ artifacts\

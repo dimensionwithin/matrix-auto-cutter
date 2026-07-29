@@ -113,7 +113,7 @@ Unbekannte Bundle- oder Receiptversionen, fehlende Pflichtteile, Digestabweichun
 
 ### 6.1 Workspace und Projekt-ID
 
-Standardroot ist `F:\MatrixMarketAutoEdit\.matrix-auto-cutter`. Root und alle vorhandenen Vorfahren müssen lokale NTFS-Verzeichnisse, regulär erreichbar, ohne Reparse Points, UNC, ADS, Devicepfade, Cloud-Platzhalter oder Wechselmedium sein. Komponenten sind feste ASCII-Namen oder kanonische UUIDv4; Benutzertext ist nur JSON-Metadatum.
+Standardroot ist `D:\workspace\.matrix-auto-cutter`. Root und alle vorhandenen Vorfahren müssen lokale NTFS-Verzeichnisse, regulär erreichbar, ohne Reparse Points, UNC, ADS, Devicepfade, Cloud-Platzhalter oder Wechselmedium sein. Komponenten sind feste ASCII-Namen oder kanonische UUIDv4; Benutzertext ist nur JSON-Metadatum.
 
 Projektanlage verwendet `CreateDirectoryW` create-if-absent für `projects/<uuid4>`. `ERROR_ALREADY_EXISTS` übernimmt das Verzeichnis niemals. Es wird eine neue UUID erzeugt, höchstens 16 Versuche. Nach 16 Kollisionen folgt `E_PROJECT_ID_COLLISION`; andere Existenz-/ACL-/I/O-Zustände werden nicht als Kollision umklassifiziert. Ein bestehendes Projekt wird ausschließlich durch explizites Open und vollständig validiertes `project.json` mit passender Projekt-ID, Rootbindung und Schema 1.0 geöffnet.
 

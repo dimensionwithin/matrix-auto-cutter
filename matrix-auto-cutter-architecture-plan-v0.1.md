@@ -142,8 +142,8 @@ Alle Zeiten in kanonischen Artefakten sind Frames auf `60/1`, alle Intervalle ha
     "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   },
   "obs_sidecar_path": "F:\\VIDEO ROHABLAGE\\aufnahme.obs-events.json",
-  "workspace": "F:\\MatrixMarketAutoEdit\\.matrix-auto-cutter\\projects\\018f2ca1-7e6d-7a62-9f8d-8de26eaf2101",
-  "export_directory": "F:\\MatrixMarketAutoEdit",
+  "workspace": "D:\\workspace\\.matrix-auto-cutter\\projects\\018f2ca1-7e6d-7a62-9f8d-8de26eaf2101",
+  "export_directory": "D:\\workspace",
   "profile": "youtube_1440p60_v1",
   "config_overrides": {},
   "source_immutable": true
@@ -612,7 +612,7 @@ Pflichtprüfungen:
 ## 11. Projektdaten, Cache und temporäre Dateien
 
 ```text
-F:\MatrixMarketAutoEdit\
+D:\workspace\
 ├─ 2026-07-12_title_final.mp4
 └─ .matrix-auto-cutter\
    └─ projects\
