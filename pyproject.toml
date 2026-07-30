@@ -6,6 +6,7 @@ build-backend = "hatchling.build"
 name = "matrix-auto-cutter"
 version = "0.1.0"
 description = "Zeitbasis-, Journal-, Sidecar- und Protection-Kern des Matrix Auto Cutter"
+license = "MIT"
 requires-python = ">=3.12,<3.13"
 dependencies = ["pydantic>=2.11,<3"]
 

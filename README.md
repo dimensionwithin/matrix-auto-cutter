@@ -62,4 +62,4 @@ Actively developed; the core pipeline works. Local desktop tool — no cloud, no
 
 ## License
 
-*(add license)*
+MIT — see [LICENSE](LICENSE).
