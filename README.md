@@ -1,65 +1,94 @@
 # Matrix Auto Cutter
 
-Automated, conservative post-production for long-form market-analysis videos.
+Bereitet fertige OBS-Bildschirmaufnahmen für den automatischen Schnitt vor: prüft die
+Aufnahmedatei auf Identität und Unversehrtheit, rechnet die Ereignisse der Aufnahme
+frame-genau in die Zeitbasis des Videos um und markiert die Abschnitte, die nicht
+geschnitten werden dürfen.
 
-Matrix Auto Cutter takes a raw multi-hour recording, transcribes it locally, and produces a
-tightened edit — removing dead time and filler while **deliberately protecting the pauses
-that matter** (e.g. silence while reading a chart on screen). It never publishes blindly:
-every cut decision is written to a reviewable edit list before anything is rendered.
+**Status: in aktiver Entwicklung.**
 
-The whole thing runs **offline** — local speech transcription only, no cloud API and no
-internet requirement.
+Fertig und getestet ist der Unterbau — Zeitbasis, Journal- und Sidecar-Verträge,
+Schutzbereiche, Quellenprüfung und das atomare Schreiben des Projektstands.
+Der eigentliche Schnitt ist noch nicht gebaut: Transkription, Erkennung entfernbarer
+Passagen, CTA-Planung, EDL-Ausgabe und Rendern fehlen. Wer das Repo öffnet, findet
+die Ingest- und Sicherungsschicht, nicht das fertige Werkzeug.
 
----
+## Was es löst
 
-## Why it exists
+Eine Marktanalyse-Aufnahme läuft 45 bis 90 Minuten und soll auf 10 bis 30 Minuten
+gekürzt werden. Automatische Stille-Schneider sind dafür ungeeignet: Sie entfernen
+genau die Stellen, die bewusst produziert wurden — Intro, Stinger, Szenenwechsel,
+Denk- und Chartlesepausen.
 
-Editing long trading/analysis videos by hand is slow and repetitive, but naive
-"silence removal" tools cut the wrong things — they strip out the deliberate pauses where
-you're reading a chart or letting a point land. This tool encodes that domain knowledge:
-it distinguishes *unwanted* dead time from *intentional* pauses, and stays conservative by
-default so it never over-cuts.
+Bevor überhaupt ein Schnitt geplant werden darf, muss dreierlei feststehen: dass die
+Datei auf der Platte wirklich die aufgezeichnete ist, dass Ereigniszeitstempel exakt
+auf Frames abgebildet sind, und welche Bereiche gesperrt sind. Genau diese
+Vorbedingungen stellt dieses Projekt her — nachweisbar und ohne stille Annahmen.
 
----
+## Wie es funktioniert
 
-## How it works
+Die Arbeitsteilung ist bewusst eng gezogen: OBS erzeugt Intro, Outro, Szenenwechsel
+und Stinger bereits live während der Aufnahme. Matrix Auto Cutter bearbeitet die
+fertige MP4 nach und lässt die live produzierten Abschnitte unangetastet. Die
+Originaldateien werden nie verändert.
 
-A phased pipeline, built to be auditable at each stage:
+**Kern**
 
-1. **Transcribe** — local speech-to-text; every transcribed segment is timestamped
-   (from/to) so the editor knows exactly when each word was spoken.
-2. **Analyze** — classify gaps into removable dead time vs. protected reading/thinking pauses.
-3. **Protect** — protection gating keeps flagged regions (chart-reading pauses, etc.) intact.
-4. **Plan** — schedule CTA overlays and assemble the edit.
-5. **Review** — emit an **EDL / JSON / HTML** review artifact for a human to check.
-6. **Finalize / render** — produce the final cut only after the plan is confirmed.
+- `timebase` — ausschließlich CFR 60/1, halboffene Frameintervalle `[start, end)`,
+  Rechnung über `Fraction`, keine Gleitkommazahlen.
+- `journal` — strikte Validierung des Recording-Journals, das der OBS-Producer
+  während der Aufnahme schreibt: lückenlose Sequenz, monotone Uhr- und Counterwerte,
+  Pause/Resume-Paarung, eindeutige Event-IDs.
+- `calibration` — bildet QPC-Zeitstempel (Nanosekunden) rational auf Quellframes ab;
+  rechnet Pausen heraus, bestimmt Taktdrift in ppm und die Unsicherheit je Ereignis.
+- `protection` — paart Ereignisse zu Schutzbereichen, erweitert sie um die
+  Messunsicherheit und vereinigt die Policies. Ein Bereich kann Zeitschnitte,
+  Overlays und lokale Audioreparatur einzeln sperren.
+- `sidecar` — Sidecar-1.1-Vertrag mit einem Validator, der keine Exceptions wirft,
+  sondern strukturierte Fehler zurückgibt.
+- `atomic` — atomares Schreiben, damit ein Abbruch keinen halben Zustand hinterlässt.
 
-Core modules: `timebase`, `journal`, `sidecar`, `protection`, `calibration`, `atomic`,
-plus a `phase2` subsystem (probe → source-hash confirmation → protection gating →
-finalize / render).
+**Phase 2 — Vertrauensgrenze zur Datei**
 
----
+- `close_gate` — wartet über Win32-Handles darauf, dass der Recorder die Datei
+  wirklich freigegeben hat, abgesichert über Leases und Besitzprüfung.
+- `probe` — gekapselter `ffprobe`-Aufruf: Identität und Version der Binary werden
+  gegen eine Policy geprüft, bevor ihrer Ausgabe geglaubt wird; danach
+  Stream-Auswahl und Medienprofil.
+- `source_confirmation` — belegt, dass die Datei am Pfad dieselbe ist, die das
+  Journal beschreibt; erneute Pfadprüfung gegen Umbenennen und Austausch.
+- `source_hash` — lease-gebundenes Hashen mit Quittung.
+- `finalizer` — Zustandsautomat mit Wiederaufnahme nach Abbruch; veröffentlicht das
+  Projektdokument atomar per Compare-and-Swap.
+- Querschnitt: Workspace- und Pfadvalidierung, Sperr-Leases, Fortschrittsmeldungen,
+  Cancellation, Dateisnapshots.
 
-## Engineering
+Jede Stufe meldet Fehler als typisierte Werte statt als Ausnahmen, damit der Aufrufer
+jeden Fall behandeln muss.
 
-This project is built to production discipline rather than as a throwaway script:
+## Technik
 
-- **`Python 3.12`**, packaged with Hatchling
-- **`Pydantic v2`** models throughout
-- **`mypy --strict`** and **`ruff`** clean
-- **100% branch coverage** enforced via `pytest` + `pytest-cov`
-- **Property-based testing** with `Hypothesis`
-- Test code exceeds production code — the pipeline is designed to be provably safe before
-  it ever touches a render.
+- Python 3.12, Paketierung mit Hatchling, Abhängigkeiten über `uv`
+- Pydantic v2 für alle Datenverträge
+- Windows-spezifisch, wo es sein muss: direkte Win32-Aufrufe über `ctypes` für
+  Handle- und Dateiidentität, jeweils hinter einem Port mit austauschbarer
+  Implementierung für die Tests
+- Externe Abhängigkeit zur Laufzeit: `ffprobe`. Kein Netzwerkzugriff, keine
+  Cloud-API, keine Telemetrie
+- `mypy --strict` — fehlerfrei über 70 Quelldateien
+- `ruff` — fehlerfrei, inklusive Docstring- und Annotationsregeln
+- 1273 Tests mit `pytest`, davon Property-based-Tests mit `Hypothesis` sowie
+  Integrationstests gegen echte `ffprobe`-Binaries und echte Win32-Handles
+- 100 % Branch Coverage, erzwungen über `fail_under = 100` (9274 Statements,
+  2808 Branches)
+- Testcode ist umfangreicher als Produktivcode (ca. 25 700 zu 22 100 Zeilen)
 
----
+Bekannt: ein Windows-Integrationstest schlägt gelegentlich fehl, wenn die gesamte
+Suite läuft, und ist einzeln grün — eine Race Condition im Test, nicht im
+Produktivcode. Noch nicht behoben.
 
-## Status
+Quellcode und Dokumentation sind auf Deutsch.
 
-Actively developed; the core pipeline works. Local desktop tool — no cloud, no telemetry.
+## Lizenz
 
----
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+MIT — siehe [LICENSE](LICENSE).
