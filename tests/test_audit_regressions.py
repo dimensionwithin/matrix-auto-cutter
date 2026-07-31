@@ -1232,7 +1232,9 @@ def test_exported_sidecar_schema_contains_canonical_numeric_and_string_constrain
 
 
 def test_exported_schema_recursively_matches_canonical_sidecar_contract() -> None:
-    architecture = Path("matrix-auto-cutter-architecture-plan-v0.2.md").read_text(encoding="utf-8")
+    architecture = Path("docs/matrix-auto-cutter-architecture-plan-v0.2.md").read_text(
+        encoding="utf-8"
+    )
     schema_section = architecture.split("### 8.3 Kanonisches Sidecar-JSON-Schema 1.1", 1)[1]
     canonical = json.loads(schema_section.split("```json", 1)[1].split("```", 1)[0])
     exported = ObsEventSidecar.model_json_schema()
@@ -1282,7 +1284,9 @@ def test_optional_event_fields_export_exact_non_nullable_schema() -> None:
     ],
 )
 def test_recursive_schema_walker_rejects_bidirectional_mutations(mutation: str) -> None:
-    architecture = Path("matrix-auto-cutter-architecture-plan-v0.2.md").read_text(encoding="utf-8")
+    architecture = Path("docs/matrix-auto-cutter-architecture-plan-v0.2.md").read_text(
+        encoding="utf-8"
+    )
     schema_section = architecture.split("### 8.3 Kanonisches Sidecar-JSON-Schema 1.1", 1)[1]
     canonical = json.loads(schema_section.split("```json", 1)[1].split("```", 1)[0])
     exported = ObsEventSidecar.model_json_schema()
