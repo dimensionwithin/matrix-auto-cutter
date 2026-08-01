@@ -54,6 +54,7 @@ struct BlockingPoint final {
     std::mutex mutex;
     std::condition_variable changed;
     bool enabled{};
+    bool one_shot{};
     bool entered{};
     bool released{};
 
@@ -61,6 +62,9 @@ struct BlockingPoint final {
         std::unique_lock lock(mutex);
         if (!enabled) {
             return;
+        }
+        if (one_shot) {
+            enabled = false;
         }
         entered = true;
         changed.notify_all();
@@ -98,6 +102,7 @@ struct ProducerState final {
     RecordingStart start{};
     RecordingStop stop{};
     BlockingPoint shutdown_block;
+    BlockingPoint pause_submit_block;
 };
 
 class FakeProducer final : public ProducerPort {
@@ -117,6 +122,9 @@ class FakeProducer final : public ProducerPort {
     }
 
     CallbackResult submit(JournalSnapshot snapshot) noexcept override {
+        if (std::holds_alternative<PauseSnapshot>(snapshot)) {
+            state_->pause_submit_block.enter_if_enabled();
+        }
         std::lock_guard lock(state_->mutex);
         if (std::holds_alternative<EventSnapshot>(snapshot)) {
             ++state_->events;
@@ -339,7 +347,7 @@ class FakeHost final : public AdapterHost {
     bool install_result{true};
     bool acquire_result{true};
     bool connect_result{true};
-    bool capture_result{true};
+    std::atomic<bool> capture_result{true};
     bool installed{};
     bool output_connected{};
     std::atomic<unsigned> install_calls{};
@@ -678,6 +686,211 @@ void test_pause_sequence_failure_and_stop_while_paused() {
     }
 }
 
+void test_ordered_pause_resume_pause_survives_a_blocked_worker() {
+    TempRoot root;
+    auto producer = std::make_shared<ProducerState>();
+    producer->pause_submit_block.enabled = true;
+    FakeFactory factory(producer);
+    FakeHost host;
+    ObsJournalAdapter adapter(host, factory, test_options(root.path));
+    check(adapter.load(), "rapid pause sequence load failed");
+    start_output(host, adapter, producer);
+    anchor_recording(host, producer);
+
+    host.set_signal(recording_path, 12'000'000'000ULL, 120);
+    host.fire_output(OutputEvent::paused);
+    producer->pause_submit_block.wait_until_entered();
+    host.set_signal(recording_path, 13'000'000'000ULL, 121);
+    host.fire_output(OutputEvent::resumed);
+    host.set_signal(recording_path, 14'000'000'000ULL, 122);
+    host.fire_output(OutputEvent::paused);
+    producer->pause_submit_block.release();
+
+    wait_for_producer_count(producer, [](const auto& value) { return value.pauses == 2; },
+                            "second ordered pause was not drained");
+    wait_for_producer_count(producer, [](const auto& value) { return value.resumes == 1; },
+                            "ordered resume was not drained");
+    check(adapter.state() == AdapterState::paused,
+          "latest actual pause state was not retained after worker drain");
+    host.set_signal(recording_path, 15'000'000'000ULL, 122);
+    host.fire_output(OutputEvent::stopped, 0);
+    wait_for([&] { return adapter.state() == AdapterState::idle; },
+             "stop after ordered rapid pause sequence failed");
+}
+
+void test_forced_failure_wins_over_an_already_queued_stop() {
+    TempRoot root;
+    auto producer = std::make_shared<ProducerState>();
+    producer->pause_submit_block.enabled = true;
+    FakeFactory factory(producer);
+    FakeHost host;
+    auto options = test_options(root.path);
+    auto pause_callbacks = std::make_shared<std::atomic<unsigned>>(0);
+    options.callback_probe = [pause_callbacks](const CallbackKind kind) {
+        if (kind == CallbackKind::output_pause &&
+            pause_callbacks->fetch_add(1, std::memory_order_acq_rel) != 0) {
+            throw std::runtime_error("injected fail-closed pause callback");
+        }
+    };
+    ObsJournalAdapter adapter(host, factory, std::move(options));
+    check(adapter.load(), "forced-vs-stop load failed");
+    start_output(host, adapter, producer);
+    anchor_recording(host, producer);
+
+    host.set_signal(recording_path, 12'000'000'000ULL, 120);
+    host.fire_output(OutputEvent::paused);
+    producer->pause_submit_block.wait_until_entered();
+    host.set_signal(recording_path, 15'000'000'000ULL, 121);
+    host.fire_output(OutputEvent::stopped, 0);
+    host.fire_output(OutputEvent::paused);
+    producer->pause_submit_block.release();
+
+    wait_for([&] { return adapter.state() == AdapterState::failed; },
+             "forced failure did not win over queued stop");
+    std::lock_guard lock(producer->mutex);
+    check(producer->stops == 0, "queued stop was authorized after fail-closed had won");
+    check(producer->shutdowns == 1, "forced failure did not shut the producer down exactly once");
+}
+
+void test_failure_from_a_draining_callback_wins_over_stop_authorization() {
+    TempRoot root;
+    auto producer = std::make_shared<ProducerState>();
+    FakeFactory factory(producer);
+    FakeHost host;
+    ObsJournalAdapter adapter(host, factory, test_options(root.path));
+    check(adapter.load(), "draining-failure-vs-stop load failed");
+    start_output(host, adapter, producer);
+    anchor_recording(host, producer);
+
+    host.capture_clock_block.enabled = true;
+    std::thread pause([&] { host.fire_output(OutputEvent::paused); });
+    host.capture_clock_block.wait_until_entered();
+    host.set_signal(recording_path, 14'000'000'000ULL, 248);
+    host.fire_output(OutputEvent::stopped, 0);
+    host.capture_result.store(false, std::memory_order_release);
+    host.capture_clock_block.release();
+    pause.join();
+
+    wait_for([&] { return adapter.state() == AdapterState::failed; },
+             "draining callback failure did not defeat stop authorization");
+    std::lock_guard lock(producer->mutex);
+    check(producer->stops == 0, "stop was authorized after a draining callback failed");
+    check(producer->shutdowns == 1, "draining callback failure did not shut down once");
+}
+
+void test_active_stop_retains_counter_quantized_qpc() {
+    TempRoot root;
+    auto producer = std::make_shared<ProducerState>();
+    FakeFactory factory(producer);
+    FakeHost host;
+    ObsJournalAdapter adapter(host, factory, test_options(root.path));
+    check(adapter.load(), "quantized-stop load failed");
+    start_output(host, adapter, producer);
+    anchor_recording(host, producer);
+    host.set_signal(recording_path, 14'100'000'000ULL, 248);
+    host.fire_output(OutputEvent::stopped, 0);
+    wait_for([&] { return adapter.state() == AdapterState::idle; },
+             "active quantized stop failed");
+    std::lock_guard lock(producer->mutex);
+    check(producer->stop.clock.monotonic_ns == 4'000'000'000ULL,
+          "active stop used callback latency instead of the output counter anchor");
+}
+
+void test_control_fifo_overflow_is_fail_closed() {
+    TempRoot root;
+    auto producer = std::make_shared<ProducerState>();
+    producer->pause_submit_block.enabled = true;
+    FakeFactory factory(producer);
+    FakeHost host;
+    ObsJournalAdapter adapter(host, factory, test_options(root.path));
+    check(adapter.load(), "control-overflow load failed");
+    start_output(host, adapter, producer);
+    anchor_recording(host, producer);
+
+    host.set_signal(recording_path, 12'000'000'000ULL, 120);
+    host.fire_output(OutputEvent::paused);
+    producer->pause_submit_block.wait_until_entered();
+    for (const auto event : {OutputEvent::resumed, OutputEvent::paused, OutputEvent::resumed,
+                             OutputEvent::paused, OutputEvent::resumed}) {
+        host.fire_output(event);
+    }
+    producer->pause_submit_block.release();
+
+    wait_for([&] { return adapter.state() == AdapterState::failed; },
+             "full control FIFO did not fail closed");
+    std::lock_guard lock(producer->mutex);
+    check(producer->stops == 0, "control FIFO overflow authorized a stop");
+    check(producer->shutdowns == 1, "control FIFO overflow did not shut down exactly once");
+}
+
+void test_stop_wins_over_blocked_pause_and_resume_callbacks() {
+    for (const auto event : {OutputEvent::paused, OutputEvent::resumed}) {
+        TempRoot root;
+        auto producer = std::make_shared<ProducerState>();
+        FakeFactory factory(producer);
+        FakeHost host;
+        ObsJournalAdapter adapter(host, factory, test_options(root.path));
+        check(adapter.load(), "blocked control-vs-stop load failed");
+        start_output(host, adapter, producer);
+        anchor_recording(host, producer);
+        if (event == OutputEvent::resumed) {
+            host.set_signal(recording_path, 12'000'000'000ULL, 120);
+            host.fire_output(OutputEvent::paused);
+            wait_for_producer_count(producer, [](const auto& value) { return value.pauses == 1; },
+                                    "pause was not accepted before resume-vs-stop race");
+        }
+
+        host.capture_clock_block.enabled = true;
+        std::thread callback([&] { host.fire_output(event); });
+        host.capture_clock_block.wait_until_entered();
+        host.set_signal(
+            recording_path,
+            event == OutputEvent::paused ? 14'000'000'000ULL : 15'000'000'000ULL,
+            event == OutputEvent::paused ? 248 : 121);
+        host.fire_output(OutputEvent::stopped, 0);
+        host.capture_clock_block.release();
+        callback.join();
+        wait_for([&] { return adapter.state() == AdapterState::idle; },
+                 "stop did not win over blocked pause/resume callback");
+        std::lock_guard lock(producer->mutex);
+        check(producer->resumes == 0, "blocked resume overtook stop");
+        check(producer->pauses == (event == OutputEvent::resumed ? 1U : 0U),
+              "blocked pause overtook stop");
+        check(producer->stop.clock.recording_paused == (event == OutputEvent::resumed),
+              "stop did not retain the state that won before the blocked control signal");
+    }
+}
+
+void test_pause_linearization_suppresses_a_tick_still_capturing() {
+    TempRoot root;
+    auto producer = std::make_shared<ProducerState>();
+    FakeFactory factory(producer);
+    FakeHost host;
+    ObsJournalAdapter adapter(host, factory, test_options(root.path));
+    check(adapter.load(), "pause-vs-tick load failed");
+    start_output(host, adapter, producer);
+    anchor_recording(host, producer);
+
+    host.capture_clock_block.enabled = true;
+    host.capture_clock_block.one_shot = true;
+    std::thread tick([&] { host.fire_tick(); });
+    host.capture_clock_block.wait_until_entered();
+    host.set_signal(recording_path, 12'000'000'000ULL, 120);
+    host.fire_output(OutputEvent::paused);
+    host.capture_clock_block.release();
+    tick.join();
+    wait_for_producer_count(producer, [](const auto& value) { return value.pauses == 1; },
+                            "pause was not accepted in tick race");
+    {
+        std::lock_guard lock(producer->mutex);
+        check(producer->calibrations == 0, "tick captured before pause was written after pause");
+    }
+    host.set_signal(recording_path, 15'000'000'000ULL, 120);
+    host.fire_output(OutputEvent::stopped, 0);
+    wait_for([&] { return adapter.state() == AdapterState::idle; },
+             "paused stop after tick race failed");
+}
+
 void test_invalid_session_localappdata_and_unsupported_or_concurrent_start_fail_closed() {
     {
         TempRoot root;
@@ -766,7 +979,14 @@ void test_invalid_session_localappdata_and_unsupported_or_concurrent_start_fail_
     }
 }
 
-enum class BlockedScenario { idle_frontend, start_pending, active_tick, output_stop };
+enum class BlockedScenario {
+    idle_frontend,
+    start_pending,
+    active_tick,
+    output_pause,
+    output_resume,
+    output_stop
+};
 
 void run_blocked_unload_scenario(const BlockedScenario scenario) {
     TempRoot root;
@@ -797,9 +1017,17 @@ void run_blocked_unload_scenario(const BlockedScenario scenario) {
     ObsJournalAdapter adapter(host, factory, std::move(options));
     check(adapter.load(), "blocked-unload load failed");
 
-    if (scenario == BlockedScenario::active_tick || scenario == BlockedScenario::output_stop) {
+    if (scenario == BlockedScenario::active_tick || scenario == BlockedScenario::output_pause ||
+        scenario == BlockedScenario::output_resume || scenario == BlockedScenario::output_stop) {
         start_output(host, adapter, producer);
         anchor_recording(host, producer);
+    }
+
+    if (scenario == BlockedScenario::output_resume) {
+        host.set_signal(recording_path, 12'000'000'000ULL, 120);
+        host.fire_output(OutputEvent::paused);
+        wait_for_producer_count(producer, [](const auto& value) { return value.pauses == 1; },
+                                "pause was not accepted before blocked resume");
     }
 
     if (scenario == BlockedScenario::active_tick) {
@@ -807,6 +1035,9 @@ void run_blocked_unload_scenario(const BlockedScenario scenario) {
     }
     if (scenario == BlockedScenario::output_stop) {
         host.capture_output_block.enabled = true;
+    } else if (scenario == BlockedScenario::output_pause ||
+               scenario == BlockedScenario::output_resume) {
+        host.capture_clock_block.enabled = true;
     }
 
     std::thread callback;
@@ -819,10 +1050,19 @@ void run_blocked_unload_scenario(const BlockedScenario scenario) {
         callback = std::thread([&] { host.fire_frontend(FrontendEvent::recording_starting); });
     } else if (scenario == BlockedScenario::active_tick) {
         callback = std::thread([&] { host.fire_tick(); });
-    } else {
+    } else if (scenario == BlockedScenario::output_stop) {
         active_block = &host.capture_output_block;
         host.set_signal(recording_path, 14'000'000'000ULL, 248);
         callback = std::thread([&] { host.fire_output(OutputEvent::stopped, 0); });
+    } else {
+        active_block = &host.capture_clock_block;
+        const auto event = scenario == BlockedScenario::output_pause ? OutputEvent::paused
+                                                                     : OutputEvent::resumed;
+        host.set_signal(
+            recording_path,
+            scenario == BlockedScenario::output_pause ? 12'000'000'000ULL : 14'000'000'000ULL,
+            scenario == BlockedScenario::output_pause ? 120 : 121);
+        callback = std::thread([&] { host.fire_output(event, 0); });
     }
     active_block->wait_until_entered();
     if (scenario == BlockedScenario::start_pending) {
@@ -850,6 +1090,8 @@ void test_unload_drains_blocked_callbacks_in_all_adapter_states() {
     run_blocked_unload_scenario(BlockedScenario::idle_frontend);
     run_blocked_unload_scenario(BlockedScenario::start_pending);
     run_blocked_unload_scenario(BlockedScenario::active_tick);
+    run_blocked_unload_scenario(BlockedScenario::output_pause);
+    run_blocked_unload_scenario(BlockedScenario::output_resume);
     run_blocked_unload_scenario(BlockedScenario::output_stop);
 }
 
@@ -884,7 +1126,8 @@ void test_no_exception_crosses_any_callback_boundary() {
     ObsJournalAdapter::output_boundary(OutputEvent::started, 0, nullptr);
 
     for (const auto kind : {CallbackKind::frontend, CallbackKind::tick,
-                            CallbackKind::output_start, CallbackKind::output_stop}) {
+                            CallbackKind::output_start, CallbackKind::output_pause,
+                            CallbackKind::output_resume, CallbackKind::output_stop}) {
         TempRoot root;
         auto producer = std::make_shared<ProducerState>();
         FakeFactory factory(producer);
@@ -907,6 +1150,10 @@ void test_no_exception_crosses_any_callback_boundary() {
             start_output(host, adapter, producer);
             if (kind == CallbackKind::tick) {
                 host.fire_tick();
+            } else if (kind == CallbackKind::output_pause) {
+                host.fire_output(OutputEvent::paused, 0);
+            } else if (kind == CallbackKind::output_resume) {
+                host.fire_output(OutputEvent::resumed, 0);
             } else {
                 host.fire_output(OutputEvent::stopped, 0);
             }
@@ -927,9 +1174,21 @@ int main() {
         {"actual-output-pause-resume/calibration-gate/order",
          test_actual_output_pause_resume_is_ordered_and_gates_calibration},
         {"pause-sequence-failure/stop-while-paused", test_pause_sequence_failure_and_stop_while_paused},
+        {"ordered-pause-resume-pause/blocked-worker",
+         test_ordered_pause_resume_pause_survives_a_blocked_worker},
+        {"forced-failure-wins-over-queued-stop",
+         test_forced_failure_wins_over_an_already_queued_stop},
+        {"draining-callback-failure-wins-over-stop",
+         test_failure_from_a_draining_callback_wins_over_stop_authorization},
+        {"active-stop/counter-quantized-qpc", test_active_stop_retains_counter_quantized_qpc},
+        {"control-fifo-overflow/fail-closed", test_control_fifo_overflow_is_fail_closed},
+        {"stop-wins-over-blocked-pause-resume",
+         test_stop_wins_over_blocked_pause_and_resume_callbacks},
+        {"pause-linearization-suppresses-capturing-tick",
+         test_pause_linearization_suppresses_a_tick_still_capturing},
         {"invalid-session/localappdata/unsupported/concurrent-start",
          test_invalid_session_localappdata_and_unsupported_or_concurrent_start_fail_closed},
-        {"unload-blocked-idle/start-pending/active-tick/output-stop",
+        {"unload-blocked-idle/start-pending/active-tick/output-pause/resume/stop",
          test_unload_drains_blocked_callbacks_in_all_adapter_states},
         {"adapter-worker-timeout-module-pin",
          test_adapter_worker_timeout_keeps_module_pinned_until_shutdown_returns},

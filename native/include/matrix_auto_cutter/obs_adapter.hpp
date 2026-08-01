@@ -159,6 +159,7 @@ class ObsJournalAdapter final {
         std::uint64_t output_frame_count{};
         int code{};
         bool captured{};
+        bool recording_paused{};
     };
 
     [[nodiscard]] bool enter_callback() noexcept;
@@ -198,9 +199,11 @@ class ObsJournalAdapter final {
     std::atomic<std::uint64_t> calibration_count_{};
     std::atomic<bool> recording_started_claimed_{};
     std::atomic<bool> recording_started_accepted_{};
-    // Tracks actual output-signal order independently of worker scheduling.
-    // 0 active, 1 pause queued/paused, 2 resume queued.
+    // Tracks the latest actual output-signal state at control-FIFO linearization.
+    // 0 active, 1 paused.
     std::atomic<unsigned> observed_pause_state_{};
+    std::atomic<unsigned> pause_resume_commands_pending_{};
+    std::atomic<bool> pause_seen_{};
     std::atomic<std::uint64_t> callback_gate_{callback_gate_closed};
     std::atomic<unsigned> bound_callbacks_in_flight_{};
     mutable std::mutex callback_wait_mutex_;

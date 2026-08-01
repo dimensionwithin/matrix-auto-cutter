@@ -484,6 +484,95 @@ void test_pause_lifecycle_rejects_invalid_order_and_accepts_paused_stop() {
           "stop while paused did not retain pause flag");
 }
 
+void test_pause_lifecycle_rejects_duplicate_transitions_and_large_counter_motion() {
+    {
+        auto state = std::make_shared<SinkState>();
+        JournalProducer producer(options_for(state));
+        check(producer.start_recording(start_request()) == ProducerResult::producer_ok, "start failed");
+        check(producer.submit(start_event()) == CallbackResult::accepted, "start event rejected");
+        check(producer.submit(pause_snapshot()) == CallbackResult::accepted, "pause rejected");
+        auto duplicate = pause_snapshot(3, 120);
+        duplicate.event_id = "55555555-5555-4555-8555-555555555555";
+        check(producer.submit(std::move(duplicate)) == CallbackResult::accepted,
+              "duplicate pause did not reach writer");
+        check(producer.shutdown() == ProducerResult::producer_internal_error,
+              "duplicate pause was not fail closed");
+    }
+    {
+        auto state = std::make_shared<SinkState>();
+        JournalProducer producer(options_for(state));
+        check(producer.start_recording(start_request()) == ProducerResult::producer_ok, "start failed");
+        check(producer.submit(start_event()) == CallbackResult::accepted, "start event rejected");
+        check(producer.submit(pause_snapshot()) == CallbackResult::accepted, "pause rejected");
+        check(producer.submit(resume_snapshot()) == CallbackResult::accepted, "resume rejected");
+        auto duplicate = resume_snapshot(5, 122);
+        duplicate.event_id = "55555555-5555-4555-8555-555555555555";
+        check(producer.submit(std::move(duplicate)) == CallbackResult::accepted,
+              "duplicate resume did not reach writer");
+        check(producer.shutdown() == ProducerResult::producer_internal_error,
+              "duplicate resume was not fail closed");
+    }
+    for (const std::uint64_t movement : {0ULL, 1ULL, 2ULL}) {
+        auto state = std::make_shared<SinkState>();
+        JournalProducer producer(options_for(state));
+        check(producer.start_recording(start_request()) == ProducerResult::producer_ok, "start failed");
+        check(producer.submit(start_event()) == CallbackResult::accepted, "start event rejected");
+        check(producer.submit(pause_snapshot()) == CallbackResult::accepted, "pause rejected");
+        check(producer.submit(resume_snapshot(4, 120 + movement)) == CallbackResult::accepted,
+              "bounded resume movement rejected");
+        check(producer.normal_stop(stop_request()) == ProducerResult::producer_ok, "stop rejected");
+        check(producer.shutdown() == ProducerResult::producer_ok,
+              "bounded resume movement failed writer validation");
+    }
+    {
+        auto state = std::make_shared<SinkState>();
+        JournalProducer producer(options_for(state));
+        check(producer.start_recording(start_request()) == ProducerResult::producer_ok, "start failed");
+        check(producer.submit(start_event()) == CallbackResult::accepted, "start event rejected");
+        check(producer.submit(pause_snapshot()) == CallbackResult::accepted, "pause rejected");
+        check(producer.submit(resume_snapshot(4, 123)) == CallbackResult::accepted,
+              "large resume movement did not reach writer");
+        check(producer.normal_stop(stop_request()) == ProducerResult::producer_ok, "stop rejected");
+        check(producer.shutdown() == ProducerResult::producer_internal_error,
+              "resume movement above two frames was not fail closed");
+    }
+}
+
+void test_queue_overflow_with_accepted_pause_resume_drains_without_stop() {
+    OverflowFixture fixture;
+    check(fixture.producer.submit(pause_snapshot()) == CallbackResult::accepted, "pause slot rejected");
+    check(fixture.producer.submit(resume_snapshot()) == CallbackResult::accepted, "resume slot rejected");
+    check(fixture.producer.submit(sample(5)) == CallbackResult::full,
+          "pause/resume queue overflow was not observed");
+    release_writer(fixture.sink);
+    check(fixture.producer.shutdown() == ProducerResult::producer_failed_queue_overflow,
+          "pause/resume overflow did not remain fail closed");
+    std::lock_guard lock(fixture.sink->mutex);
+    check(fixture.sink->lines.size() == 4, "accepted pause/resume snapshots were not drained");
+    check(fixture.sink->lines[2].find("\"record_type\":\"pause\"") != std::string::npos &&
+              fixture.sink->lines[3].find("\"record_type\":\"resume\"") != std::string::npos,
+          "pause/resume overflow drain order changed");
+    check(fixture.sink->lines.back().find("\"record_type\":\"stop\"") == std::string::npos,
+          "pause/resume overflow emitted a stop");
+}
+
+void test_pause_resume_event_ids_cannot_reuse_an_existing_event_id() {
+    auto state = std::make_shared<SinkState>();
+    JournalProducer producer(options_for(state));
+    check(producer.start_recording(start_request()) == ProducerResult::producer_ok, "start failed");
+    check(producer.submit(start_event()) == CallbackResult::accepted, "start event rejected");
+    auto duplicate = pause_snapshot();
+    duplicate.event_id = std::string(start_id);
+    check(producer.submit(std::move(duplicate)) == CallbackResult::accepted,
+          "duplicate pause did not reach writer validation");
+    check(producer.normal_stop(stop_request()) == ProducerResult::producer_ok,
+          "stop request did not linearize after accepted duplicate");
+    check(producer.shutdown() == ProducerResult::producer_internal_error,
+          "duplicate pause UUID did not make the run unfinalizable");
+    std::lock_guard lock(state->mutex);
+    check(state->lines.size() == 2, "duplicate UUID wrote a pause or successful stop record");
+}
+
 }  // namespace
 
 int main() {
@@ -504,6 +593,11 @@ int main() {
         {"pause-resume/canonical/uuid/sequence", test_pause_resume_are_canonical_and_writer_sequenced},
         {"pause-lifecycle/invalid-order/paused-stop",
          test_pause_lifecycle_rejects_invalid_order_and_accepts_paused_stop},
+        {"pause-lifecycle/duplicate/counter-motion",
+         test_pause_lifecycle_rejects_duplicate_transitions_and_large_counter_motion},
+        {"pause-resume/queue-overflow-drain",
+         test_queue_overflow_with_accepted_pause_resume_drains_without_stop},
+        {"pause-resume/duplicate-event-id", test_pause_resume_event_ids_cannot_reuse_an_existing_event_id},
     };
     int failures = 0;
     for (const auto& [name, test] : tests) {

@@ -10,6 +10,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -423,6 +424,25 @@ bool snapshot_valid(const JournalSnapshot& snapshot) noexcept {
     return uuid_is_v4(resume.event_id) && !resume.clock.recording_paused;
 }
 
+bool event_id_is_unique(
+    const JournalSnapshot& snapshot,
+    std::unordered_set<std::string>& event_ids) noexcept {
+    try {
+        if (const auto* event = std::get_if<EventSnapshot>(&snapshot)) {
+            return event_ids.emplace(event->event_id).second;
+        }
+        if (const auto* pause = std::get_if<PauseSnapshot>(&snapshot)) {
+            return event_ids.emplace(pause->event_id).second;
+        }
+        if (const auto* resume = std::get_if<ResumeSnapshot>(&snapshot)) {
+            return event_ids.emplace(resume->event_id).second;
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 void finish_writer(const std::shared_ptr<JournalProducer::Shared>& shared) noexcept {
     shared->sink.reset();
     {
@@ -462,6 +482,7 @@ void writer_main(const std::shared_ptr<JournalProducer::Shared>& shared) noexcep
 
     std::uint64_t sequence = 1;
     std::optional<ClockSnapshot> previous;
+    std::unordered_set<std::string> event_ids;
     bool paused = false;
     std::uint64_t pause_counter = 0;
     while (shared->state.load(std::memory_order_acquire) == ProducerState::recording_active ||
@@ -504,28 +525,37 @@ void writer_main(const std::shared_ptr<JournalProducer::Shared>& shared) noexcep
                 (!is_resume || clock.output_frame_count - pause_counter <= 2) &&
                 (!requires_active || !paused);
             if (!snapshot_valid(*item) || !clock_valid(clock, previous, requires_active) ||
-                !valid_transition) {
+                !valid_transition || !event_id_is_unique(*item, event_ids)) {
                 set_primary_failure(
                     shared,
                     ProducerState::producer_failed_internal,
                     ProducerResult::producer_internal_error);
                 continue;
             }
-            std::string line = std::visit(
-                [&](const auto& value) {
-                    using Value = std::decay_t<decltype(value)>;
-                    if constexpr (std::is_same_v<Value, EventSnapshot>) {
-                        return event_line(value, sequence);
-                    } else if constexpr (std::is_same_v<Value, CalibrationSnapshot>) {
-                        return calibration_line(value, sequence);
-                    } else if constexpr (std::is_same_v<Value, PauseSnapshot>) {
-                        return pause_line(value, sequence);
-                    } else {
-                        return resume_line(value, sequence);
-                    }
-                },
-                *item);
-            if (!shared->sink->write_line(line)) {
+            std::optional<std::string> line;
+            try {
+                line.emplace(std::visit(
+                    [&](const auto& value) {
+                        using Value = std::decay_t<decltype(value)>;
+                        if constexpr (std::is_same_v<Value, EventSnapshot>) {
+                            return event_line(value, sequence);
+                        } else if constexpr (std::is_same_v<Value, CalibrationSnapshot>) {
+                            return calibration_line(value, sequence);
+                        } else if constexpr (std::is_same_v<Value, PauseSnapshot>) {
+                            return pause_line(value, sequence);
+                        } else {
+                            return resume_line(value, sequence);
+                        }
+                    },
+                    *item));
+            } catch (...) {
+                set_primary_failure(
+                    shared,
+                    ProducerState::producer_failed_internal,
+                    ProducerResult::producer_internal_error);
+                continue;
+            }
+            if (!shared->sink->write_line(*line)) {
                 set_primary_failure(
                     shared, ProducerState::producer_failed_io, ProducerResult::producer_failed_io);
                 continue;
@@ -550,7 +580,13 @@ void writer_main(const std::shared_ptr<JournalProducer::Shared>& shared) noexcep
                 ProducerResult::producer_internal_error);
             break;
         }
-        if (!shared->sink->write_line(stop_line(*stop, sequence))) {
+        bool stop_written = false;
+        try {
+            stop_written = shared->sink->write_line(stop_line(*stop, sequence));
+        } catch (...) {
+            stop_written = false;
+        }
+        if (!stop_written) {
             set_primary_failure(
                 shared, ProducerState::producer_failed_io, ProducerResult::producer_failed_io);
             break;

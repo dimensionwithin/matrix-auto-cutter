@@ -85,7 +85,7 @@ void usage() {
     std::cerr
         << "Usage: matrix-journal-producer --journal <path> --recording <mp4-path> "
            "--duration-ns <nanoseconds> --final-frame-count <frames> "
-           "[--pause-start-ns <nanoseconds> --resume-ns <nanoseconds>] "
+           "[--pause-start-ns <nanoseconds> [--resume-ns <nanoseconds>]] "
            "[--queue-capacity <count>]\n";
 }
 
@@ -139,16 +139,20 @@ std::optional<Arguments> parse_arguments(const int argc, wchar_t** argv) {
     if (!journal || !recording || !duration || !frames) {
         return std::nullopt;
     }
-    if (result.pause_start_ns.has_value() != result.resume_ns.has_value() ||
+    if ((result.resume_ns.has_value() && !result.pause_start_ns.has_value()) ||
         (result.pause_start_ns.has_value() &&
-         (*result.pause_start_ns == 0 || *result.pause_start_ns >= *result.resume_ns ||
-          *result.resume_ns >= result.duration_ns))) {
+         (*result.pause_start_ns == 0 || *result.pause_start_ns >= result.duration_ns ||
+          (result.resume_ns.has_value() &&
+           (*result.pause_start_ns >= *result.resume_ns ||
+            *result.resume_ns >= result.duration_ns))))) {
         return std::nullopt;
     }
-    const auto active_ns = result.duration_ns -
-                           (result.pause_start_ns.has_value()
-                                ? *result.resume_ns - *result.pause_start_ns
-                                : 0);
+    const auto active_ns =
+        !result.pause_start_ns.has_value()
+            ? result.duration_ns
+            : result.resume_ns.has_value()
+                  ? result.duration_ns - (*result.resume_ns - *result.pause_start_ns)
+                  : *result.pause_start_ns;
     const long double expected = static_cast<long double>(result.final_frame_count) *
                                  1'000'000'000.0L / 60.0L;
     const long double difference =
@@ -210,9 +214,11 @@ int wmain(const int argc, wchar_t** argv) {
         if (!arguments->pause_start_ns.has_value() || wall_ns <= *arguments->pause_start_ns) {
             return wall_ns;
         }
-        const auto paused = wall_ns < *arguments->resume_ns
+        const auto paused = !arguments->resume_ns.has_value()
                                 ? wall_ns - *arguments->pause_start_ns
-                                : *arguments->resume_ns - *arguments->pause_start_ns;
+                                : wall_ns < *arguments->resume_ns
+                                      ? wall_ns - *arguments->pause_start_ns
+                                      : *arguments->resume_ns - *arguments->pause_start_ns;
         return wall_ns - paused;
     };
     const auto counter_at = [&](const std::uint64_t wall_ns) {
@@ -229,7 +235,9 @@ int wmain(const int argc, wchar_t** argv) {
     }
     if (arguments->pause_start_ns.has_value()) {
         points.push_back(*arguments->pause_start_ns);
-        points.push_back(*arguments->resume_ns);
+        if (arguments->resume_ns.has_value()) {
+            points.push_back(*arguments->resume_ns);
+        }
     }
     std::sort(points.begin(), points.end());
     points.erase(std::unique(points.begin(), points.end()), points.end());
@@ -251,7 +259,8 @@ int wmain(const int argc, wchar_t** argv) {
             return 1;
         }
         if ((arguments->pause_start_ns.has_value() && point >= *arguments->pause_start_ns &&
-             point <= *arguments->resume_ns) || point % sample_period_ns != 0) {
+             (!arguments->resume_ns.has_value() || point <= *arguments->resume_ns)) ||
+            point % sample_period_ns != 0) {
             continue;
         }
         if (!accepted(
@@ -263,7 +272,10 @@ int wmain(const int argc, wchar_t** argv) {
     }
 
     const ProducerResult stopped = producer.normal_stop(RecordingStop{
-        ClockSnapshot{arguments->duration_ns, arguments->final_frame_count, false},
+        ClockSnapshot{
+            arguments->duration_ns,
+            arguments->final_frame_count,
+            arguments->pause_start_ns.has_value() && !arguments->resume_ns.has_value()},
         arguments->recording_utf8,
     });
     if (stopped != ProducerResult::producer_ok) {
