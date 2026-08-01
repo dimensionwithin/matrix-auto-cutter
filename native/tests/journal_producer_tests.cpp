@@ -44,6 +44,7 @@ struct SinkState final {
     bool event_entered{};
     bool release{};
     int fail_at{-1};
+    int writer_exit_calls{};
 };
 
 class TestSink final : public JournalSink {
@@ -266,6 +267,13 @@ void test_shutdown_timeout_preserves_live_writer_resources() {
     state->block_event = true;
     auto options = options_for(state);
     options.shutdown_wait = std::make_shared<ImmediateTimeoutWait>();
+    options.writer_thread_exit = [state] {
+        {
+            std::lock_guard lock(state->mutex);
+            ++state->writer_exit_calls;
+        }
+        state->changed.notify_all();
+    };
     {
         JournalProducer producer(std::move(options));
         check(producer.start_recording(start_request()) == ProducerResult::producer_ok,
@@ -278,11 +286,18 @@ void test_shutdown_timeout_preserves_live_writer_resources() {
               "shutdown timeout was not returned");
         check(producer.shutdown() == ProducerResult::producer_shutdown_timeout,
               "shutdown timeout was not idempotent");
+        {
+            std::lock_guard lock(state->mutex);
+            check(state->writer_exit_calls == 0,
+                  "writer module lifetime was released while detached code was still blocked");
+        }
     }
     release_writer(state);
     std::unique_lock lock(state->mutex);
     check(state->changed.wait_for(lock, 2s, [&] { return state.use_count() == 1; }),
           "detached writer retained resources after release");
+    check(state->writer_exit_calls == 1,
+          "writer thread lifetime hook did not run exactly once after timeout release");
     for (const auto& line : state->lines) {
         check(line.find("\"record_type\":\"stop\"") == std::string::npos,
               "timed-out shutdown later emitted a stop");

@@ -555,7 +555,20 @@ ProducerResult JournalProducer::start_recording(const RecordingStart& start) noe
                 shared_, ProducerState::producer_failed_io, ProducerResult::producer_failed_io);
             return ProducerResult::producer_failed_io;
         }
-        thread_->value = std::thread(writer_main, shared_);
+        thread_->value = std::thread([shared = shared_]() mutable noexcept {
+            auto writer_thread_exit = std::move(shared->options.writer_thread_exit);
+            writer_main(shared);
+            // A timed-out plugin host may already have released its producer.
+            // Drop the writer's final shared-state reference before the host's
+            // non-returning module-unpin/exit operation.
+            shared.reset();
+            if (writer_thread_exit) {
+                try {
+                    writer_thread_exit();
+                } catch (...) {
+                }
+            }
+        });
         std::unique_lock lock(shared_->lifecycle_mutex);
         shared_->lifecycle_changed.wait(lock, [&] { return shared_->startup_done; });
         return result();

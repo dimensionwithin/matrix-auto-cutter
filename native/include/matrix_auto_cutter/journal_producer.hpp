@@ -100,6 +100,7 @@ class JournalSink {
 using JournalSinkFactory =
     std::function<std::unique_ptr<JournalSink>(const std::filesystem::path&)>;
 using UuidFactory = std::function<std::string()>;
+using WriterThreadExit = std::function<void()>;
 
 class ShutdownClock {
   public:
@@ -123,6 +124,9 @@ struct ProducerOptions final {
     UuidFactory uuid_factory;
     std::shared_ptr<ShutdownClock> shutdown_clock;
     std::shared_ptr<ShutdownWait> shutdown_wait;
+    // Called as the final operation on the writer thread. A plugin host may use
+    // a non-returning FreeLibraryAndExitThread hook to bind DLL code lifetime.
+    WriterThreadExit writer_thread_exit;
 };
 
 class JournalProducer final {
