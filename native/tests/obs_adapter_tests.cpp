@@ -91,6 +91,8 @@ struct ProducerState final {
     unsigned starts{};
     unsigned events{};
     unsigned calibrations{};
+    unsigned pauses{};
+    unsigned resumes{};
     unsigned stops{};
     unsigned shutdowns{};
     RecordingStart start{};
@@ -118,8 +120,12 @@ class FakeProducer final : public ProducerPort {
         std::lock_guard lock(state_->mutex);
         if (std::holds_alternative<EventSnapshot>(snapshot)) {
             ++state_->events;
-        } else {
+        } else if (std::holds_alternative<CalibrationSnapshot>(snapshot)) {
             ++state_->calibrations;
+        } else if (std::holds_alternative<PauseSnapshot>(snapshot)) {
+            ++state_->pauses;
+        } else {
+            ++state_->resumes;
         }
         state_->changed.notify_all();
         return state_->calibration_result;
@@ -594,6 +600,84 @@ void test_failed_or_missing_output_stop_never_calls_normal_stop() {
     }
 }
 
+void test_actual_output_pause_resume_is_ordered_and_gates_calibration() {
+    TempRoot root;
+    auto producer = std::make_shared<ProducerState>();
+    FakeFactory factory(producer);
+    FakeHost host;
+    ObsJournalAdapter adapter(host, factory, test_options(root.path));
+    check(adapter.load(), "pause/resume load failed");
+    start_output(host, adapter, producer);
+    anchor_recording(host, producer);
+
+    host.set_signal(recording_path, 12'000'000'000ULL, 120);
+    host.fire_output(OutputEvent::paused);
+    wait_for_producer_count(producer, [](const auto& value) { return value.pauses == 1; },
+                            "actual output pause did not submit one pause snapshot");
+    check(adapter.state() == AdapterState::paused, "pause did not move adapter to paused state");
+    host.set_signal(recording_path, 14'000'000'000ULL, 120);
+    host.fire_tick();
+    std::this_thread::sleep_for(10ms);
+    {
+        std::lock_guard lock(producer->mutex);
+        check(producer->calibrations == 0, "calibration was accepted during pause");
+    }
+
+    host.set_signal(recording_path, 15'000'000'000ULL, 122);
+    host.fire_output(OutputEvent::resumed);
+    wait_for_producer_count(producer, [](const auto& value) { return value.resumes == 1; },
+                            "actual output unpause did not submit one resume snapshot");
+    wait_for([&] { return adapter.state() == AdapterState::active; },
+             "resume did not reactivate adapter");
+    host.set_signal(recording_path, 17'100'000'000ULL, 248);
+    host.fire_tick();
+    wait_for_producer_count(producer, [](const auto& value) { return value.calibrations == 1; },
+                            "calibration did not continue after resume");
+    stop_output_successfully(host, adapter, producer);
+    std::lock_guard lock(producer->mutex);
+    check(!producer->stop.clock.recording_paused, "stop after resume retained paused flag");
+}
+
+void test_pause_sequence_failure_and_stop_while_paused() {
+    {
+        TempRoot root;
+        auto producer = std::make_shared<ProducerState>();
+        FakeFactory factory(producer);
+        FakeHost host;
+        ObsJournalAdapter adapter(host, factory, test_options(root.path));
+        check(adapter.load(), "double-pause load failed");
+        start_output(host, adapter, producer);
+        anchor_recording(host, producer);
+        host.set_signal(recording_path, 12'000'000'000ULL, 120);
+        host.fire_output(OutputEvent::paused);
+        host.fire_output(OutputEvent::paused);
+        wait_for([&] { return adapter.state() == AdapterState::failed; },
+                 "double actual pause was not fail closed");
+        adapter.unload();
+    }
+    {
+        TempRoot root;
+        auto producer = std::make_shared<ProducerState>();
+        FakeFactory factory(producer);
+        FakeHost host;
+        ObsJournalAdapter adapter(host, factory, test_options(root.path));
+        check(adapter.load(), "paused-stop load failed");
+        start_output(host, adapter, producer);
+        anchor_recording(host, producer);
+        host.set_signal(recording_path, 12'000'000'000ULL, 120);
+        host.fire_output(OutputEvent::paused);
+        wait_for_producer_count(producer, [](const auto& value) { return value.pauses == 1; },
+                                "pause was not accepted before stop");
+        host.set_signal(recording_path, 15'000'000'000ULL, 121);
+        host.fire_output(OutputEvent::stopped, 0);
+        wait_for([&] { return adapter.state() == AdapterState::idle; },
+                 "stop while paused did not finish");
+        std::lock_guard lock(producer->mutex);
+        check(producer->stop.clock.recording_paused,
+              "stop while paused did not retain paused flag");
+    }
+}
+
 void test_invalid_session_localappdata_and_unsupported_or_concurrent_start_fail_closed() {
     {
         TempRoot root;
@@ -840,6 +924,9 @@ int main() {
         {"output-authority/path/session/calibration/stop/cleanup/idempotence",
          test_output_lifecycle_authority_normative_path_and_exact_binding},
         {"failed-or-missing-output-stop", test_failed_or_missing_output_stop_never_calls_normal_stop},
+        {"actual-output-pause-resume/calibration-gate/order",
+         test_actual_output_pause_resume_is_ordered_and_gates_calibration},
+        {"pause-sequence-failure/stop-while-paused", test_pause_sequence_failure_and_stop_while_paused},
         {"invalid-session/localappdata/unsupported/concurrent-start",
          test_invalid_session_localappdata_and_unsupported_or_concurrent_start_fail_closed},
         {"unload-blocked-idle/start-pending/active-tick/output-stop",

@@ -333,7 +333,9 @@ void ObsJournalAdapter::output_boundary(
     try {
         self->probe_callback(
             event == OutputEvent::started ? CallbackKind::output_start
-                                          : CallbackKind::output_stop);
+            : event == OutputEvent::paused  ? CallbackKind::output_pause
+            : event == OutputEvent::resumed ? CallbackKind::output_resume
+                                            : CallbackKind::output_stop);
         self->on_output(event, code);
     } catch (...) {
         static_cast<void>(self->queue_forced_failure());
@@ -375,6 +377,7 @@ void ObsJournalAdapter::on_frontend(const FrontendEvent event) noexcept {
         return;
     }
     output_reference_held_.store(true, std::memory_order_release);
+    observed_pause_state_.store(0, std::memory_order_release);
     if (!host_.connect_recording_output_signals(output_boundary, this)) {
         release_output_reference();
         expected = AdapterState::start_pending;
@@ -385,7 +388,7 @@ void ObsJournalAdapter::on_frontend(const FrontendEvent event) noexcept {
     output_signals_connected_.store(true, std::memory_order_release);
     host_.log(
         LogLevel::info,
-        "recording output bound; official output start/stop signals connected");
+        "recording output bound; official output start/pause/unpause/stop signals connected");
 }
 
 bool ObsJournalAdapter::queue_forced_failure() noexcept {
@@ -413,7 +416,7 @@ void ObsJournalAdapter::on_output(const OutputEvent event, const int code) noexc
             return;
         }
         std::unique_lock lock(command_mutex_, std::try_to_lock);
-        if (!lock.owns_lock() || pending_start_.has_value()) {
+        if (!lock.owns_lock() || control_size_ == control_command_capacity) {
             if (lock.owns_lock()) {
                 lock.unlock();
             }
@@ -421,10 +424,61 @@ void ObsJournalAdapter::on_output(const OutputEvent event, const int code) noexc
             static_cast<void>(queue_forced_failure());
             return;
         }
-        pending_start_ = signal;
+        control_commands_[control_write_] = ControlCommand{
+            ControlKind::start, signal, 0, 0, 0, true};
+        control_write_ = (control_write_ + 1) % control_command_capacity;
+        ++control_size_;
         lock.unlock();
         command_changed_.notify_one();
         host_.log(LogLevel::info, "actual output start signal recognized; producer start queued");
+        return;
+    }
+
+    if (event == OutputEvent::paused || event == OutputEvent::resumed) {
+        if (!recording_started_accepted_.load(std::memory_order_acquire) ||
+            current == AdapterState::stopping || current == AdapterState::failed ||
+            current == AdapterState::unloading || current == AdapterState::unloaded) {
+            host_.log(LogLevel::error, "pause/resume outside an active journal run rejected fail closed");
+            static_cast<void>(queue_forced_failure());
+            return;
+        }
+        unsigned expected = event == OutputEvent::paused ? 0U : 1U;
+        const unsigned desired = event == OutputEvent::paused ? 1U : 2U;
+        if (!observed_pause_state_.compare_exchange_strong(
+                expected, desired, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            host_.log(LogLevel::error, "invalid actual output pause/resume sequence rejected fail closed");
+            static_cast<void>(queue_forced_failure());
+            return;
+        }
+        std::uint64_t absolute = 0;
+        std::uint64_t frames = 0;
+        if (!host_.capture_clock(absolute, frames)) {
+            host_.log(LogLevel::error, "pause/resume clock capture failed; run forced fail closed");
+            static_cast<void>(queue_forced_failure());
+            return;
+        }
+        std::unique_lock lock(command_mutex_, std::try_to_lock);
+        if (!lock.owns_lock() || control_size_ == control_command_capacity) {
+            if (lock.owns_lock()) {
+                lock.unlock();
+            }
+            host_.log(LogLevel::error, "bounded control command queue overflowed on pause/resume");
+            static_cast<void>(queue_forced_failure());
+            return;
+        }
+        const auto kind = event == OutputEvent::paused ? ControlKind::pause : ControlKind::resume;
+        control_commands_[control_write_] = ControlCommand{kind, {}, absolute, frames, 0, true};
+        control_write_ = (control_write_ + 1) % control_command_capacity;
+        ++control_size_;
+        if (event == OutputEvent::paused) {
+            state_.store(AdapterState::paused, std::memory_order_release);
+        }
+        lock.unlock();
+        command_changed_.notify_one();
+        host_.log(
+            LogLevel::info,
+            event == OutputEvent::paused ? "actual output pause signal queued"
+                                         : "actual output unpause signal queued");
         return;
     }
 
@@ -436,7 +490,7 @@ void ObsJournalAdapter::on_output(const OutputEvent event, const int code) noexc
     RecordingSignal signal;
     const bool captured = host_.capture_recording_output(signal);
     std::unique_lock lock(command_mutex_, std::try_to_lock);
-    if (!lock.owns_lock() || pending_stop_.has_value()) {
+    if (!lock.owns_lock() || control_size_ == control_command_capacity) {
         if (lock.owns_lock()) {
             lock.unlock();
         }
@@ -444,7 +498,10 @@ void ObsJournalAdapter::on_output(const OutputEvent event, const int code) noexc
         static_cast<void>(queue_forced_failure());
         return;
     }
-    pending_stop_ = StopCommand{signal, code, captured};
+    control_commands_[control_write_] =
+        ControlCommand{ControlKind::stop, signal, 0, 0, code, captured};
+    control_write_ = (control_write_ + 1) % control_command_capacity;
+    ++control_size_;
     accepting_snapshots_.store(false, std::memory_order_release);
     state_.store(AdapterState::stopping, std::memory_order_release);
     lock.unlock();
@@ -458,7 +515,8 @@ void ObsJournalAdapter::on_output(const OutputEvent event, const int code) noexc
 
 void ObsJournalAdapter::on_tick() noexcept {
     if (state_.load(std::memory_order_acquire) != AdapterState::active ||
-        !accepting_snapshots_.load(std::memory_order_acquire)) {
+        !accepting_snapshots_.load(std::memory_order_acquire) ||
+        observed_pause_state_.load(std::memory_order_acquire) != 0) {
         return;
     }
     std::uint64_t absolute = 0;
@@ -609,7 +667,11 @@ void ObsJournalAdapter::process_start(const RecordingSignal& signal) noexcept {
         recording_started_accepted_.store(false, std::memory_order_release);
         accepting_snapshots_.store(true, std::memory_order_release);
         if (state_.load(std::memory_order_acquire) != AdapterState::stopping) {
-            state_.store(AdapterState::active, std::memory_order_release);
+            state_.store(
+                observed_pause_state_.load(std::memory_order_acquire) == 0
+                    ? AdapterState::active
+                    : AdapterState::paused,
+                std::memory_order_release);
         }
         host_.log(LogLevel::info, "native producer started from actual output start signal");
         host_.log(LogLevel::info, journal_utf8);
@@ -685,6 +747,56 @@ void ObsJournalAdapter::process_clock(const ClockCommand& command) noexcept {
     }
 }
 
+void ObsJournalAdapter::process_pause_or_resume(const ControlCommand& command) noexcept {
+    try {
+        if (!producer_ || !recording_started_accepted_.load(std::memory_order_acquire)) {
+            fail_current_run(
+                ProducerResult::producer_internal_error,
+                "pause/resume arrived before recording_started was journaled");
+            return;
+        }
+        const auto origin = origin_ns_.load(std::memory_order_acquire);
+        if (!command.captured || command.absolute_monotonic_ns < origin) {
+            fail_current_run(
+                ProducerResult::producer_internal_error,
+                "pause/resume clock was not monotone from output start");
+            return;
+        }
+        const std::string event_id =
+            options_.event_uuid_factory ? options_.event_uuid_factory() : std::string{};
+        if (!valid_uuid_v4(event_id)) {
+            fail_current_run(
+                ProducerResult::producer_internal_error,
+                "pause/resume UUIDv4 generation failed");
+            return;
+        }
+        const ClockSnapshot clock{
+            command.absolute_monotonic_ns - origin, command.output_frame_count,
+            command.kind == ControlKind::pause};
+        const CallbackResult outcome = command.kind == ControlKind::pause
+                                           ? producer_->submit(PauseSnapshot{event_id, clock})
+                                           : producer_->submit(ResumeSnapshot{event_id, clock});
+        if (outcome != CallbackResult::accepted) {
+            fail_current_run(
+                outcome == CallbackResult::full ? ProducerResult::producer_failed_queue_overflow
+                                                : ProducerResult::producer_internal_error,
+                "producer rejected pause/resume snapshot; run cannot be successful");
+            return;
+        }
+        if (command.kind == ControlKind::resume) {
+            observed_pause_state_.store(0, std::memory_order_release);
+            if (state_.load(std::memory_order_acquire) != AdapterState::stopping) {
+                state_.store(AdapterState::active, std::memory_order_release);
+            }
+            host_.log(LogLevel::info, "resume snapshot accepted by native producer");
+        } else {
+            host_.log(LogLevel::info, "pause snapshot accepted by native producer");
+        }
+    } catch (...) {
+        fail_current_run(ProducerResult::producer_internal_error, "pause/resume processing threw");
+    }
+}
+
 void ObsJournalAdapter::disconnect_output_signals() noexcept {
     if (output_signals_connected_.exchange(false, std::memory_order_acq_rel)) {
         host_.disconnect_recording_output_signals();
@@ -726,9 +838,10 @@ void ObsJournalAdapter::reset_run() noexcept {
     accepting_snapshots_.store(false, std::memory_order_release);
     recording_started_claimed_.store(false, std::memory_order_release);
     recording_started_accepted_.store(false, std::memory_order_release);
+    observed_pause_state_.store(0, std::memory_order_release);
 }
 
-void ObsJournalAdapter::process_stop(const StopCommand& command) noexcept {
+void ObsJournalAdapter::process_stop(const ControlCommand& command) noexcept {
     try {
         accepting_snapshots_.store(false, std::memory_order_release);
         state_.store(AdapterState::stopping, std::memory_order_release);
@@ -739,37 +852,18 @@ void ObsJournalAdapter::process_stop(const StopCommand& command) noexcept {
         if (producer_ && command.captured && command.code == 0 &&
             recording_started_accepted_.load(std::memory_order_acquire)) {
             RecordingSignal signal = command.signal;
-            const auto started_frames =
-                recording_started_frame_count_.load(std::memory_order_acquire);
-            const auto started_ns = recording_started_ns_.load(std::memory_order_acquire);
-            constexpr std::uint64_t max_stop_qpc_adjustment_frames = 8;
-            const auto max_adjustment = frame_span_ns(max_stop_qpc_adjustment_frames);
-            const auto counter_span = signal.output_frame_count >= started_frames
-                                          ? frame_span_ns(signal.output_frame_count - started_frames)
-                                          : std::nullopt;
-            bool valid = max_adjustment.has_value() && counter_span.has_value() &&
-                         started_ns <= UINT64_MAX - counter_span.value_or(0) &&
-                         signal.path.view() == recording_path_;
+            const auto origin = origin_ns_.load(std::memory_order_acquire);
+            const bool paused = observed_pause_state_.load(std::memory_order_acquire) == 1;
+            const bool valid = signal.absolute_monotonic_ns >= origin &&
+                               signal.path.view() == recording_path_;
             if (valid) {
-                const auto final_frame_ns = started_ns + *counter_span;
-                const auto difference = final_frame_ns <= signal.absolute_monotonic_ns
-                                            ? signal.absolute_monotonic_ns - final_frame_ns
-                                            : final_frame_ns - signal.absolute_monotonic_ns;
-                valid = difference <= *max_adjustment;
-                if (valid) {
-                    signal.absolute_monotonic_ns = final_frame_ns;
-                    const auto origin = origin_ns_.load(std::memory_order_acquire);
-                    valid = signal.absolute_monotonic_ns >= origin;
-                    if (valid) {
-                        stop_result = producer_->normal_stop(RecordingStop{
-                            ClockSnapshot{
-                                signal.absolute_monotonic_ns - origin,
-                                signal.output_frame_count,
-                                false},
-                            std::string(signal.path.view()),
-                        });
-                    }
-                }
+                stop_result = producer_->normal_stop(RecordingStop{
+                    ClockSnapshot{
+                        signal.absolute_monotonic_ns - origin,
+                        signal.output_frame_count,
+                        paused},
+                    std::string(signal.path.view()),
+                });
             }
         }
         const auto shutdown_result = producer_ ? producer_->shutdown()
@@ -862,24 +956,23 @@ void ObsJournalAdapter::fail_current_run(
 void ObsJournalAdapter::worker_main() noexcept {
     try {
         for (;;) {
-            std::optional<RecordingSignal> start;
+            std::optional<ControlCommand> control;
             std::optional<ClockCommand> clock;
-            std::optional<StopCommand> stop;
             bool forced = false;
             bool unload = false;
             {
                 std::unique_lock lock(command_mutex_);
                 command_changed_.wait(lock, [&] {
-                    return pending_start_.has_value() || pending_clock_.has_value() ||
-                           pending_stop_.has_value() ||
+                    return control_size_ != 0 || pending_clock_.has_value() ||
                            forced_shutdown_.load(std::memory_order_acquire) || unload_requested_;
                 });
-                start = std::move(pending_start_);
-                pending_start_.reset();
+                if (control_size_ != 0) {
+                    control.emplace(std::move(control_commands_[control_read_]));
+                    control_read_ = (control_read_ + 1) % control_command_capacity;
+                    --control_size_;
+                }
                 clock = std::move(pending_clock_);
                 pending_clock_.reset();
-                stop = std::move(pending_stop_);
-                pending_stop_.reset();
                 forced = forced_shutdown_.exchange(false, std::memory_order_acq_rel);
                 unload = unload_requested_;
             }
@@ -897,14 +990,25 @@ void ObsJournalAdapter::worker_main() noexcept {
                 state_.store(AdapterState::unloading, std::memory_order_release);
                 break;
             }
-            if (start.has_value()) {
-                process_start(*start);
-            }
-            if (clock.has_value()) {
-                process_clock(*clock);
-            }
-            if (stop.has_value()) {
-                process_stop(*stop);
+            if (control.has_value() && control->kind == ControlKind::start) {
+                process_start(control->signal);
+                if (clock.has_value()) {
+                    process_clock(*clock);
+                }
+            } else {
+                // A calibration captured before a pause/stop must be drained
+                // before that control command; calibration remains coalesced.
+                if (clock.has_value()) {
+                    process_clock(*clock);
+                }
+                if (control.has_value()) {
+                    if (control->kind == ControlKind::pause ||
+                        control->kind == ControlKind::resume) {
+                        process_pause_or_resume(*control);
+                    } else {
+                        process_stop(*control);
+                    }
+                }
             }
             if (forced) {
                 force_cleanup(

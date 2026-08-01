@@ -108,6 +108,45 @@ def main() -> int:
         ]
         if max(right - left for left, right in pairwise(anchors)) > 2_000_000_000:
             raise AssertionError("90-minute active calibration cadence exceeded two seconds")
+
+        paused_journal = root / "native-pause.recording-journal.ndjson"
+        paused_run = subprocess.run(
+            [
+                str(harness),
+                "--journal",
+                str(paused_journal),
+                "--recording",
+                str(recording),
+                "--duration-ns",
+                "8000000000",
+                "--final-frame-count",
+                "360",
+                "--pause-start-ns",
+                "2000000000",
+                "--resume-ns",
+                "4000000000",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if paused_run.returncode != 0:
+            raise AssertionError(paused_run.stderr)
+        paused_records = [
+            json.loads(line) for line in paused_journal.read_bytes()[:-1].split(b"\n")
+        ]
+        if not isinstance(_parse_journal(paused_journal.read_bytes(), None), LoadedJournal):
+            raise AssertionError("native pause/resume journal was rejected")
+        pauses = [record for record in paused_records if record["record_type"] == "pause"]
+        resumes = [record for record in paused_records if record["record_type"] == "resume"]
+        if (
+            len(pauses) != 1
+            or len(resumes) != 1
+            or not pauses[0]["recording_paused"]
+            or resumes[0]["recording_paused"]
+            or resumes[0]["output_frame_count"] - pauses[0]["output_frame_count"] > 2
+        ):
+            raise AssertionError("native pause/resume records are not canonical")
     print("native journal accepted by the existing Phase-2F legacy loader")
     return 0
 

@@ -29,10 +29,10 @@ enum class FrontendEvent {
     recording_stopped,
     other,
 };
-enum class OutputEvent { started, stopped };
-enum class CallbackKind { frontend, tick, output_start, output_stop };
+enum class OutputEvent { started, paused, resumed, stopped };
+enum class CallbackKind { frontend, tick, output_start, output_pause, output_resume, output_stop };
 enum class LogLevel { info, warning, error };
-enum class AdapterState { unloaded, idle, start_pending, active, stopping, failed, unloading };
+enum class AdapterState { unloaded, idle, start_pending, active, paused, stopping, failed, unloading };
 
 struct BoundedPath final {
     std::array<char, max_recording_path_utf8 + 1> bytes{};
@@ -151,8 +151,12 @@ class ObsJournalAdapter final {
         std::uint64_t output_frame_count{};
         bool recording_start_anchor{};
     };
-    struct StopCommand final {
+    enum class ControlKind { start, pause, resume, stop };
+    struct ControlCommand final {
+        ControlKind kind{ControlKind::start};
         RecordingSignal signal;
+        std::uint64_t absolute_monotonic_ns{};
+        std::uint64_t output_frame_count{};
         int code{};
         bool captured{};
     };
@@ -167,7 +171,8 @@ class ObsJournalAdapter final {
     void worker_main() noexcept;
     void process_start(const RecordingSignal& signal) noexcept;
     void process_clock(const ClockCommand& command) noexcept;
-    void process_stop(const StopCommand& command) noexcept;
+    void process_pause_or_resume(const ControlCommand& command) noexcept;
+    void process_stop(const ControlCommand& command) noexcept;
     void fail_current_run(ProducerResult result, std::string_view reason) noexcept;
     void force_cleanup(ProducerResult result, std::string_view reason) noexcept;
     void disconnect_output_signals() noexcept;
@@ -193,6 +198,9 @@ class ObsJournalAdapter final {
     std::atomic<std::uint64_t> calibration_count_{};
     std::atomic<bool> recording_started_claimed_{};
     std::atomic<bool> recording_started_accepted_{};
+    // Tracks actual output-signal order independently of worker scheduling.
+    // 0 active, 1 pause queued/paused, 2 resume queued.
+    std::atomic<unsigned> observed_pause_state_{};
     std::atomic<std::uint64_t> callback_gate_{callback_gate_closed};
     std::atomic<unsigned> bound_callbacks_in_flight_{};
     mutable std::mutex callback_wait_mutex_;
@@ -200,9 +208,12 @@ class ObsJournalAdapter final {
 
     mutable std::mutex command_mutex_;
     std::condition_variable command_changed_;
-    std::optional<RecordingSignal> pending_start_;
+    static constexpr std::size_t control_command_capacity = 4;
+    std::array<ControlCommand, control_command_capacity> control_commands_{};
+    std::size_t control_read_{};
+    std::size_t control_write_{};
+    std::size_t control_size_{};
     std::optional<ClockCommand> pending_clock_;
-    std::optional<StopCommand> pending_stop_;
     std::atomic<bool> forced_shutdown_{};
     bool unload_requested_{};
 

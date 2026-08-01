@@ -247,10 +247,18 @@ struct JournalProducer::Shared final {
         }
         if (const auto* event = std::get_if<EventSnapshot>(&snapshot);
             event != nullptr &&
-            (event->event_id.size() != 36 ||
-             (event->source_uuid.has_value() && event->source_uuid->size() != 36) ||
-             (event->pair_id.has_value() && event->pair_id->size() != 36) ||
+            (!uuid_is_v4(event->event_id) ||
+             (event->source_uuid.has_value() && !uuid_is_v4(*event->source_uuid)) ||
+             (event->pair_id.has_value() && !uuid_is_v4(*event->pair_id)) ||
              (event->label.has_value() && event->label->size() > 500))) {
+            return CallbackResult::internal_error;
+        }
+        if (const auto* pause = std::get_if<PauseSnapshot>(&snapshot);
+            pause != nullptr && (!uuid_is_v4(pause->event_id) || !pause->clock.recording_paused)) {
+            return CallbackResult::internal_error;
+        }
+        if (const auto* resume = std::get_if<ResumeSnapshot>(&snapshot);
+            resume != nullptr && (!uuid_is_v4(resume->event_id) || resume->clock.recording_paused)) {
             return CallbackResult::internal_error;
         }
         const auto write = write_position.load(std::memory_order_relaxed);
@@ -347,6 +355,30 @@ std::string calibration_line(const CalibrationSnapshot& sample, const std::uint6
            std::to_string(sequence) + "}";
 }
 
+std::string pause_line(const PauseSnapshot& pause, const std::uint64_t sequence) {
+    std::string result =
+        "{\"artifact_type\":\"recording_event_journal\",\"event_id\":";
+    append_json_string(result, pause.event_id);
+    result += ",\"journal_schema_version\":\"1.0\",\"monotonic_ns\":" +
+              std::to_string(pause.clock.monotonic_ns) + ",\"output_frame_count\":" +
+              std::to_string(pause.clock.output_frame_count) +
+              ",\"record_type\":\"pause\",\"recording_paused\":true,\"sequence\":" +
+              std::to_string(sequence) + "}";
+    return result;
+}
+
+std::string resume_line(const ResumeSnapshot& resume, const std::uint64_t sequence) {
+    std::string result =
+        "{\"artifact_type\":\"recording_event_journal\",\"event_id\":";
+    append_json_string(result, resume.event_id);
+    result += ",\"journal_schema_version\":\"1.0\",\"monotonic_ns\":" +
+              std::to_string(resume.clock.monotonic_ns) + ",\"output_frame_count\":" +
+              std::to_string(resume.clock.output_frame_count) +
+              ",\"record_type\":\"resume\",\"recording_paused\":false,\"sequence\":" +
+              std::to_string(sequence) + "}";
+    return result;
+}
+
 std::string stop_line(const RecordingStop& stop, const std::uint64_t sequence) {
     std::string result =
         "{\"artifact_type\":\"recording_event_journal\",\"file_splitting_detected\":false,\"journal_schema_version\":\"1.0\",\"last_recording_path\":";
@@ -354,8 +386,9 @@ std::string stop_line(const RecordingStop& stop, const std::uint64_t sequence) {
     result += ",\"lifecycle_status\":\"stopped_unfinalized\",\"monotonic_ns\":" +
               std::to_string(stop.clock.monotonic_ns) + ",\"output_frame_count\":" +
               std::to_string(stop.clock.output_frame_count) +
-              ",\"output_result\":\"success\",\"record_type\":\"stop\",\"recording_paused\":false,\"sequence\":" +
-              std::to_string(sequence) + "}";
+              ",\"output_result\":\"success\",\"record_type\":\"stop\",\"recording_paused\":";
+    result += stop.clock.recording_paused ? "true" : "false";
+    result += ",\"sequence\":" + std::to_string(sequence) + "}";
     return result;
 }
 
@@ -380,7 +413,14 @@ bool snapshot_valid(const JournalSnapshot& snapshot) noexcept {
                (!event->label.has_value() ||
                 (event->label->size() <= 500 && valid_utf8(*event->label)));
     }
-    return !std::get<CalibrationSnapshot>(snapshot).clock.recording_paused;
+    if (const auto* sample = std::get_if<CalibrationSnapshot>(&snapshot)) {
+        return !sample->clock.recording_paused;
+    }
+    if (const auto* pause = std::get_if<PauseSnapshot>(&snapshot)) {
+        return uuid_is_v4(pause->event_id) && pause->clock.recording_paused;
+    }
+    const auto& resume = std::get<ResumeSnapshot>(snapshot);
+    return uuid_is_v4(resume.event_id) && !resume.clock.recording_paused;
 }
 
 void finish_writer(const std::shared_ptr<JournalProducer::Shared>& shared) noexcept {
@@ -422,6 +462,8 @@ void writer_main(const std::shared_ptr<JournalProducer::Shared>& shared) noexcep
 
     std::uint64_t sequence = 1;
     std::optional<ClockSnapshot> previous;
+    bool paused = false;
+    std::uint64_t pause_counter = 0;
     while (shared->state.load(std::memory_order_acquire) == ProducerState::recording_active ||
            shared->state.load(std::memory_order_acquire) == ProducerState::stop_requested ||
            shared->state.load(std::memory_order_acquire) ==
@@ -453,8 +495,16 @@ void writer_main(const std::shared_ptr<JournalProducer::Shared>& shared) noexcep
         }
         if (item.has_value()) {
             const auto clock = std::visit([](const auto& value) { return value.clock; }, *item);
-            if (!snapshot_valid(*item) ||
-                !clock_valid(clock, previous, std::holds_alternative<CalibrationSnapshot>(*item))) {
+            const bool is_pause = std::holds_alternative<PauseSnapshot>(*item);
+            const bool is_resume = std::holds_alternative<ResumeSnapshot>(*item);
+            const bool requires_active = std::holds_alternative<EventSnapshot>(*item) ||
+                                         std::holds_alternative<CalibrationSnapshot>(*item);
+            const bool valid_transition =
+                (!is_pause || !paused) && (!is_resume || paused) &&
+                (!is_resume || clock.output_frame_count - pause_counter <= 2) &&
+                (!requires_active || !paused);
+            if (!snapshot_valid(*item) || !clock_valid(clock, previous, requires_active) ||
+                !valid_transition) {
                 set_primary_failure(
                     shared,
                     ProducerState::producer_failed_internal,
@@ -466,8 +516,12 @@ void writer_main(const std::shared_ptr<JournalProducer::Shared>& shared) noexcep
                     using Value = std::decay_t<decltype(value)>;
                     if constexpr (std::is_same_v<Value, EventSnapshot>) {
                         return event_line(value, sequence);
-                    } else {
+                    } else if constexpr (std::is_same_v<Value, CalibrationSnapshot>) {
                         return calibration_line(value, sequence);
+                    } else if constexpr (std::is_same_v<Value, PauseSnapshot>) {
+                        return pause_line(value, sequence);
+                    } else {
+                        return resume_line(value, sequence);
                     }
                 },
                 *item);
@@ -478,10 +532,17 @@ void writer_main(const std::shared_ptr<JournalProducer::Shared>& shared) noexcep
             }
             ++sequence;
             previous = clock;
+            if (is_pause) {
+                paused = true;
+                pause_counter = clock.output_frame_count;
+            } else if (is_resume) {
+                paused = false;
+            }
             continue;
         }
-        if (!stop.has_value() || stop->clock.recording_paused ||
-            !clock_valid(stop->clock, previous, true) ||
+        if (!stop.has_value() || stop->clock.recording_paused != paused ||
+            (paused && stop->clock.output_frame_count - pause_counter > 2) ||
+            !clock_valid(stop->clock, previous, !paused) ||
             stop->recording_path_utf8 != shared->start.recording_path_utf8) {
             set_primary_failure(
                 shared,

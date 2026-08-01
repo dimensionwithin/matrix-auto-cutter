@@ -279,6 +279,10 @@ class NativeObsHost final : public AdapterHost {
         output_private_data_ = private_data;
         api_.signal_connect(handler, "start", obs_output_start_boundary, output_private_data_);
         start_signal_connected_.store(true, std::memory_order_release);
+        api_.signal_connect(handler, "pause", obs_output_pause_boundary, output_private_data_);
+        pause_signal_connected_.store(true, std::memory_order_release);
+        api_.signal_connect(handler, "unpause", obs_output_unpause_boundary, output_private_data_);
+        unpause_signal_connected_.store(true, std::memory_order_release);
         api_.signal_connect(handler, "stop", obs_output_stop_boundary, output_private_data_);
         stop_signal_connected_.store(true, std::memory_order_release);
         output_signals_connected_.store(true, std::memory_order_release);
@@ -296,12 +300,22 @@ class NativeObsHost final : public AdapterHost {
                 api_.signal_disconnect(
                     handler, "stop", obs_output_stop_boundary, output_private_data_);
             }
+            if (unpause_signal_connected_.exchange(false, std::memory_order_acq_rel)) {
+                api_.signal_disconnect(
+                    handler, "unpause", obs_output_unpause_boundary, output_private_data_);
+            }
+            if (pause_signal_connected_.exchange(false, std::memory_order_acq_rel)) {
+                api_.signal_disconnect(
+                    handler, "pause", obs_output_pause_boundary, output_private_data_);
+            }
             if (start_signal_connected_.exchange(false, std::memory_order_acq_rel)) {
                 api_.signal_disconnect(
                     handler, "start", obs_output_start_boundary, output_private_data_);
             }
         } else {
             stop_signal_connected_.store(false, std::memory_order_release);
+            unpause_signal_connected_.store(false, std::memory_order_release);
+            pause_signal_connected_.store(false, std::memory_order_release);
             start_signal_connected_.store(false, std::memory_order_release);
         }
         output_private_data_ = nullptr;
@@ -399,6 +413,23 @@ class NativeObsHost final : public AdapterHost {
         }
     }
 
+    // OBS 32.1.2 libobs registers exactly "void pause(ptr output)" and
+    // "void unpause(ptr output)" on each output signal handler.  They carry
+    // no result code, so the adapter receives the canonical zero placeholder.
+    static void obs_output_pause_boundary(void* data, calldata_t*) noexcept {
+        try {
+            ObsJournalAdapter::output_boundary(OutputEvent::paused, 0, data);
+        } catch (...) {
+        }
+    }
+
+    static void obs_output_unpause_boundary(void* data, calldata_t*) noexcept {
+        try {
+            ObsJournalAdapter::output_boundary(OutputEvent::resumed, 0, data);
+        } catch (...) {
+        }
+    }
+
     bool capture_path_and_kind(obs_output_t* output, RecordingSignal& signal) noexcept {
         const char* output_id = api_.output_id(output);
         if (output_id == nullptr) {
@@ -457,6 +488,8 @@ class NativeObsHost final : public AdapterHost {
     void* output_private_data_{};
     std::atomic<bool> output_signals_connected_{};
     std::atomic<bool> start_signal_connected_{};
+    std::atomic<bool> pause_signal_connected_{};
+    std::atomic<bool> unpause_signal_connected_{};
     std::atomic<bool> stop_signal_connected_{};
     std::array<char, 64> version_{};
     std::size_t version_size_{};

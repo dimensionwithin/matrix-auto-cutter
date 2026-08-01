@@ -77,7 +77,21 @@ struct CalibrationSnapshot final {
     ClockSnapshot clock;
 };
 
-using JournalSnapshot = std::variant<EventSnapshot, CalibrationSnapshot>;
+// These are value snapshots.  The adapter creates their UUIDs on its worker,
+// never in an OBS callback, and the producer assigns the sequence on its
+// writer thread.
+struct PauseSnapshot final {
+    std::string event_id;
+    ClockSnapshot clock;
+};
+
+struct ResumeSnapshot final {
+    std::string event_id;
+    ClockSnapshot clock;
+};
+
+using JournalSnapshot =
+    std::variant<EventSnapshot, CalibrationSnapshot, PauseSnapshot, ResumeSnapshot>;
 
 struct RecordingStart final {
     std::filesystem::path journal_path;

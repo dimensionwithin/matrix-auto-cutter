@@ -30,8 +30,10 @@ using matrix_auto_cutter::JournalSink;
 using matrix_auto_cutter::ProducerOptions;
 using matrix_auto_cutter::ProducerResult;
 using matrix_auto_cutter::ProducerState;
+using matrix_auto_cutter::PauseSnapshot;
 using matrix_auto_cutter::RecordingStart;
 using matrix_auto_cutter::RecordingStop;
+using matrix_auto_cutter::ResumeSnapshot;
 
 constexpr std::string_view session_id = "11111111-1111-4111-8111-111111111111";
 constexpr std::string_view start_id = "22222222-2222-4222-8222-222222222222";
@@ -137,6 +139,16 @@ RecordingStop stop_request(const std::uint64_t seconds = 6) {
         ClockSnapshot{seconds * 1'000'000'000ULL, seconds * 60, false},
         std::string(recording_path),
     };
+}
+
+PauseSnapshot pause_snapshot(const std::uint64_t seconds = 2, const std::uint64_t frames = 120) {
+    return PauseSnapshot{
+        "33333333-3333-4333-8333-333333333333", ClockSnapshot{seconds * 1'000'000'000ULL, frames, true}};
+}
+
+ResumeSnapshot resume_snapshot(const std::uint64_t seconds = 4, const std::uint64_t frames = 121) {
+    return ResumeSnapshot{
+        "44444444-4444-4444-8444-444444444444", ClockSnapshot{seconds * 1'000'000'000ULL, frames, false}};
 }
 
 void wait_for_block(const std::shared_ptr<SinkState>& state) {
@@ -419,6 +431,59 @@ void test_unbounded_callback_snapshot_fails_without_escape() {
           "boundedness failure was not stable");
 }
 
+void test_pause_resume_are_canonical_and_writer_sequenced() {
+    auto state = std::make_shared<SinkState>();
+    JournalProducer producer(options_for(state));
+    check(producer.start_recording(start_request()) == ProducerResult::producer_ok, "start failed");
+    check(producer.submit(start_event()) == CallbackResult::accepted, "start event rejected");
+    check(producer.submit(pause_snapshot()) == CallbackResult::accepted, "pause rejected");
+    check(producer.submit(resume_snapshot()) == CallbackResult::accepted, "resume rejected");
+    check(producer.normal_stop(stop_request(6)) == ProducerResult::producer_ok, "stop rejected");
+    check(producer.shutdown() == ProducerResult::producer_ok, "shutdown failed");
+    std::lock_guard lock(state->mutex);
+    check(state->lines.size() == 5, "pause/resume journal line count differs");
+    check(state->lines[2].find("\"record_type\":\"pause\"") != std::string::npos &&
+              state->lines[2].find("\"recording_paused\":true") != std::string::npos,
+          "pause was not canonical");
+    check(state->lines[3].find("\"record_type\":\"resume\"") != std::string::npos &&
+              state->lines[3].find("\"recording_paused\":false") != std::string::npos,
+          "resume was not canonical");
+    check(state->lines[2].find("33333333-3333-4333-8333-333333333333") != std::string::npos &&
+              state->lines[3].find("44444444-4444-4444-8444-444444444444") != std::string::npos,
+          "pause and resume UUIDs were not distinct");
+    for (std::size_t sequence = 0; sequence < state->lines.size(); ++sequence) {
+        check(state->lines[sequence].find("\"sequence\":" + std::to_string(sequence)) !=
+                  std::string::npos,
+              "pause/resume writer sequence was not contiguous");
+    }
+}
+
+void test_pause_lifecycle_rejects_invalid_order_and_accepts_paused_stop() {
+    auto invalid = std::make_shared<SinkState>();
+    JournalProducer bad(options_for(invalid));
+    check(bad.start_recording(start_request()) == ProducerResult::producer_ok, "start failed");
+    check(bad.submit(start_event()) == CallbackResult::accepted, "start event rejected");
+    check(bad.submit(resume_snapshot()) == CallbackResult::accepted, "resume did not reach writer");
+    check(bad.shutdown() == ProducerResult::producer_internal_error,
+          "orphan resume was not fail closed");
+
+    auto state = std::make_shared<SinkState>();
+    JournalProducer producer(options_for(state));
+    check(producer.start_recording(start_request()) == ProducerResult::producer_ok, "start failed");
+    check(producer.submit(start_event()) == CallbackResult::accepted, "start event rejected");
+    check(producer.submit(pause_snapshot()) == CallbackResult::accepted, "pause rejected");
+    auto paused_stop = stop_request(5);
+    paused_stop.clock = ClockSnapshot{5'000'000'000ULL, 121, true};
+    check(producer.normal_stop(paused_stop) == ProducerResult::producer_ok,
+          "stop while paused rejected");
+    check(producer.submit(resume_snapshot(6, 121)) == CallbackResult::terminal,
+          "resume after stop was accepted");
+    check(producer.shutdown() == ProducerResult::producer_ok, "paused stop shutdown failed");
+    std::lock_guard lock(state->mutex);
+    check(state->lines.back().find("\"recording_paused\":true") != std::string::npos,
+          "stop while paused did not retain pause flag");
+}
+
 }  // namespace
 
 int main() {
@@ -436,6 +501,9 @@ int main() {
         {"shutdown-timeout-resource-lifetime", test_shutdown_timeout_preserves_live_writer_resources},
         {"no-exception-escape", test_public_boundary_contains_factory_exception},
         {"bounded-callback-snapshot", test_unbounded_callback_snapshot_fails_without_escape},
+        {"pause-resume/canonical/uuid/sequence", test_pause_resume_are_canonical_and_writer_sequenced},
+        {"pause-lifecycle/invalid-order/paused-stop",
+         test_pause_lifecycle_rejects_invalid_order_and_accepts_paused_stop},
     };
     int failures = 0;
     for (const auto& [name, test] : tests) {
