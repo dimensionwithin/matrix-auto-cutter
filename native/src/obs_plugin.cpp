@@ -32,6 +32,7 @@ using namespace matrix_auto_cutter::obs_adapter;
 constexpr std::string_view plugin_name =
     "Matrix Auto Cutter OBS Journal Adapter 0.1.0-experimental";
 int module_anchor = 0;
+decltype(&calldata_get_data) resolved_calldata_get_data{};
 
 HMODULE retain_current_module() noexcept {
     HMODULE module{};
@@ -68,6 +69,9 @@ class Obs32Api final {
     decltype(&obs_output_release) output_release{};
     decltype(&obs_output_get_id) output_id{};
     decltype(&obs_output_get_total_frames) output_frames{};
+    decltype(&obs_output_get_signal_handler) output_signal_handler{};
+    decltype(&signal_handler_connect) signal_connect{};
+    decltype(&signal_handler_disconnect) signal_disconnect{};
     decltype(&obs_get_video_frame_time) video_frame_time{};
     decltype(&obs_get_version_string) version_string{};
     decltype(&blog) write_log{};
@@ -88,13 +92,21 @@ class Obs32Api final {
         output_release = resolve<decltype(output_release)>(obs, "obs_output_release");
         output_id = resolve<decltype(output_id)>(obs, "obs_output_get_id");
         output_frames = resolve<decltype(output_frames)>(obs, "obs_output_get_total_frames");
+        output_signal_handler = resolve<decltype(output_signal_handler)>(
+            obs, "obs_output_get_signal_handler");
+        signal_connect = resolve<decltype(signal_connect)>(obs, "signal_handler_connect");
+        signal_disconnect = resolve<decltype(signal_disconnect)>(obs, "signal_handler_disconnect");
+        resolved_calldata_get_data =
+            resolve<decltype(resolved_calldata_get_data)>(obs, "calldata_get_data");
         video_frame_time =
             resolve<decltype(video_frame_time)>(obs, "obs_get_video_frame_time");
         version_string = resolve<decltype(version_string)>(obs, "obs_get_version_string");
         write_log = resolve<decltype(write_log)>(obs, "blog");
         return frontend_add && frontend_remove && frontend_recording_output && add_tick &&
                remove_tick && output_settings && data_string && data_release && output_release &&
-               output_id && output_frames && video_frame_time && version_string && write_log;
+               output_id && output_frames && output_signal_handler && signal_connect &&
+               signal_disconnect && resolved_calldata_get_data && video_frame_time &&
+               version_string && write_log;
     }
 };
 
@@ -123,8 +135,29 @@ class WindowsModuleThreadLifetime final : public WorkerThreadLifetime {
     HMODULE module_{};
 };
 
+class WindowsCallbackRegistrationLifetime final : public CallbackRegistrationLifetime {
+  public:
+    WindowsCallbackRegistrationLifetime() noexcept : module_(retain_current_module()) {}
+
+    ~WindowsCallbackRegistrationLifetime() override {
+        if (module_ != nullptr) {
+            FreeLibrary(module_);
+        }
+    }
+
+    [[nodiscard]] bool valid() const noexcept { return module_ != nullptr; }
+
+  private:
+    HMODULE module_{};
+};
+
 std::unique_ptr<WorkerThreadLifetime> make_worker_lifetime() {
     auto lifetime = std::make_unique<WindowsModuleThreadLifetime>();
+    return lifetime->valid() ? std::move(lifetime) : nullptr;
+}
+
+std::unique_ptr<CallbackRegistrationLifetime> make_callback_lifetime() {
+    auto lifetime = std::make_unique<WindowsCallbackRegistrationLifetime>();
     return lifetime->valid() ? std::move(lifetime) : nullptr;
 }
 
@@ -196,26 +229,25 @@ class NativeObsHost final : public AdapterHost {
         const FrontendCallback frontend,
         const TickCallback tick,
         void* private_data) noexcept override {
-        frontend_ = frontend;
-        tick_ = tick;
+        if (frontend != ObsJournalAdapter::frontend_boundary ||
+            tick != ObsJournalAdapter::tick_boundary || private_data == nullptr) {
+            return false;
+        }
         private_data_ = private_data;
-        api_.frontend_add(obs_frontend_boundary, this);
-        api_.add_tick(obs_tick_boundary, this);
+        api_.frontend_add(obs_frontend_boundary, private_data_);
+        api_.add_tick(obs_tick_boundary, private_data_);
         installed_.store(true, std::memory_order_release);
         return true;
     }
 
     void remove_callbacks() noexcept override {
         if (installed_.exchange(false, std::memory_order_acq_rel)) {
-            api_.remove_tick(obs_tick_boundary, this);
-            api_.frontend_remove(obs_frontend_boundary, this);
+            api_.remove_tick(obs_tick_boundary, private_data_);
+            api_.frontend_remove(obs_frontend_boundary, private_data_);
         }
-        frontend_ = nullptr;
-        tick_ = nullptr;
-        private_data_ = nullptr;
     }
 
-    bool acquire_recording_start(RecordingSignal& signal) noexcept override {
+    bool acquire_recording_output() noexcept override {
         obs_output_t* output = api_.frontend_recording_output();
         if (output == nullptr) {
             return false;
@@ -226,14 +258,56 @@ class NativeObsHost final : public AdapterHost {
             api_.output_release(output);
             return false;
         }
-        if (!capture_path_and_kind(output, signal) || !capture_clock_for(output, signal)) {
-            release_recording_output();
-            return false;
-        }
         return true;
     }
 
-    bool capture_recording_stop(RecordingSignal& signal) noexcept override {
+    bool connect_recording_output_signals(
+        const OutputCallback output_callback,
+        void* private_data) noexcept override {
+        if (output_callback != ObsJournalAdapter::output_boundary || private_data == nullptr ||
+            output_signals_connected_.load(std::memory_order_acquire)) {
+            return false;
+        }
+        obs_output_t* output = output_.load(std::memory_order_acquire);
+        if (output == nullptr) {
+            return false;
+        }
+        signal_handler_t* handler = api_.output_signal_handler(output);
+        if (handler == nullptr) {
+            return false;
+        }
+        output_private_data_ = private_data;
+        api_.signal_connect(handler, "start", obs_output_start_boundary, output_private_data_);
+        start_signal_connected_.store(true, std::memory_order_release);
+        api_.signal_connect(handler, "stop", obs_output_stop_boundary, output_private_data_);
+        stop_signal_connected_.store(true, std::memory_order_release);
+        output_signals_connected_.store(true, std::memory_order_release);
+        return true;
+    }
+
+    void disconnect_recording_output_signals() noexcept override {
+        if (!output_signals_connected_.exchange(false, std::memory_order_acq_rel)) {
+            return;
+        }
+        obs_output_t* output = output_.load(std::memory_order_acquire);
+        signal_handler_t* handler = output != nullptr ? api_.output_signal_handler(output) : nullptr;
+        if (handler != nullptr) {
+            if (stop_signal_connected_.exchange(false, std::memory_order_acq_rel)) {
+                api_.signal_disconnect(
+                    handler, "stop", obs_output_stop_boundary, output_private_data_);
+            }
+            if (start_signal_connected_.exchange(false, std::memory_order_acq_rel)) {
+                api_.signal_disconnect(
+                    handler, "start", obs_output_start_boundary, output_private_data_);
+            }
+        } else {
+            stop_signal_connected_.store(false, std::memory_order_release);
+            start_signal_connected_.store(false, std::memory_order_release);
+        }
+        output_private_data_ = nullptr;
+    }
+
+    bool capture_recording_output(RecordingSignal& signal) noexcept override {
         obs_output_t* output = output_.load(std::memory_order_acquire);
         return output != nullptr && capture_path_and_kind(output, signal) &&
                capture_clock_for(output, signal);
@@ -256,6 +330,7 @@ class NativeObsHost final : public AdapterHost {
     }
 
     void release_recording_output() noexcept override {
+        disconnect_recording_output_signals();
         if (obs_output_t* output = output_.exchange(nullptr, std::memory_order_acq_rel)) {
             api_.output_release(output);
         }
@@ -281,27 +356,45 @@ class NativeObsHost final : public AdapterHost {
   private:
     static void obs_frontend_boundary(const enum obs_frontend_event event, void* data) noexcept {
         try {
-            auto* self = static_cast<NativeObsHost*>(data);
-            if (self == nullptr || self->frontend_ == nullptr) {
-                return;
-            }
             const FrontendEvent mapped =
-                event == OBS_FRONTEND_EVENT_RECORDING_STARTED
-                    ? FrontendEvent::recording_started
-                    : event == OBS_FRONTEND_EVENT_RECORDING_STOPPED
-                          ? FrontendEvent::recording_stopped
-                          : FrontendEvent::other;
-            self->frontend_(mapped, self->private_data_);
+                event == OBS_FRONTEND_EVENT_RECORDING_STARTING
+                    ? FrontendEvent::recording_starting
+                    : event == OBS_FRONTEND_EVENT_RECORDING_STARTED
+                          ? FrontendEvent::recording_started
+                          : event == OBS_FRONTEND_EVENT_RECORDING_STOPPING
+                                ? FrontendEvent::recording_stopping
+                                : event == OBS_FRONTEND_EVENT_RECORDING_STOPPED
+                                      ? FrontendEvent::recording_stopped
+                                      : FrontendEvent::other;
+            ObsJournalAdapter::frontend_boundary(mapped, data);
         } catch (...) {
         }
     }
 
     static void obs_tick_boundary(void* data, float) noexcept {
         try {
-            auto* self = static_cast<NativeObsHost*>(data);
-            if (self != nullptr && self->tick_ != nullptr) {
-                self->tick_(self->private_data_);
+            ObsJournalAdapter::tick_boundary(data);
+        } catch (...) {
+        }
+    }
+
+    static void obs_output_start_boundary(void* data, calldata_t*) noexcept {
+        try {
+            ObsJournalAdapter::output_boundary(OutputEvent::started, 0, data);
+        } catch (...) {
+        }
+    }
+
+    static void obs_output_stop_boundary(void* data, calldata_t* calldata) noexcept {
+        try {
+            long long code = -1;
+            if (calldata == nullptr || resolved_calldata_get_data == nullptr ||
+                !resolved_calldata_get_data(calldata, "code", &code, sizeof(code))) {
+                code = -1;
             }
+            const int bounded_code =
+                code > INT_MAX || code < INT_MIN ? -1 : static_cast<int>(code);
+            ObsJournalAdapter::output_boundary(OutputEvent::stopped, bounded_code, data);
         } catch (...) {
         }
     }
@@ -360,9 +453,11 @@ class NativeObsHost final : public AdapterHost {
     Obs32Api& api_;
     std::atomic<obs_output_t*> output_{};
     std::atomic<bool> installed_{};
-    FrontendCallback frontend_{};
-    TickCallback tick_{};
     void* private_data_{};
+    void* output_private_data_{};
+    std::atomic<bool> output_signals_connected_{};
+    std::atomic<bool> start_signal_connected_{};
+    std::atomic<bool> stop_signal_connected_{};
     std::array<char, 64> version_{};
     std::size_t version_size_{};
 };
@@ -389,6 +484,7 @@ extern "C" MODULE_EXPORT bool obs_module_load(void) {
         producer_factory = std::make_unique<NativeProducerFactory>();
         AdapterOptions options;
         options.worker_lifetime_factory = make_worker_lifetime;
+        options.callback_lifetime_factory = make_callback_lifetime;
         adapter = std::make_unique<ObsJournalAdapter>(*host, *producer_factory, std::move(options));
         if (!adapter->load()) {
             adapter.reset();

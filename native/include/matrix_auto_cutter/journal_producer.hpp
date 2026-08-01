@@ -84,6 +84,7 @@ struct RecordingStart final {
     std::string recording_path_utf8;
     std::string producer_version;
     std::string obs_version;
+    std::optional<std::string> recording_session_id;
 };
 
 struct RecordingStop final {
@@ -170,6 +171,7 @@ class MonotonicQpcClock final {
 };
 
 [[nodiscard]] std::string uuid_v4() noexcept;
+[[nodiscard]] bool valid_uuid_v4(std::string_view value) noexcept;
 [[nodiscard]] const char* to_string(CallbackResult value) noexcept;
 [[nodiscard]] const char* to_string(ProducerResult value) noexcept;
 [[nodiscard]] const char* to_string(ProducerState value) noexcept;

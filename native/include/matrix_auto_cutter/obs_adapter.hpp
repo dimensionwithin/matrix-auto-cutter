@@ -22,7 +22,15 @@ namespace matrix_auto_cutter::obs_adapter {
 inline constexpr std::size_t max_recording_path_utf8 = 32'767;
 inline constexpr auto calibration_interval = std::chrono::seconds(2);
 
-enum class FrontendEvent { recording_started, recording_stopped, other };
+enum class FrontendEvent {
+    recording_starting,
+    recording_started,
+    recording_stopping,
+    recording_stopped,
+    other,
+};
+enum class OutputEvent { started, stopped };
+enum class CallbackKind { frontend, tick, output_start, output_stop };
 enum class LogLevel { info, warning, error };
 enum class AdapterState { unloaded, idle, start_pending, active, stopping, failed, unloading };
 
@@ -44,6 +52,7 @@ struct RecordingSignal final {
 
 using FrontendCallback = void (*)(FrontendEvent, void*) noexcept;
 using TickCallback = void (*)(void*) noexcept;
+using OutputCallback = void (*)(OutputEvent, int, void*) noexcept;
 
 class AdapterHost {
   public:
@@ -53,8 +62,12 @@ class AdapterHost {
         TickCallback tick,
         void* private_data) noexcept = 0;
     virtual void remove_callbacks() noexcept = 0;
-    virtual bool acquire_recording_start(RecordingSignal& signal) noexcept = 0;
-    virtual bool capture_recording_stop(RecordingSignal& signal) noexcept = 0;
+    virtual bool acquire_recording_output() noexcept = 0;
+    virtual bool connect_recording_output_signals(
+        OutputCallback output,
+        void* private_data) noexcept = 0;
+    virtual void disconnect_recording_output_signals() noexcept = 0;
+    virtual bool capture_recording_output(RecordingSignal& signal) noexcept = 0;
     virtual bool capture_clock(
         std::uint64_t& absolute_monotonic_ns,
         std::uint64_t& output_frame_count) noexcept = 0;
@@ -87,10 +100,23 @@ class WorkerThreadLifetime {
     virtual void exit_thread() noexcept = 0;
 };
 
+class CallbackRegistrationLifetime {
+  public:
+    virtual ~CallbackRegistrationLifetime() = default;
+};
+
 struct AdapterOptions final {
     std::string producer_version{"0.1.0-experimental"};
-    std::function<std::string()> uuid_factory{uuid_v4};
+    UuidFactory session_uuid_factory{uuid_v4};
+    UuidFactory event_uuid_factory{uuid_v4};
+    std::function<std::optional<std::filesystem::path>()> local_app_data_provider;
     std::function<std::unique_ptr<WorkerThreadLifetime>()> worker_lifetime_factory;
+    std::function<std::unique_ptr<CallbackRegistrationLifetime>()>
+        callback_lifetime_factory;
+    std::function<void(CallbackKind)> callback_probe;
+    std::chrono::milliseconds unload_deadline{
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            producer_shutdown_deadline + std::chrono::seconds(2))};
 };
 
 struct RunReport final {
@@ -117,16 +143,42 @@ class ObsJournalAdapter final {
 
     static void frontend_boundary(FrontendEvent event, void* private_data) noexcept;
     static void tick_boundary(void* private_data) noexcept;
+    static void output_boundary(OutputEvent event, int code, void* private_data) noexcept;
 
   private:
+    struct ClockCommand final {
+        std::uint64_t absolute_monotonic_ns{};
+        std::uint64_t output_frame_count{};
+        bool recording_start_anchor{};
+    };
+    struct StopCommand final {
+        RecordingSignal signal;
+        int code{};
+        bool captured{};
+    };
+
+    [[nodiscard]] bool enter_callback() noexcept;
+    void leave_callback(bool bound_access) noexcept;
+    void close_callback_gate() noexcept;
+    void probe_callback(CallbackKind kind);
     void on_frontend(FrontendEvent event) noexcept;
     void on_tick() noexcept;
+    void on_output(OutputEvent event, int code) noexcept;
     void worker_main() noexcept;
     void process_start(const RecordingSignal& signal) noexcept;
-    void process_stop(const RecordingSignal& signal) noexcept;
+    void process_clock(const ClockCommand& command) noexcept;
+    void process_stop(const StopCommand& command) noexcept;
     void fail_current_run(ProducerResult result, std::string_view reason) noexcept;
-    void finish_callback() noexcept;
-    [[nodiscard]] bool wait_for_callbacks() noexcept;
+    void force_cleanup(ProducerResult result, std::string_view reason) noexcept;
+    void disconnect_output_signals() noexcept;
+    void release_output_reference() noexcept;
+    void wait_for_callbacks_to_drain() noexcept;
+    void wait_for_bound_callbacks_to_drain() noexcept;
+    void reset_run() noexcept;
+    [[nodiscard]] bool queue_forced_failure() noexcept;
+
+    static constexpr std::uint64_t callback_gate_closed = UINT64_C(1) << 63U;
+    static constexpr std::uint64_t callback_gate_count_mask = callback_gate_closed - 1U;
 
     AdapterHost& host_;
     ProducerFactory& factory_;
@@ -141,14 +193,16 @@ class ObsJournalAdapter final {
     std::atomic<std::uint64_t> calibration_count_{};
     std::atomic<bool> recording_started_claimed_{};
     std::atomic<bool> recording_started_accepted_{};
-    std::atomic<unsigned> callbacks_in_flight_{};
+    std::atomic<std::uint64_t> callback_gate_{callback_gate_closed};
+    std::atomic<unsigned> bound_callbacks_in_flight_{};
     mutable std::mutex callback_wait_mutex_;
     std::condition_variable callback_finished_;
 
     mutable std::mutex command_mutex_;
     std::condition_variable command_changed_;
     std::optional<RecordingSignal> pending_start_;
-    std::optional<RecordingSignal> pending_stop_;
+    std::optional<ClockCommand> pending_clock_;
+    std::optional<StopCommand> pending_stop_;
     std::atomic<bool> forced_shutdown_{};
     bool unload_requested_{};
 
@@ -162,7 +216,11 @@ class ObsJournalAdapter final {
     std::mutex worker_done_mutex_;
     std::condition_variable worker_done_changed_;
     bool worker_done_{};
+    std::atomic<bool> output_reference_held_{};
+    std::atomic<bool> output_signals_connected_{};
     std::atomic<bool> loaded_{};
+    std::atomic<bool> permanently_unloaded_{};
+    std::unique_ptr<CallbackRegistrationLifetime> callback_lifetime_;
 };
 
 }  // namespace matrix_auto_cutter::obs_adapter

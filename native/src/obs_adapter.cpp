@@ -4,14 +4,12 @@
 
 #include <algorithm>
 #include <cctype>
-#include <exception>
+#include <system_error>
 #include <utility>
 
 namespace matrix_auto_cutter::obs_adapter {
 namespace {
 
-constexpr auto callback_drain_deadline = std::chrono::seconds(1);
-constexpr auto worker_unload_deadline = producer_shutdown_deadline + std::chrono::seconds(2);
 constexpr std::uint64_t nominal_video_fps = 60;
 constexpr std::uint64_t nanoseconds_per_second = 1'000'000'000ULL;
 
@@ -45,28 +43,24 @@ bool direct_mp4_signal(const RecordingSignal& signal) noexcept {
            !signal.fragmented_mp4;
 }
 
-std::optional<std::filesystem::path> path_from_utf8(const std::string_view value) noexcept {
+std::optional<std::filesystem::path> default_local_app_data() noexcept {
     try {
-        if (value.empty() || value.size() > static_cast<std::size_t>(INT_MAX)) {
+        SetLastError(ERROR_SUCCESS);
+        const DWORD required = GetEnvironmentVariableW(L"LOCALAPPDATA", nullptr, 0);
+        if (required <= 1) {
             return std::nullopt;
         }
-        const auto input_size = static_cast<int>(value.size());
-        const int count = MultiByteToWideChar(
-            CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), input_size, nullptr, 0);
-        if (count <= 0) {
+        std::wstring value(static_cast<std::size_t>(required), L'\0');
+        const DWORD written = GetEnvironmentVariableW(L"LOCALAPPDATA", value.data(), required);
+        if (written == 0 || written >= required) {
             return std::nullopt;
         }
-        std::wstring wide(static_cast<std::size_t>(count), L'\0');
-        if (MultiByteToWideChar(
-                CP_UTF8,
-                MB_ERR_INVALID_CHARS,
-                value.data(),
-                input_size,
-                wide.data(),
-                count) != count) {
+        value.resize(static_cast<std::size_t>(written));
+        std::filesystem::path path(std::move(value));
+        if (path.empty() || !path.is_absolute()) {
             return std::nullopt;
         }
-        return std::filesystem::path(std::move(wide));
+        return path;
     } catch (...) {
         return std::nullopt;
     }
@@ -102,23 +96,6 @@ std::string path_to_utf8(const std::filesystem::path& path) noexcept {
     }
 }
 
-std::optional<std::filesystem::path> journal_path_for(
-    const std::string_view recording_path,
-    const std::string_view journal_id) noexcept {
-    const auto recording = path_from_utf8(recording_path);
-    if (!recording.has_value() || journal_id.size() != 36) {
-        return std::nullopt;
-    }
-    try {
-        std::wstring suffix = L".matrix-";
-        suffix.append(journal_id.begin(), journal_id.end());
-        suffix += L".recording-journal.ndjson";
-        return std::filesystem::path(recording->native() + suffix);
-    } catch (...) {
-        return std::nullopt;
-    }
-}
-
 }  // namespace
 
 bool BoundedPath::assign(const std::string_view value) noexcept {
@@ -143,31 +120,53 @@ ObsJournalAdapter::ObsJournalAdapter(
     AdapterHost& host,
     ProducerFactory& factory,
     AdapterOptions options)
-    : host_(host), factory_(factory), options_(std::move(options)) {}
+    : host_(host), factory_(factory), options_(std::move(options)) {
+    if (!options_.local_app_data_provider) {
+        options_.local_app_data_provider = default_local_app_data;
+    }
+}
 
 ObsJournalAdapter::~ObsJournalAdapter() { unload(); }
 
 bool ObsJournalAdapter::load() noexcept {
+    if (permanently_unloaded_.load(std::memory_order_acquire)) {
+        return false;
+    }
     bool expected = false;
     if (!loaded_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
         return true;
     }
     try {
-        std::unique_ptr<WorkerThreadLifetime> lifetime;
-        if (options_.worker_lifetime_factory) {
-            lifetime = options_.worker_lifetime_factory();
-            if (!lifetime) {
+        if (options_.callback_lifetime_factory) {
+            callback_lifetime_ = options_.callback_lifetime_factory();
+            if (!callback_lifetime_) {
                 loaded_.store(false, std::memory_order_release);
                 return false;
             }
         }
-        worker_ = std::thread([this, lifetime = std::move(lifetime)]() mutable noexcept {
+        std::unique_ptr<WorkerThreadLifetime> worker_lifetime;
+        if (options_.worker_lifetime_factory) {
+            worker_lifetime = options_.worker_lifetime_factory();
+            if (!worker_lifetime) {
+                callback_lifetime_.reset();
+                loaded_.store(false, std::memory_order_release);
+                return false;
+            }
+        }
+        callback_gate_.store(0, std::memory_order_release);
+        {
+            std::lock_guard lock(worker_done_mutex_);
+            worker_done_ = false;
+        }
+        worker_ = std::thread([this, lifetime = std::move(worker_lifetime)]() mutable noexcept {
             worker_main();
             if (lifetime) {
                 lifetime->exit_thread();
             }
         });
         if (!host_.install_callbacks(frontend_boundary, tick_boundary, this)) {
+            close_callback_gate();
+            host_.remove_callbacks();
             {
                 std::lock_guard lock(command_mutex_);
                 unload_requested_ = true;
@@ -175,14 +174,19 @@ bool ObsJournalAdapter::load() noexcept {
             command_changed_.notify_one();
             worker_.join();
             loaded_.store(false, std::memory_order_release);
+            state_.store(AdapterState::unloaded, std::memory_order_release);
             return false;
         }
         state_.store(AdapterState::idle, std::memory_order_release);
-        host_.log(LogLevel::info, "module loaded: Matrix Auto Cutter OBS Journal Adapter 0.1.0-experimental");
+        host_.log(
+            LogLevel::info,
+            "module loaded: Matrix Auto Cutter OBS Journal Adapter 0.1.0-experimental");
         return true;
     } catch (...) {
+        close_callback_gate();
         loaded_.store(false, std::memory_order_release);
         state_.store(AdapterState::unloaded, std::memory_order_release);
+        callback_lifetime_.reset();
         return false;
     }
 }
@@ -191,10 +195,12 @@ void ObsJournalAdapter::unload() noexcept {
     if (!loaded_.exchange(false, std::memory_order_acq_rel)) {
         return;
     }
+    permanently_unloaded_.store(true, std::memory_order_release);
     try {
+        close_callback_gate();
+        state_.store(AdapterState::unloading, std::memory_order_release);
         host_.remove_callbacks();
         accepting_snapshots_.store(false, std::memory_order_release);
-        state_.store(AdapterState::unloading, std::memory_order_release);
         {
             std::lock_guard lock(command_mutex_);
             unload_requested_ = true;
@@ -204,7 +210,7 @@ void ObsJournalAdapter::unload() noexcept {
         bool done = false;
         {
             std::unique_lock lock(worker_done_mutex_);
-            done = worker_done_changed_.wait_for(lock, worker_unload_deadline, [&] {
+            done = worker_done_changed_.wait_for(lock, options_.unload_deadline, [&] {
                 return worker_done_;
             });
         }
@@ -215,16 +221,19 @@ void ObsJournalAdapter::unload() noexcept {
                 worker_.detach();
                 host_.log(
                     LogLevel::error,
-                    "adapter worker unload deadline exceeded; DLL remains pinned until thread exit");
+                    "adapter worker unload deadline exceeded; DLL remains pinned until final callback/thread exit");
             }
         }
         if (done) {
             state_.store(AdapterState::unloaded, std::memory_order_release);
-            host_.log(LogLevel::info, "module callbacks and native resources released");
+            host_.log(LogLevel::info, "module callbacks, output signals, references and threads released");
         }
     } catch (...) {
         if (worker_.joinable()) {
-            worker_.detach();
+            try {
+                worker_.detach();
+            } catch (...) {
+            }
         }
     }
 }
@@ -238,159 +247,248 @@ std::optional<RunReport> ObsJournalAdapter::last_report() const {
     return last_report_;
 }
 
-void ObsJournalAdapter::frontend_boundary(const FrontendEvent event, void* private_data) noexcept {
-    try {
-        if (private_data != nullptr) {
-            static_cast<ObsJournalAdapter*>(private_data)->on_frontend(event);
+bool ObsJournalAdapter::enter_callback() noexcept {
+    auto current = callback_gate_.load(std::memory_order_acquire);
+    for (;;) {
+        if ((current & callback_gate_closed) != 0 ||
+            (current & callback_gate_count_mask) == callback_gate_count_mask) {
+            return false;
         }
-    } catch (...) {
+        if (callback_gate_.compare_exchange_weak(
+                current, current + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return true;
+        }
     }
 }
 
-void ObsJournalAdapter::tick_boundary(void* private_data) noexcept {
-    try {
-        if (private_data != nullptr) {
-            static_cast<ObsJournalAdapter*>(private_data)->on_tick();
-        }
-    } catch (...) {
+void ObsJournalAdapter::leave_callback(const bool bound_access) noexcept {
+    if (bound_access && bound_callbacks_in_flight_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        callback_finished_.notify_all();
     }
-}
-
-void ObsJournalAdapter::finish_callback() noexcept {
-    if (callbacks_in_flight_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+    const auto previous = callback_gate_.fetch_sub(1, std::memory_order_acq_rel);
+    if ((previous & callback_gate_count_mask) == 1) {
         callback_finished_.notify_all();
     }
 }
 
-void ObsJournalAdapter::on_frontend(const FrontendEvent event) noexcept {
-    callbacks_in_flight_.fetch_add(1, std::memory_order_acq_rel);
-    struct Guard final {
-        ObsJournalAdapter* self;
-        ~Guard() { self->finish_callback(); }
-    } guard{this};
+void ObsJournalAdapter::close_callback_gate() noexcept {
+    callback_gate_.fetch_or(callback_gate_closed, std::memory_order_acq_rel);
+    callback_finished_.notify_all();
+}
 
-    if (!loaded_.load(std::memory_order_acquire)) {
+void ObsJournalAdapter::probe_callback(const CallbackKind kind) {
+    if (options_.callback_probe) {
+        options_.callback_probe(kind);
+    }
+}
+
+void ObsJournalAdapter::frontend_boundary(const FrontendEvent event, void* private_data) noexcept {
+    auto* self = static_cast<ObsJournalAdapter*>(private_data);
+    if (self == nullptr || !self->enter_callback()) {
         return;
     }
+    struct Guard final {
+        ObsJournalAdapter* self;
+        ~Guard() { self->leave_callback(false); }
+    } guard{self};
+    try {
+        self->probe_callback(CallbackKind::frontend);
+        self->on_frontend(event);
+    } catch (...) {
+        static_cast<void>(self->queue_forced_failure());
+    }
+}
+
+void ObsJournalAdapter::tick_boundary(void* private_data) noexcept {
+    auto* self = static_cast<ObsJournalAdapter*>(private_data);
+    if (self == nullptr || !self->enter_callback()) {
+        return;
+    }
+    self->bound_callbacks_in_flight_.fetch_add(1, std::memory_order_acq_rel);
+    struct Guard final {
+        ObsJournalAdapter* self;
+        ~Guard() { self->leave_callback(true); }
+    } guard{self};
+    try {
+        self->probe_callback(CallbackKind::tick);
+        self->on_tick();
+    } catch (...) {
+        static_cast<void>(self->queue_forced_failure());
+    }
+}
+
+void ObsJournalAdapter::output_boundary(
+    const OutputEvent event,
+    const int code,
+    void* private_data) noexcept {
+    auto* self = static_cast<ObsJournalAdapter*>(private_data);
+    if (self == nullptr || !self->enter_callback()) {
+        return;
+    }
+    self->bound_callbacks_in_flight_.fetch_add(1, std::memory_order_acq_rel);
+    struct Guard final {
+        ObsJournalAdapter* self;
+        ~Guard() { self->leave_callback(true); }
+    } guard{self};
+    try {
+        self->probe_callback(
+            event == OutputEvent::started ? CallbackKind::output_start
+                                          : CallbackKind::output_stop);
+        self->on_output(event, code);
+    } catch (...) {
+        static_cast<void>(self->queue_forced_failure());
+    }
+}
+
+void ObsJournalAdapter::on_frontend(const FrontendEvent event) noexcept {
     if (event == FrontendEvent::recording_started) {
-        RecordingSignal signal;
-        if (!host_.acquire_recording_start(signal)) {
-            host_.log(LogLevel::error, "recording start rejected: no safe current recording output/path");
+        host_.log(LogLevel::info, "frontend RECORDING_STARTED observed (diagnostic only)");
+        return;
+    }
+    if (event == FrontendEvent::recording_stopping) {
+        host_.log(LogLevel::info, "frontend RECORDING_STOPPING observed (diagnostic only)");
+        return;
+    }
+    if (event == FrontendEvent::recording_stopped) {
+        host_.log(LogLevel::info, "frontend RECORDING_STOPPED observed (diagnostic only)");
+        return;
+    }
+    if (event != FrontendEvent::recording_starting) {
+        return;
+    }
+
+    host_.log(LogLevel::info, "frontend RECORDING_STARTING recognized");
+    auto expected = AdapterState::idle;
+    if (!state_.compare_exchange_strong(
+            expected,
+            AdapterState::start_pending,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        host_.log(LogLevel::warning, "concurrent recording start rejected fail closed");
+        return;
+    }
+
+    if (!host_.acquire_recording_output()) {
+        expected = AdapterState::start_pending;
+        state_.compare_exchange_strong(expected, AdapterState::idle, std::memory_order_acq_rel);
+        host_.log(LogLevel::error, "recording start rejected: no current recording output");
+        return;
+    }
+    output_reference_held_.store(true, std::memory_order_release);
+    if (!host_.connect_recording_output_signals(output_boundary, this)) {
+        release_output_reference();
+        expected = AdapterState::start_pending;
+        state_.compare_exchange_strong(expected, AdapterState::idle, std::memory_order_acq_rel);
+        host_.log(LogLevel::error, "recording output signal connection failed");
+        return;
+    }
+    output_signals_connected_.store(true, std::memory_order_release);
+    host_.log(
+        LogLevel::info,
+        "recording output bound; official output start/stop signals connected");
+}
+
+bool ObsJournalAdapter::queue_forced_failure() noexcept {
+    accepting_snapshots_.store(false, std::memory_order_release);
+    forced_shutdown_.store(true, std::memory_order_release);
+    command_changed_.notify_one();
+    return false;
+}
+
+void ObsJournalAdapter::on_output(const OutputEvent event, const int code) noexcept {
+    const auto current = state_.load(std::memory_order_acquire);
+    if (event == OutputEvent::started) {
+        if (current == AdapterState::active) {
+            host_.log(LogLevel::error, "duplicate actual output start rejected fail closed");
+            static_cast<void>(queue_forced_failure());
             return;
         }
-        if (!direct_mp4_signal(signal)) {
-            host_.release_recording_output();
-            host_.log(
-                LogLevel::warning,
-                "recording start rejected fail closed: output is not traditional Direct MP4");
+        if (current != AdapterState::start_pending) {
+            return;
+        }
+        RecordingSignal signal;
+        if (!host_.capture_recording_output(signal) || !direct_mp4_signal(signal)) {
+            host_.log(LogLevel::error, "actual output start snapshot failed");
+            static_cast<void>(queue_forced_failure());
             return;
         }
         std::unique_lock lock(command_mutex_, std::try_to_lock);
-        auto expected = AdapterState::idle;
-        if (!lock.owns_lock() || !state_.compare_exchange_strong(
-                                    expected,
-                                    AdapterState::start_pending,
-                                    std::memory_order_acq_rel,
-                                    std::memory_order_acquire)) {
-            host_.release_recording_output();
-            host_.log(LogLevel::warning, "concurrent recording start rejected fail closed");
+        if (!lock.owns_lock() || pending_start_.has_value()) {
+            if (lock.owns_lock()) {
+                lock.unlock();
+            }
+            host_.log(LogLevel::error, "actual output start command could not be queued");
+            static_cast<void>(queue_forced_failure());
             return;
         }
         pending_start_ = signal;
         lock.unlock();
         command_changed_.notify_one();
-        host_.log(LogLevel::info, "confirmed recording start captured; producer start queued");
+        host_.log(LogLevel::info, "actual output start signal recognized; producer start queued");
         return;
     }
-    if (event != FrontendEvent::recording_stopped) {
+
+    if (current == AdapterState::idle || current == AdapterState::stopping ||
+        current == AdapterState::failed || current == AdapterState::unloading ||
+        current == AdapterState::unloaded) {
         return;
     }
-    const auto current = state_.load(std::memory_order_acquire);
-    if (current == AdapterState::idle || current == AdapterState::unloaded ||
-        current == AdapterState::unloading) {
-        return;
-    }
-    accepting_snapshots_.store(false, std::memory_order_release);
     RecordingSignal signal;
-    bool captured = host_.capture_recording_stop(signal);
-    if (captured) {
-        const auto started_frames =
-            recording_started_frame_count_.load(std::memory_order_acquire);
-        const auto started_ns = recording_started_ns_.load(std::memory_order_acquire);
-        constexpr std::uint64_t max_stop_qpc_adjustment_frames = 8;
-        const auto max_adjustment = frame_span_ns(max_stop_qpc_adjustment_frames);
-        const auto counter_span = signal.output_frame_count >= started_frames
-                                      ? frame_span_ns(signal.output_frame_count - started_frames)
-                                      : std::nullopt;
-        if (!recording_started_accepted_.load(std::memory_order_acquire) ||
-            !max_adjustment.has_value() || !counter_span.has_value() ||
-            started_ns > UINT64_MAX - *counter_span) {
-            captured = false;
-        } else {
-            const auto final_frame_ns = started_ns + *counter_span;
-            const auto difference = final_frame_ns <= signal.absolute_monotonic_ns
-                                        ? signal.absolute_monotonic_ns - final_frame_ns
-                                        : final_frame_ns - signal.absolute_monotonic_ns;
-            if (difference > *max_adjustment) {
-                captured = false;
-            } else {
-                signal.absolute_monotonic_ns = final_frame_ns;
-            }
-        }
-    }
+    const bool captured = host_.capture_recording_output(signal);
     std::unique_lock lock(command_mutex_, std::try_to_lock);
-    if (!captured || !lock.owns_lock()) {
+    if (!lock.owns_lock() || pending_stop_.has_value()) {
         if (lock.owns_lock()) {
-            forced_shutdown_.store(true, std::memory_order_release);
             lock.unlock();
-        } else {
-            forced_shutdown_.store(true, std::memory_order_release);
         }
-        state_.store(AdapterState::failed, std::memory_order_release);
-        command_changed_.notify_one();
-        host_.log(LogLevel::error, "recording stop snapshot failed; run forced fail closed");
+        host_.log(LogLevel::error, "actual output stop command could not be queued");
+        static_cast<void>(queue_forced_failure());
         return;
     }
-    pending_stop_ = signal;
+    pending_stop_ = StopCommand{signal, code, captured};
+    accepting_snapshots_.store(false, std::memory_order_release);
     state_.store(AdapterState::stopping, std::memory_order_release);
     lock.unlock();
     command_changed_.notify_one();
-    host_.log(LogLevel::info, "confirmed recording stop captured");
+    host_.log(
+        code == 0 && captured ? LogLevel::info : LogLevel::error,
+        code == 0 && captured
+            ? "actual output stop signal recognized with success code"
+            : "actual output stop signal reported failure; run remains unfinalizable");
 }
 
 void ObsJournalAdapter::on_tick() noexcept {
-    callbacks_in_flight_.fetch_add(1, std::memory_order_acq_rel);
-    struct Guard final {
-        ObsJournalAdapter* self;
-        ~Guard() { self->finish_callback(); }
-    } guard{this};
     if (state_.load(std::memory_order_acquire) != AdapterState::active ||
-        !accepting_snapshots_.load(std::memory_order_acquire) || producer_ == nullptr) {
+        !accepting_snapshots_.load(std::memory_order_acquire)) {
         return;
     }
     std::uint64_t absolute = 0;
     std::uint64_t frames = 0;
     if (!host_.capture_clock(absolute, frames)) {
-        accepting_snapshots_.store(false, std::memory_order_release);
-        host_.log(LogLevel::error, "calibration capture failed; snapshots disabled");
+        host_.log(LogLevel::error, "calibration capture failed; run forced fail closed");
+        static_cast<void>(queue_forced_failure());
+        return;
+    }
+    if (state_.load(std::memory_order_acquire) != AdapterState::active ||
+        !accepting_snapshots_.load(std::memory_order_acquire)) {
         return;
     }
     const auto origin = origin_ns_.load(std::memory_order_acquire);
     if (absolute < origin) {
-        accepting_snapshots_.store(false, std::memory_order_release);
-        host_.log(LogLevel::error, "non-monotone QPC observation; snapshots disabled");
+        host_.log(LogLevel::error, "non-monotone output clock; run forced fail closed");
+        static_cast<void>(queue_forced_failure());
         return;
     }
     const auto relative = absolute - origin;
+    ClockCommand command{absolute, frames, false};
     if (!recording_started_claimed_.load(std::memory_order_acquire)) {
         const auto initial_frames = initial_frame_count_.load(std::memory_order_acquire);
         if (frames <= initial_frames) {
             return;
         }
-        const auto frame_elapsed = frame_span_ns(frames - initial_frames);
-        if (!frame_elapsed.has_value() || relative < *frame_elapsed) {
-            accepting_snapshots_.store(false, std::memory_order_release);
+        const auto elapsed = frame_span_ns(frames - initial_frames);
+        if (!elapsed.has_value() || relative < *elapsed || initial_frames == UINT64_MAX) {
             host_.log(LogLevel::error, "output frame/QPC anchor is invalid; run failed closed");
+            static_cast<void>(queue_forced_failure());
             return;
         }
         bool expected = false;
@@ -398,191 +496,345 @@ void ObsJournalAdapter::on_tick() noexcept {
                 expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
             return;
         }
-        if (!pending_recording_started_.has_value()) {
-            accepting_snapshots_.store(false, std::memory_order_release);
-            host_.log(LogLevel::error, "recording_started snapshot was not prepared");
-            return;
-        }
-        if (initial_frames == UINT64_MAX) {
-            accepting_snapshots_.store(false, std::memory_order_release);
-            host_.log(LogLevel::error, "initial output counter cannot be advanced");
-            return;
-        }
-        pending_recording_started_->clock =
-            ClockSnapshot{relative - *frame_elapsed, initial_frames + 1, false};
-        const auto started = producer_->submit(std::move(*pending_recording_started_));
-        if (started != CallbackResult::accepted) {
-            accepting_snapshots_.store(false, std::memory_order_release);
-            host_.log(LogLevel::error, "recording_started event rejected; run failed closed");
-            return;
-        }
-        recording_started_ns_.store(
-            origin + pending_recording_started_->clock.monotonic_ns,
-            std::memory_order_relaxed);
-        recording_started_frame_count_.store(
-            pending_recording_started_->clock.output_frame_count,
-            std::memory_order_release);
-        recording_started_accepted_.store(true, std::memory_order_release);
-        next_calibration_ns_.store(
-            relative - *frame_elapsed +
-                static_cast<std::uint64_t>(calibration_interval.count()) *
-                    nanoseconds_per_second,
-            std::memory_order_release);
-        host_.log(
-            LogLevel::info,
-            "actual output-frame clock anchored; exactly one recording_started accepted");
-        return;
-    }
-    if (!recording_started_accepted_.load(std::memory_order_acquire)) {
-        return;
-    }
-    auto due = next_calibration_ns_.load(std::memory_order_acquire);
-    if (relative < due || !next_calibration_ns_.compare_exchange_strong(
-                              due,
-                              relative + static_cast<std::uint64_t>(calibration_interval.count()) *
-                                             nanoseconds_per_second,
-                              std::memory_order_acq_rel,
-                              std::memory_order_acquire)) {
-        return;
-    }
-    const auto outcome = producer_->submit(
-        CalibrationSnapshot{ClockSnapshot{relative, frames, false}});
-    if (outcome == CallbackResult::accepted) {
-        calibration_count_.fetch_add(1, std::memory_order_relaxed);
-        host_.log(LogLevel::info, "calibration snapshot accepted");
+        command.recording_start_anchor = true;
     } else {
-        accepting_snapshots_.store(false, std::memory_order_release);
-        host_.log(LogLevel::error, "producer rejected calibration; run cannot be successful");
+        if (!recording_started_accepted_.load(std::memory_order_acquire)) {
+            return;
+        }
+        auto due = next_calibration_ns_.load(std::memory_order_acquire);
+        if (relative < due || !next_calibration_ns_.compare_exchange_strong(
+                                  due,
+                                  relative +
+                                      static_cast<std::uint64_t>(calibration_interval.count()) *
+                                          nanoseconds_per_second,
+                                  std::memory_order_acq_rel,
+                                  std::memory_order_acquire)) {
+            return;
+        }
     }
-}
-
-bool ObsJournalAdapter::wait_for_callbacks() noexcept {
-    try {
-        std::unique_lock lock(callback_wait_mutex_);
-        return callback_finished_.wait_for(lock, callback_drain_deadline, [&] {
-            return callbacks_in_flight_.load(std::memory_order_acquire) == 0;
-        });
-    } catch (...) {
-        return false;
+    std::unique_lock lock(command_mutex_, std::try_to_lock);
+    if (!lock.owns_lock() || pending_clock_.has_value()) {
+        if (lock.owns_lock()) {
+            lock.unlock();
+        }
+        host_.log(LogLevel::error, "bounded adapter command queue rejected clock snapshot");
+        static_cast<void>(queue_forced_failure());
+        return;
     }
+    pending_clock_ = command;
+    lock.unlock();
+    command_changed_.notify_one();
 }
 
 void ObsJournalAdapter::process_start(const RecordingSignal& signal) noexcept {
-    const std::string recording(signal.path.view());
-    const std::string journal_id = options_.uuid_factory ? options_.uuid_factory() : std::string{};
-    const auto journal = journal_path_for(recording, journal_id);
-    if (!journal.has_value()) {
-        fail_current_run(ProducerResult::producer_internal_error, "journal path creation failed");
-        return;
-    }
-    auto producer = factory_.create();
-    if (!producer) {
-        fail_current_run(ProducerResult::producer_internal_error, "producer allocation failed");
-        return;
-    }
-    const RecordingStart start{
-        *journal,
-        recording,
-        options_.producer_version,
-        std::string(host_.obs_version()),
-    };
-    const auto started = producer->start_recording(start);
-    if (started != ProducerResult::producer_ok) {
-        static_cast<void>(producer->shutdown());
-        producer_ = std::move(producer);
-        journal_path_ = *journal;
+    try {
+        const std::string recording(signal.path.view());
+        const std::string session =
+            options_.session_uuid_factory ? options_.session_uuid_factory() : std::string{};
+        if (!valid_uuid_v4(session)) {
+            fail_current_run(
+                ProducerResult::producer_internal_error,
+                "recording session UUIDv4 generation failed");
+            return;
+        }
+        const auto local = options_.local_app_data_provider();
+        if (!local.has_value() || local->empty() || !local->is_absolute()) {
+            fail_current_run(
+                ProducerResult::producer_failed_io,
+                "LOCALAPPDATA resolution failed; producer not started");
+            return;
+        }
+        const auto directory = *local / L"DimensionWithin" / L"MatrixAutoCutter" /
+                               L"producer" / L"journals";
+        std::error_code error;
+        std::filesystem::create_directories(directory, error);
+        if (error || !std::filesystem::is_directory(directory, error) || error) {
+            fail_current_run(
+                ProducerResult::producer_failed_io,
+                "normative journal directory creation failed; producer not started");
+            return;
+        }
+        const auto journal = directory / std::filesystem::path(
+                                             session + ".recording-journal.ndjson");
+        const auto journal_utf8 = path_to_utf8(journal);
+        if (journal_utf8.empty()) {
+            fail_current_run(
+                ProducerResult::producer_failed_io,
+                "normative journal path conversion failed; producer not started");
+            return;
+        }
+        auto producer = factory_.create();
+        if (!producer) {
+            fail_current_run(ProducerResult::producer_internal_error, "producer allocation failed");
+            return;
+        }
         recording_path_ = recording;
-        fail_current_run(started, "native producer start failed");
-        return;
+        journal_path_ = journal;
+        producer_ = std::move(producer);
+        const RecordingStart start{
+            journal,
+            recording,
+            options_.producer_version,
+            std::string(host_.obs_version()),
+            session,
+        };
+        const auto started = producer_->start_recording(start);
+        if (started != ProducerResult::producer_ok) {
+            fail_current_run(started, "native producer start failed");
+            return;
+        }
+        const std::string event_id =
+            options_.event_uuid_factory ? options_.event_uuid_factory() : std::string{};
+        if (!valid_uuid_v4(event_id)) {
+            fail_current_run(
+                ProducerResult::producer_internal_error,
+                "recording_started event UUIDv4 generation failed");
+            return;
+        }
+        pending_recording_started_ = EventSnapshot{
+            event_id,
+            EventType::recording_started,
+            ClockSnapshot{0, signal.output_frame_count, false},
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+        };
+        origin_ns_.store(signal.absolute_monotonic_ns, std::memory_order_release);
+        initial_frame_count_.store(signal.output_frame_count, std::memory_order_release);
+        recording_started_ns_.store(0, std::memory_order_relaxed);
+        recording_started_frame_count_.store(0, std::memory_order_release);
+        next_calibration_ns_.store(UINT64_MAX, std::memory_order_release);
+        calibration_count_.store(0, std::memory_order_release);
+        recording_started_claimed_.store(false, std::memory_order_release);
+        recording_started_accepted_.store(false, std::memory_order_release);
+        accepting_snapshots_.store(true, std::memory_order_release);
+        if (state_.load(std::memory_order_acquire) != AdapterState::stopping) {
+            state_.store(AdapterState::active, std::memory_order_release);
+        }
+        host_.log(LogLevel::info, "native producer started from actual output start signal");
+        host_.log(LogLevel::info, journal_utf8);
+    } catch (...) {
+        fail_current_run(ProducerResult::producer_internal_error, "producer start threw internally");
     }
-    const std::string event_id = options_.uuid_factory ? options_.uuid_factory() : std::string{};
-    EventSnapshot pending_started{
-        event_id,
-        EventType::recording_started,
-        ClockSnapshot{0, signal.output_frame_count, false},
-        std::nullopt,
-        std::nullopt,
-        std::nullopt,
-    };
-    producer_ = std::move(producer);
-    pending_recording_started_ = std::move(pending_started);
-    journal_path_ = *journal;
-    recording_path_ = recording;
-    origin_ns_.store(signal.absolute_monotonic_ns, std::memory_order_release);
-    initial_frame_count_.store(signal.output_frame_count, std::memory_order_release);
-    recording_started_ns_.store(0, std::memory_order_relaxed);
-    recording_started_frame_count_.store(0, std::memory_order_release);
-    next_calibration_ns_.store(UINT64_MAX, std::memory_order_release);
-    calibration_count_.store(0, std::memory_order_release);
-    recording_started_claimed_.store(false, std::memory_order_release);
-    recording_started_accepted_.store(false, std::memory_order_release);
-    accepting_snapshots_.store(true, std::memory_order_release);
-    state_.store(AdapterState::active, std::memory_order_release);
-    host_.log(LogLevel::info, "native producer started; awaiting actual output-frame clock anchor");
-    host_.log(LogLevel::info, path_to_utf8(journal_path_));
 }
 
-void ObsJournalAdapter::process_stop(const RecordingSignal& signal) noexcept {
-    if (!producer_) {
-        fail_current_run(ProducerResult::producer_internal_error, "stop without producer");
-        return;
+void ObsJournalAdapter::process_clock(const ClockCommand& command) noexcept {
+    try {
+        if (!producer_ || state_.load(std::memory_order_acquire) != AdapterState::active ||
+            !accepting_snapshots_.load(std::memory_order_acquire)) {
+            return;
+        }
+        const auto origin = origin_ns_.load(std::memory_order_acquire);
+        if (command.absolute_monotonic_ns < origin) {
+            fail_current_run(ProducerResult::producer_internal_error, "clock before output epoch");
+            return;
+        }
+        const auto relative = command.absolute_monotonic_ns - origin;
+        if (command.recording_start_anchor) {
+            const auto initial = initial_frame_count_.load(std::memory_order_acquire);
+            const auto elapsed = command.output_frame_count >= initial
+                                     ? frame_span_ns(command.output_frame_count - initial)
+                                     : std::nullopt;
+            if (!pending_recording_started_.has_value() || !elapsed.has_value() ||
+                relative < *elapsed || initial == UINT64_MAX) {
+                fail_current_run(
+                    ProducerResult::producer_internal_error,
+                    "recording_started anchor preparation failed");
+                return;
+            }
+            pending_recording_started_->clock =
+                ClockSnapshot{relative - *elapsed, initial + 1, false};
+            const auto snapshot = pending_recording_started_->clock;
+            const auto outcome = producer_->submit(std::move(*pending_recording_started_));
+            pending_recording_started_.reset();
+            if (outcome != CallbackResult::accepted) {
+                fail_current_run(
+                    outcome == CallbackResult::full
+                        ? ProducerResult::producer_failed_queue_overflow
+                        : ProducerResult::producer_internal_error,
+                    "recording_started event rejected; run failed closed");
+                return;
+            }
+            recording_started_ns_.store(origin + snapshot.monotonic_ns, std::memory_order_relaxed);
+            recording_started_frame_count_.store(
+                snapshot.output_frame_count, std::memory_order_release);
+            recording_started_accepted_.store(true, std::memory_order_release);
+            next_calibration_ns_.store(
+                snapshot.monotonic_ns +
+                    static_cast<std::uint64_t>(calibration_interval.count()) *
+                        nanoseconds_per_second,
+                std::memory_order_release);
+            host_.log(
+                LogLevel::info,
+                "recording_started captured after actual output start; clock epoch anchored");
+            return;
+        }
+        const auto outcome = producer_->submit(CalibrationSnapshot{
+            ClockSnapshot{relative, command.output_frame_count, false}});
+        if (outcome == CallbackResult::accepted) {
+            calibration_count_.fetch_add(1, std::memory_order_relaxed);
+            host_.log(LogLevel::info, "calibration snapshot accepted");
+            return;
+        }
+        fail_current_run(
+            outcome == CallbackResult::full ? ProducerResult::producer_failed_queue_overflow
+                                            : ProducerResult::producer_internal_error,
+            "producer rejected calibration; run cannot be successful");
+    } catch (...) {
+        fail_current_run(ProducerResult::producer_internal_error, "clock processing threw");
     }
-    accepting_snapshots_.store(false, std::memory_order_release);
-    const auto relative = signal.absolute_monotonic_ns >= origin_ns_.load(std::memory_order_acquire)
-                              ? signal.absolute_monotonic_ns - origin_ns_.load(std::memory_order_acquire)
-                              : 0;
-    const std::string final_path(signal.path.view());
-    const bool callbacks_done = wait_for_callbacks();
-    ProducerResult stop_result = ProducerResult::producer_internal_error;
-    if (callbacks_done && recording_started_accepted_.load(std::memory_order_acquire) &&
-        final_path == recording_path_ && signal.absolute_monotonic_ns >= origin_ns_.load()) {
-        stop_result = producer_->normal_stop(RecordingStop{
-            ClockSnapshot{relative, signal.output_frame_count, false}, final_path});
-    } else {
-        host_.log(LogLevel::error, "final recording path/QPC does not match begun Direct MP4 run");
+}
+
+void ObsJournalAdapter::disconnect_output_signals() noexcept {
+    if (output_signals_connected_.exchange(false, std::memory_order_acq_rel)) {
+        host_.disconnect_recording_output_signals();
     }
-    const auto shutdown_result = producer_->shutdown();
-    const auto stable = shutdown_result != ProducerResult::producer_ok ? shutdown_result
-                                                                       : producer_->result();
-    const bool success = callbacks_done && stop_result == ProducerResult::producer_ok &&
-                         stable == ProducerResult::producer_ok;
-    const auto session = producer_->recording_session_id();
-    const auto journal_utf8 = path_to_utf8(journal_path_);
-    {
-        std::lock_guard lock(report_mutex_);
-        last_report_ = RunReport{
-            stable,
-            journal_utf8,
-            session,
-            signal.output_frame_count,
-            calibration_count_.load(std::memory_order_acquire),
-            success,
-        };
+}
+
+void ObsJournalAdapter::release_output_reference() noexcept {
+    if (output_reference_held_.exchange(false, std::memory_order_acq_rel)) {
+        host_.release_recording_output();
     }
-    host_.release_recording_output();
+}
+
+void ObsJournalAdapter::wait_for_callbacks_to_drain() noexcept {
+    try {
+        std::unique_lock lock(callback_wait_mutex_);
+        callback_finished_.wait(lock, [&] {
+            return (callback_gate_.load(std::memory_order_acquire) & callback_gate_count_mask) ==
+                   0;
+        });
+    } catch (...) {
+    }
+}
+
+void ObsJournalAdapter::wait_for_bound_callbacks_to_drain() noexcept {
+    try {
+        std::unique_lock lock(callback_wait_mutex_);
+        callback_finished_.wait(lock, [&] {
+            return bound_callbacks_in_flight_.load(std::memory_order_acquire) == 0;
+        });
+    } catch (...) {
+    }
+}
+
+void ObsJournalAdapter::reset_run() noexcept {
     producer_.reset();
+    pending_recording_started_.reset();
     recording_path_.clear();
     journal_path_.clear();
-    if (success) {
-        state_.store(AdapterState::idle, std::memory_order_release);
-        host_.log(LogLevel::info, "producer shutdown successful; Legacy Journal 1.0 stable");
-        host_.log(LogLevel::info, journal_utf8);
-        host_.log(LogLevel::info, session);
-        host_.log(
-            LogLevel::info,
-            std::string("producer_result=") + to_string(stable) +
-                " final_frame_count=" + std::to_string(signal.output_frame_count));
-    } else {
-        state_.store(AdapterState::failed, std::memory_order_release);
-        host_.log(LogLevel::error, to_string(stable));
-        host_.log(LogLevel::error, "recording run failed closed; journal must not be finalized");
+    accepting_snapshots_.store(false, std::memory_order_release);
+    recording_started_claimed_.store(false, std::memory_order_release);
+    recording_started_accepted_.store(false, std::memory_order_release);
+}
+
+void ObsJournalAdapter::process_stop(const StopCommand& command) noexcept {
+    try {
+        accepting_snapshots_.store(false, std::memory_order_release);
+        state_.store(AdapterState::stopping, std::memory_order_release);
+        disconnect_output_signals();
+        wait_for_bound_callbacks_to_drain();
+
+        ProducerResult stop_result = ProducerResult::producer_internal_error;
+        if (producer_ && command.captured && command.code == 0 &&
+            recording_started_accepted_.load(std::memory_order_acquire)) {
+            RecordingSignal signal = command.signal;
+            const auto started_frames =
+                recording_started_frame_count_.load(std::memory_order_acquire);
+            const auto started_ns = recording_started_ns_.load(std::memory_order_acquire);
+            constexpr std::uint64_t max_stop_qpc_adjustment_frames = 8;
+            const auto max_adjustment = frame_span_ns(max_stop_qpc_adjustment_frames);
+            const auto counter_span = signal.output_frame_count >= started_frames
+                                          ? frame_span_ns(signal.output_frame_count - started_frames)
+                                          : std::nullopt;
+            bool valid = max_adjustment.has_value() && counter_span.has_value() &&
+                         started_ns <= UINT64_MAX - counter_span.value_or(0) &&
+                         signal.path.view() == recording_path_;
+            if (valid) {
+                const auto final_frame_ns = started_ns + *counter_span;
+                const auto difference = final_frame_ns <= signal.absolute_monotonic_ns
+                                            ? signal.absolute_monotonic_ns - final_frame_ns
+                                            : final_frame_ns - signal.absolute_monotonic_ns;
+                valid = difference <= *max_adjustment;
+                if (valid) {
+                    signal.absolute_monotonic_ns = final_frame_ns;
+                    const auto origin = origin_ns_.load(std::memory_order_acquire);
+                    valid = signal.absolute_monotonic_ns >= origin;
+                    if (valid) {
+                        stop_result = producer_->normal_stop(RecordingStop{
+                            ClockSnapshot{
+                                signal.absolute_monotonic_ns - origin,
+                                signal.output_frame_count,
+                                false},
+                            std::string(signal.path.view()),
+                        });
+                    }
+                }
+            }
+        }
+        const auto shutdown_result = producer_ ? producer_->shutdown()
+                                               : ProducerResult::producer_internal_error;
+        const auto stable =
+            shutdown_result != ProducerResult::producer_ok
+                ? shutdown_result
+                : producer_ ? producer_->result() : ProducerResult::producer_internal_error;
+        const auto report_result = stop_result != ProducerResult::producer_ok ? stop_result : stable;
+        const bool success = stop_result == ProducerResult::producer_ok &&
+                             stable == ProducerResult::producer_ok && command.code == 0;
+        const auto session = producer_ ? producer_->recording_session_id() : std::string{};
+        const auto journal_utf8 = path_to_utf8(journal_path_);
+        {
+            std::lock_guard lock(report_mutex_);
+            last_report_ = RunReport{
+                report_result,
+                journal_utf8,
+                session,
+                command.signal.output_frame_count,
+                calibration_count_.load(std::memory_order_acquire),
+                success,
+            };
+        }
+        release_output_reference();
+        reset_run();
+        if (success) {
+            state_.store(AdapterState::idle, std::memory_order_release);
+            host_.log(LogLevel::info, "producer shutdown successful; Legacy Journal 1.0 stable");
+            host_.log(LogLevel::info, journal_utf8);
+            host_.log(LogLevel::info, session);
+            host_.log(
+                LogLevel::info,
+                std::string("producer_result=") + to_string(stable) +
+                    " final_frame_count=" +
+                    std::to_string(command.signal.output_frame_count));
+        } else {
+            state_.store(AdapterState::failed, std::memory_order_release);
+            host_.log(LogLevel::error, to_string(report_result));
+            host_.log(
+                LogLevel::error,
+                "output stop was absent/failed/invalid; no finalizable stop record authorized");
+        }
+    } catch (...) {
+        force_cleanup(ProducerResult::producer_internal_error, "stop processing threw");
     }
 }
 
-void ObsJournalAdapter::fail_current_run(
-    const ProducerResult result,
+void ObsJournalAdapter::force_cleanup(
+    ProducerResult result,
     const std::string_view reason) noexcept {
     accepting_snapshots_.store(false, std::memory_order_release);
+    if (state_.load(std::memory_order_acquire) != AdapterState::unloading) {
+        state_.store(AdapterState::stopping, std::memory_order_release);
+    }
+    disconnect_output_signals();
+    wait_for_bound_callbacks_to_drain();
+    if (producer_) {
+        const auto shutdown = producer_->shutdown();
+        if (shutdown != ProducerResult::producer_ok) {
+            result = shutdown;
+        } else if (producer_->result() != ProducerResult::producer_ok) {
+            result = producer_->result();
+        }
+    }
     RunReport report;
     report.result = result;
     report.journal_path_utf8 = path_to_utf8(journal_path_);
@@ -593,64 +845,80 @@ void ObsJournalAdapter::fail_current_run(
         std::lock_guard lock(report_mutex_);
         last_report_ = std::move(report);
     }
-    state_.store(AdapterState::failed, std::memory_order_release);
-    host_.release_recording_output();
+    release_output_reference();
+    reset_run();
+    if (state_.load(std::memory_order_acquire) != AdapterState::unloading) {
+        state_.store(AdapterState::failed, std::memory_order_release);
+    }
     host_.log(LogLevel::error, reason);
+}
+
+void ObsJournalAdapter::fail_current_run(
+    const ProducerResult result,
+    const std::string_view reason) noexcept {
+    force_cleanup(result, reason);
 }
 
 void ObsJournalAdapter::worker_main() noexcept {
     try {
         for (;;) {
             std::optional<RecordingSignal> start;
-            std::optional<RecordingSignal> stop;
+            std::optional<ClockCommand> clock;
+            std::optional<StopCommand> stop;
             bool forced = false;
             bool unload = false;
             {
                 std::unique_lock lock(command_mutex_);
                 command_changed_.wait(lock, [&] {
-                    return pending_start_.has_value() || pending_stop_.has_value() ||
+                    return pending_start_.has_value() || pending_clock_.has_value() ||
+                           pending_stop_.has_value() ||
                            forced_shutdown_.load(std::memory_order_acquire) || unload_requested_;
                 });
                 start = std::move(pending_start_);
                 pending_start_.reset();
+                clock = std::move(pending_clock_);
+                pending_clock_.reset();
                 stop = std::move(pending_stop_);
                 pending_stop_.reset();
                 forced = forced_shutdown_.exchange(false, std::memory_order_acq_rel);
                 unload = unload_requested_;
             }
+            if (unload) {
+                wait_for_callbacks_to_drain();
+                if (producer_ || output_reference_held_.load(std::memory_order_acquire)) {
+                    force_cleanup(
+                        ProducerResult::producer_internal_error,
+                        "module unload before successful output stop; run failed closed");
+                } else {
+                    disconnect_output_signals();
+                    wait_for_bound_callbacks_to_drain();
+                    release_output_reference();
+                }
+                state_.store(AdapterState::unloading, std::memory_order_release);
+                break;
+            }
             if (start.has_value()) {
                 process_start(*start);
+            }
+            if (clock.has_value()) {
+                process_clock(*clock);
             }
             if (stop.has_value()) {
                 process_stop(*stop);
             }
-            if (forced && producer_) {
-                accepting_snapshots_.store(false, std::memory_order_release);
-                const auto result = producer_->shutdown();
-                {
-                    std::lock_guard lock(report_mutex_);
-                    last_report_ = RunReport{
-                        result,
-                        path_to_utf8(journal_path_),
-                        producer_->recording_session_id(),
-                        0,
-                        calibration_count_.load(std::memory_order_acquire),
-                        false,
-                    };
-                }
-                static_cast<void>(wait_for_callbacks());
-                host_.release_recording_output();
-                producer_.reset();
-                state_.store(AdapterState::failed, std::memory_order_release);
-            }
-            if (unload) {
-                break;
+            if (forced) {
+                force_cleanup(
+                    ProducerResult::producer_internal_error,
+                    "adapter command/callback failure forced fail-closed cleanup");
             }
         }
     } catch (...) {
-        accepting_snapshots_.store(false, std::memory_order_release);
-        state_.store(AdapterState::failed, std::memory_order_release);
+        close_callback_gate();
+        host_.remove_callbacks();
+        wait_for_callbacks_to_drain();
+        force_cleanup(ProducerResult::producer_internal_error, "adapter worker failed internally");
     }
+    callback_lifetime_.reset();
     {
         std::lock_guard lock(worker_done_mutex_);
         worker_done_ = true;

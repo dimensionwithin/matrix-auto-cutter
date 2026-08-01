@@ -540,8 +540,28 @@ ProducerResult JournalProducer::start_recording(const RecordingStart& start) noe
             !valid_utf8(start.obs_version)) {
             return ProducerResult::producer_internal_error;
         }
+        if (start.recording_session_id.has_value()) {
+            if (!uuid_is_v4(*start.recording_session_id)) {
+                set_primary_failure(
+                    shared_,
+                    ProducerState::producer_failed_internal,
+                    ProducerResult::producer_internal_error);
+                return ProducerResult::producer_internal_error;
+            }
+            const auto expected_name =
+                *start.recording_session_id + ".recording-journal.ndjson";
+            if (start.journal_path.filename() != std::filesystem::path(expected_name)) {
+                set_primary_failure(
+                    shared_,
+                    ProducerState::producer_failed_internal,
+                    ProducerResult::producer_internal_error);
+                return ProducerResult::producer_internal_error;
+            }
+            shared_->session_id = *start.recording_session_id;
+        } else {
+            shared_->session_id = shared_->options.uuid_factory();
+        }
         shared_->start = start;
-        shared_->session_id = shared_->options.uuid_factory();
         if (!uuid_is_v4(shared_->session_id)) {
             set_primary_failure(
                 shared_,
@@ -776,6 +796,8 @@ std::string uuid_v4() noexcept {
         bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]);
     return output.data();
 }
+
+bool valid_uuid_v4(const std::string_view value) noexcept { return uuid_is_v4(value); }
 
 const char* to_string(const CallbackResult value) noexcept {
     switch (value) {

@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -178,6 +179,90 @@ void test_normal_start_snapshot_stop_shutdown_and_exact_lines() {
           "normal journal has no final stop");
 }
 
+void test_explicit_session_id_binds_filename_and_header_without_generation() {
+    auto state = std::make_shared<SinkState>();
+    auto options = options_for(state);
+    auto generated = std::make_shared<std::atomic<unsigned>>(0);
+    options.uuid_factory = [generated] {
+        generated->fetch_add(1, std::memory_order_relaxed);
+        return std::string(start_id);
+    };
+    JournalProducer producer(std::move(options));
+    auto start = start_request();
+    start.recording_session_id = std::string(session_id);
+    start.journal_path = std::filesystem::path(
+        std::string(session_id) + ".recording-journal.ndjson");
+    check(producer.start_recording(start) == ProducerResult::producer_ok,
+          "valid explicit session was rejected");
+    check(generated->load(std::memory_order_acquire) == 0,
+          "core generated a second session id for an explicit session");
+    check(producer.recording_session_id() == session_id,
+          "explicit session was not retained by the producer");
+    check(producer.shutdown() == ProducerResult::producer_internal_error,
+          "shutdown without output stop was not fail closed");
+    std::lock_guard lock(state->mutex);
+    check(!state->lines.empty() &&
+              state->lines.front().find(
+                  "\"recording_session_id\":\"" + std::string(session_id) + "\"") !=
+                  std::string::npos,
+          "header did not contain the filename-bound explicit session id");
+}
+
+void test_invalid_or_filename_mismatched_explicit_session_is_rejected_before_open() {
+    for (const auto& [id, file] : std::vector<std::pair<std::string, std::string>>{
+             {"11111111-1111-5111-8111-111111111111",
+              "11111111-1111-5111-8111-111111111111.recording-journal.ndjson"},
+             {std::string(session_id),
+              "33333333-3333-4333-8333-333333333333.recording-journal.ndjson"},
+         }) {
+        auto state = std::make_shared<SinkState>();
+        auto options = options_for(state);
+        auto sink_calls = std::make_shared<std::atomic<unsigned>>(0);
+        options.sink_factory = [state, sink_calls](const std::filesystem::path&) {
+            sink_calls->fetch_add(1, std::memory_order_relaxed);
+            return std::make_unique<TestSink>(state);
+        };
+        JournalProducer producer(std::move(options));
+        auto start = start_request();
+        start.recording_session_id = id;
+        start.journal_path = std::filesystem::path(file);
+        check(producer.start_recording(start) == ProducerResult::producer_internal_error,
+              "invalid explicit session/path binding was accepted");
+        check(sink_calls->load(std::memory_order_acquire) == 0,
+              "invalid explicit session reached journal open");
+    }
+}
+
+void test_existing_explicit_journal_is_not_overwritten() {
+    const auto directory = std::filesystem::temp_directory_path() /
+                           std::filesystem::path(L"matrix-native-create-new-test");
+    std::error_code error;
+    std::filesystem::create_directories(directory, error);
+    check(!error, "could not create CREATE_NEW test directory");
+    const auto journal = directory /
+                         std::filesystem::path(
+                             std::string(session_id) + ".recording-journal.ndjson");
+    const std::string sentinel = "existing-journal-must-survive";
+    {
+        std::ofstream output(journal, std::ios::binary | std::ios::trunc);
+        output << sentinel;
+    }
+    ProducerOptions options;
+    JournalProducer producer(std::move(options));
+    auto start = start_request();
+    start.recording_session_id = std::string(session_id);
+    start.journal_path = journal;
+    check(producer.start_recording(start) == ProducerResult::producer_failed_io,
+          "existing journal was not rejected by CREATE_NEW");
+    std::ifstream input(journal, std::ios::binary);
+    const std::string after(
+        (std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    check(after == sentinel, "existing journal bytes were overwritten");
+    input.close();
+    std::filesystem::remove(journal, error);
+    std::filesystem::remove(directory, error);
+}
+
 struct OverflowFixture final {
     std::shared_ptr<SinkState> sink = std::make_shared<SinkState>();
     JournalProducer producer;
@@ -339,6 +424,11 @@ void test_unbounded_callback_snapshot_fails_without_escape() {
 int main() {
     const std::vector<std::pair<const char*, std::function<void()>>> tests{
         {"normal/exact/order/repeated-shutdown", test_normal_start_snapshot_stop_shutdown_and_exact_lines},
+        {"explicit-session/filename/header/single-generation",
+         test_explicit_session_id_binds_filename_and_header_without_generation},
+        {"explicit-session-invalid-or-mismatched",
+         test_invalid_or_filename_mismatched_explicit_session_is_rejected_before_open},
+        {"create-new/no-overwrite", test_existing_explicit_journal_is_not_overwritten},
         {"overflow/single-winner/terminal/drain", test_queue_full_overflow_single_winner_terminal_and_drain},
         {"stop-wins-before-overflow", test_stop_wins_before_full_observation},
         {"write-failure", test_write_failure_is_fail_closed},

@@ -1,11 +1,17 @@
 #include "matrix_auto_cutter/obs_adapter.hpp"
 
+#include <Windows.h>
+
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
+#include <filesystem>
 #include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -16,14 +22,12 @@
 namespace {
 
 using namespace std::chrono_literals;
-using matrix_auto_cutter::CallbackResult;
-using matrix_auto_cutter::CalibrationSnapshot;
-using matrix_auto_cutter::EventSnapshot;
-using matrix_auto_cutter::JournalSnapshot;
-using matrix_auto_cutter::ProducerResult;
-using matrix_auto_cutter::RecordingStart;
-using matrix_auto_cutter::RecordingStop;
+using namespace matrix_auto_cutter;
 using namespace matrix_auto_cutter::obs_adapter;
+
+constexpr std::string_view session_id = "11111111-1111-4111-8111-111111111111";
+constexpr std::string_view event_id = "22222222-2222-4222-8222-222222222222";
+constexpr std::string_view recording_path = R"(P:\smoke\real-obs.mp4)";
 
 struct TestFailure final : std::runtime_error {
     using std::runtime_error::runtime_error;
@@ -36,33 +40,62 @@ void check(const bool condition, const std::string_view message) {
 }
 
 template <typename Predicate>
-void wait_for(Predicate predicate, const std::string_view message) {
+void wait_for(Predicate&& predicate, const std::string_view message) {
     const auto deadline = std::chrono::steady_clock::now() + 2s;
     while (!predicate()) {
         if (std::chrono::steady_clock::now() >= deadline) {
             throw TestFailure(std::string(message));
         }
-        std::this_thread::sleep_for(2ms);
+        std::this_thread::yield();
     }
 }
 
+struct BlockingPoint final {
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool enabled{};
+    bool entered{};
+    bool released{};
+
+    void enter_if_enabled() {
+        std::unique_lock lock(mutex);
+        if (!enabled) {
+            return;
+        }
+        entered = true;
+        changed.notify_all();
+        changed.wait(lock, [&] { return released; });
+    }
+
+    void wait_until_entered() {
+        std::unique_lock lock(mutex);
+        check(changed.wait_for(lock, 2s, [&] { return entered; }), "blocking point not entered");
+    }
+
+    void release() {
+        {
+            std::lock_guard lock(mutex);
+            released = true;
+        }
+        changed.notify_all();
+    }
+};
+
 struct ProducerState final {
     std::mutex mutex;
+    std::condition_variable changed;
     ProducerResult start_result{ProducerResult::producer_ok};
-    CallbackResult calibration_result{CallbackResult::accepted};
     ProducerResult stop_result{ProducerResult::producer_ok};
     ProducerResult shutdown_result{ProducerResult::producer_ok};
+    CallbackResult calibration_result{CallbackResult::accepted};
     unsigned starts{};
-    unsigned recording_started_events{};
+    unsigned events{};
     unsigned calibrations{};
     unsigned stops{};
     unsigned shutdowns{};
-    std::uint64_t final_frames{};
-    std::uint64_t final_ns{};
-    std::uint64_t recording_started_ns{};
-    std::uint64_t recording_started_frames{};
-    std::string start_path;
-    std::string stop_path;
+    RecordingStart start{};
+    RecordingStop stop{};
+    BlockingPoint shutdown_block;
 };
 
 class FakeProducer final : public ProducerPort {
@@ -70,37 +103,41 @@ class FakeProducer final : public ProducerPort {
     explicit FakeProducer(std::shared_ptr<ProducerState> state) : state_(std::move(state)) {}
 
     ProducerResult start_recording(const RecordingStart& start) noexcept override {
-        std::lock_guard lock(state_->mutex);
-        ++state_->starts;
-        state_->start_path = start.recording_path_utf8;
-        return state_->start_result;
+        try {
+            std::lock_guard lock(state_->mutex);
+            ++state_->starts;
+            state_->start = start;
+            state_->changed.notify_all();
+            return state_->start_result;
+        } catch (...) {
+            return ProducerResult::producer_internal_error;
+        }
     }
 
     CallbackResult submit(JournalSnapshot snapshot) noexcept override {
         std::lock_guard lock(state_->mutex);
         if (std::holds_alternative<EventSnapshot>(snapshot)) {
-            ++state_->recording_started_events;
-            state_->recording_started_ns = std::get<EventSnapshot>(snapshot).clock.monotonic_ns;
-            state_->recording_started_frames =
-                std::get<EventSnapshot>(snapshot).clock.output_frame_count;
-            return CallbackResult::accepted;
+            ++state_->events;
+        } else {
+            ++state_->calibrations;
         }
-        ++state_->calibrations;
+        state_->changed.notify_all();
         return state_->calibration_result;
     }
 
     ProducerResult normal_stop(const RecordingStop& stop) noexcept override {
         std::lock_guard lock(state_->mutex);
         ++state_->stops;
-        state_->final_frames = stop.clock.output_frame_count;
-        state_->final_ns = stop.clock.monotonic_ns;
-        state_->stop_path = stop.recording_path_utf8;
+        state_->stop = stop;
+        state_->changed.notify_all();
         return state_->stop_result;
     }
 
     ProducerResult shutdown() noexcept override {
+        state_->shutdown_block.enter_if_enabled();
         std::lock_guard lock(state_->mutex);
         ++state_->shutdowns;
+        state_->changed.notify_all();
         return state_->shutdown_result;
     }
 
@@ -110,7 +147,8 @@ class FakeProducer final : public ProducerPort {
     }
 
     std::string recording_session_id() const noexcept override {
-        return "11111111-1111-4111-8111-111111111111";
+        std::lock_guard lock(state_->mutex);
+        return state_->start.recording_session_id.value_or("");
     }
 
   private:
@@ -122,7 +160,7 @@ class FakeFactory final : public ProducerFactory {
     explicit FakeFactory(std::shared_ptr<ProducerState> state) : state_(std::move(state)) {}
 
     std::unique_ptr<ProducerPort> create() noexcept override {
-        ++creates;
+        creates.fetch_add(1, std::memory_order_relaxed);
         return std::make_unique<FakeProducer>(state_);
     }
 
@@ -138,52 +176,94 @@ class FakeHost final : public AdapterHost {
         const FrontendCallback frontend,
         const TickCallback tick,
         void* private_data) noexcept override {
+        std::lock_guard lock(mutex_);
         frontend_ = frontend;
         tick_ = tick;
         private_data_ = private_data;
         installed = true;
+        ++install_calls;
         return install_result;
     }
 
     void remove_callbacks() noexcept override {
-        installed = false;
-        removed = true;
+        std::lock_guard lock(mutex_);
+        if (installed) {
+            installed = false;
+            ++remove_calls;
+        }
         frontend_ = nullptr;
         tick_ = nullptr;
-        private_data_ = nullptr;
     }
 
-    bool acquire_recording_start(RecordingSignal& signal) noexcept override {
-        if (!capture_result) {
+    bool acquire_recording_output() noexcept override {
+        ++acquire_calls;
+        if (!acquire_result) {
             return false;
         }
-        ++references;
-        signal = next_signal;
+        references.fetch_add(1, std::memory_order_acq_rel);
+        acquire_block.enter_if_enabled();
         return true;
     }
 
-    bool capture_recording_stop(RecordingSignal& signal) noexcept override {
-        if (!capture_result || references.load() == 0) {
+    bool connect_recording_output_signals(
+        const OutputCallback output,
+        void* private_data) noexcept override {
+        std::lock_guard lock(mutex_);
+        if (!connect_result || output_connected) {
             return false;
         }
-        signal = next_signal;
+        output_ = output;
+        output_private_data_ = private_data;
+        output_connected = true;
+        ++connect_calls;
+        return true;
+    }
+
+    void disconnect_recording_output_signals() noexcept override {
+        std::lock_guard lock(mutex_);
+        if (output_connected) {
+            output_connected = false;
+            output_ = nullptr;
+            ++disconnect_calls;
+            cleanup_order.emplace_back("disconnect");
+        }
+    }
+
+    bool capture_recording_output(RecordingSignal& signal) noexcept override {
+        capture_output_block.enter_if_enabled();
+        if (!capture_result || references.load(std::memory_order_acquire) == 0) {
+            return false;
+        }
+        std::lock_guard lock(mutex_);
+        signal = next_signal_;
         return true;
     }
 
     bool capture_clock(
         std::uint64_t& absolute_monotonic_ns,
         std::uint64_t& output_frame_count) noexcept override {
-        if (!capture_result || references.load() == 0) {
+        capture_clock_block.enter_if_enabled();
+        if (!capture_result || references.load(std::memory_order_acquire) == 0) {
             return false;
         }
-        absolute_monotonic_ns = next_signal.absolute_monotonic_ns;
-        output_frame_count = next_signal.output_frame_count;
+        std::lock_guard lock(mutex_);
+        absolute_monotonic_ns = next_signal_.absolute_monotonic_ns;
+        output_frame_count = next_signal_.output_frame_count;
         return true;
     }
 
     void release_recording_output() noexcept override {
-        unsigned current = references.load();
-        while (current > 0 && !references.compare_exchange_weak(current, current - 1)) {
+        unsigned current = references.load(std::memory_order_acquire);
+        while (current > 0 && !references.compare_exchange_weak(
+                                  current,
+                                  current - 1,
+                                  std::memory_order_acq_rel,
+                                  std::memory_order_acquire)) {
+        }
+        if (current > 0) {
+            ++release_calls;
+            std::lock_guard lock(mutex_);
+            cleanup_order.emplace_back("release");
         }
     }
 
@@ -191,7 +271,7 @@ class FakeHost final : public AdapterHost {
 
     void log(LogLevel, const std::string_view message) noexcept override {
         try {
-            std::lock_guard lock(log_mutex);
+            std::lock_guard lock(mutex_);
             logs.emplace_back(message);
         } catch (...) {
         }
@@ -200,229 +280,577 @@ class FakeHost final : public AdapterHost {
     void set_signal(
         const std::string_view path,
         const std::uint64_t absolute_ns,
-        const std::uint64_t frames) {
-        check(next_signal.path.assign(path), "test path was not bounded");
-        check(next_signal.output_id.assign("ffmpeg_muxer"), "test output id was not bounded");
-        next_signal.absolute_monotonic_ns = absolute_ns;
-        next_signal.output_frame_count = frames;
-        next_signal.fragmented_mp4 = false;
+        const std::uint64_t frames,
+        const std::string_view output_id = "ffmpeg_muxer",
+        const bool fragmented = false) {
+        std::lock_guard lock(mutex_);
+        check(next_signal_.path.assign(path), "test path was not bounded");
+        check(next_signal_.output_id.assign(output_id), "test output id was not bounded");
+        next_signal_.absolute_monotonic_ns = absolute_ns;
+        next_signal_.output_frame_count = frames;
+        next_signal_.fragmented_mp4 = fragmented;
     }
 
-    void fire(const FrontendEvent event) noexcept {
-        if (frontend_ != nullptr) {
-            frontend_(event, private_data_);
+    void fire_frontend(const FrontendEvent event) noexcept {
+        FrontendCallback callback{};
+        void* data{};
+        {
+            std::lock_guard lock(mutex_);
+            callback = frontend_;
+            data = private_data_;
+        }
+        if (callback != nullptr) {
+            callback(event, data);
         }
     }
 
-    void tick() noexcept {
-        if (tick_ != nullptr) {
-            tick_(private_data_);
+    void fire_tick() noexcept {
+        TickCallback callback{};
+        void* data{};
+        {
+            std::lock_guard lock(mutex_);
+            callback = tick_;
+            data = private_data_;
+        }
+        if (callback != nullptr) {
+            callback(data);
+        }
+    }
+
+    void fire_output(const OutputEvent event, const int code = 0) noexcept {
+        OutputCallback callback{};
+        void* data{};
+        {
+            std::lock_guard lock(mutex_);
+            callback = output_;
+            data = output_private_data_;
+        }
+        if (callback != nullptr) {
+            callback(event, code, data);
         }
     }
 
     bool install_result{true};
+    bool acquire_result{true};
+    bool connect_result{true};
     bool capture_result{true};
     bool installed{};
-    bool removed{};
+    bool output_connected{};
+    std::atomic<unsigned> install_calls{};
+    std::atomic<unsigned> remove_calls{};
+    std::atomic<unsigned> acquire_calls{};
+    std::atomic<unsigned> connect_calls{};
+    std::atomic<unsigned> disconnect_calls{};
+    std::atomic<unsigned> release_calls{};
     std::atomic<unsigned> references{};
-    RecordingSignal next_signal{};
-    std::mutex log_mutex;
+    BlockingPoint acquire_block;
+    BlockingPoint capture_output_block;
+    BlockingPoint capture_clock_block;
+    std::vector<std::string> cleanup_order;
     std::vector<std::string> logs;
 
   private:
+    mutable std::mutex mutex_;
+    RecordingSignal next_signal_{};
     FrontendCallback frontend_{};
     TickCallback tick_{};
+    OutputCallback output_{};
     void* private_data_{};
+    void* output_private_data_{};
 };
 
-AdapterOptions test_options() {
+struct ModuleCounters final {
+    std::atomic<int> pins{};
+    std::atomic<unsigned> callback_releases{};
+    std::atomic<unsigned> worker_releases{};
+};
+
+class FakeCallbackLifetime final : public CallbackRegistrationLifetime {
+  public:
+    explicit FakeCallbackLifetime(std::shared_ptr<ModuleCounters> state) : state_(std::move(state)) {
+        state_->pins.fetch_add(1, std::memory_order_acq_rel);
+    }
+    ~FakeCallbackLifetime() override {
+        state_->callback_releases.fetch_add(1, std::memory_order_acq_rel);
+        state_->pins.fetch_sub(1, std::memory_order_acq_rel);
+    }
+
+  private:
+    std::shared_ptr<ModuleCounters> state_;
+};
+
+class FakeWorkerLifetime final : public WorkerThreadLifetime {
+  public:
+    explicit FakeWorkerLifetime(std::shared_ptr<ModuleCounters> state) : state_(std::move(state)) {
+        state_->pins.fetch_add(1, std::memory_order_acq_rel);
+    }
+    void exit_thread() noexcept override {
+        state_->worker_releases.fetch_add(1, std::memory_order_acq_rel);
+        state_->pins.fetch_sub(1, std::memory_order_acq_rel);
+    }
+
+  private:
+    std::shared_ptr<ModuleCounters> state_;
+};
+
+struct TempRoot final {
+    TempRoot() {
+        static std::atomic<unsigned> serial{};
+        path = std::filesystem::temp_directory_path() /
+               std::filesystem::path(
+                   L"matrix-obs-adapter-tests-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
+                   std::to_wstring(serial.fetch_add(1, std::memory_order_relaxed)));
+    }
+    ~TempRoot() {
+        std::error_code error;
+        std::filesystem::remove_all(path, error);
+    }
+    std::filesystem::path path;
+};
+
+AdapterOptions test_options(
+    const std::filesystem::path& local_app_data,
+    const std::shared_ptr<ModuleCounters>& module = {}) {
     AdapterOptions options;
-    auto ids = std::make_shared<unsigned>(0);
-    options.uuid_factory = [ids] {
-        ++*ids;
-        return *ids % 2 == 1 ? "22222222-2222-4222-8222-222222222222"
-                             : "33333333-3333-4333-8333-333333333333";
+    auto session_calls = std::make_shared<std::atomic<unsigned>>(0);
+    options.session_uuid_factory = [session_calls] {
+        session_calls->fetch_add(1, std::memory_order_relaxed);
+        return std::string(session_id);
     };
+    options.event_uuid_factory = [] { return std::string(event_id); };
+    options.local_app_data_provider = [local_app_data] {
+        return std::optional<std::filesystem::path>(local_app_data);
+    };
+    if (module) {
+        options.callback_lifetime_factory = [module] {
+            return std::make_unique<FakeCallbackLifetime>(module);
+        };
+        options.worker_lifetime_factory = [module] {
+            return std::make_unique<FakeWorkerLifetime>(module);
+        };
+    }
     return options;
 }
 
-void start_normal(FakeHost& host, ObsJournalAdapter& adapter) {
-    host.set_signal(R"(P:\smoke\real-obs.mp4)", 10'000'000'000ULL, 7);
-    host.fire(FrontendEvent::recording_started);
+void wait_for_producer_count(
+    const std::shared_ptr<ProducerState>& state,
+    const std::function<bool(const ProducerState&)>& ready,
+    const std::string_view message) {
+    std::unique_lock lock(state->mutex);
+    check(state->changed.wait_for(lock, 2s, [&] { return ready(*state); }), message);
+}
+
+void bind_output(FakeHost& host, ObsJournalAdapter& adapter) {
+    host.fire_frontend(FrontendEvent::recording_starting);
+    check(adapter.state() == AdapterState::start_pending, "STARTING did not enter start_pending");
+    check(host.references.load(std::memory_order_acquire) == 1, "output reference not acquired");
+    check(host.connect_calls.load(std::memory_order_acquire) == 1, "signals not connected once");
+}
+
+void start_output(
+    FakeHost& host,
+    ObsJournalAdapter& adapter,
+    const std::shared_ptr<ProducerState>& producer) {
+    bind_output(host, adapter);
+    host.set_signal(recording_path, 10'000'000'000ULL, 7);
+    host.fire_output(OutputEvent::started);
+    wait_for_producer_count(producer, [](const auto& value) { return value.starts == 1; },
+                            "actual output start did not start producer");
     wait_for([&] { return adapter.state() == AdapterState::active; }, "adapter did not activate");
 }
 
-void test_module_initialization_normal_lifecycle_and_cleanup() {
-    auto producer_state = std::make_shared<ProducerState>();
-    FakeFactory factory(producer_state);
-    FakeHost host;
-    ObsJournalAdapter adapter(host, factory, test_options());
-    check(adapter.load(), "module adapter load failed");
-    check(host.installed, "callbacks were not installed");
-
-    start_normal(host, adapter);
-    {
-        std::lock_guard lock(producer_state->mutex);
-        check(producer_state->starts == 1, "producer did not start exactly once");
-        check(producer_state->recording_started_events == 0,
-              "recording_started was submitted before the output counter advanced");
-    }
-
-    host.set_signal(R"(P:\smoke\real-obs.mp4)", 12'000'000'000ULL, 127);
-    host.tick();
-    host.set_signal(R"(P:\smoke\real-obs.mp4)", 13'000'000'000ULL, 187);
-    host.tick();
-    {
-        std::lock_guard lock(producer_state->mutex);
-        check(producer_state->calibrations == 1, "calibration cadence was not approximately two seconds");
-        check(producer_state->recording_started_events == 1,
-              "recording_started was not submitted exactly once");
-        check(producer_state->recording_started_ns == 0,
-              "output frame/QPC anchor changed the expected start timestamp");
-        check(producer_state->recording_started_frames == 8,
-              "recording_started did not bind the first actual output frame counter");
-    }
-
-    host.set_signal(R"(P:\smoke\real-obs.mp4)", 14'000'000'000ULL, 247);
-    host.fire(FrontendEvent::recording_stopped);
-    wait_for([&] { return adapter.state() == AdapterState::idle; }, "normal stop did not finish");
-    const auto report = adapter.last_report();
-    check(report.has_value() && report->successful, "normal run was not reported successful");
-    check(report->final_frame_count == 247, "final frame counter changed");
-    check(report->calibration_count == 1, "calibration count changed");
-    check(report->recording_session_id == "11111111-1111-4111-8111-111111111111",
-          "session id was not exposed");
-    check(report->journal_path_utf8.ends_with(".recording-journal.ndjson"),
-          "journal path was not discoverable");
-    {
-        std::lock_guard lock(producer_state->mutex);
-        check(producer_state->stops == 1 && producer_state->shutdowns == 1,
-              "normal stop/shutdown counts differ");
-        check(producer_state->final_frames == 247, "producer did not receive final frame count");
-        check(producer_state->final_ns == 3'983'333'333ULL,
-              "stop did not derive final QPC from the bounded start counter anchor");
-    }
-
-    host.tick();
-    {
-        std::lock_guard lock(producer_state->mutex);
-        check(producer_state->calibrations == 1, "callback after stop was accepted");
-    }
-    host.fire(FrontendEvent::recording_stopped);
-    adapter.unload();
-    adapter.unload();
-    check(host.removed && !host.installed, "callbacks were not removed");
-    check(host.references.load() == 0, "recording output reference leaked");
+void anchor_recording(
+    FakeHost& host,
+    const std::shared_ptr<ProducerState>& producer) {
+    host.set_signal(recording_path, 10'016'666'666ULL, 8);
+    host.fire_tick();
+    wait_for_producer_count(producer, [](const auto& value) { return value.events == 1; },
+                            "recording_started was not anchored");
 }
 
-void test_concurrent_start_and_non_mp4_fail_closed() {
-    auto producer_state = std::make_shared<ProducerState>();
-    FakeFactory factory(producer_state);
+void stop_output_successfully(
+    FakeHost& host,
+    ObsJournalAdapter& adapter,
+    const std::shared_ptr<ProducerState>& producer) {
+    host.set_signal(recording_path, 14'000'000'000ULL, 248);
+    host.fire_output(OutputEvent::stopped, 0);
+    wait_for_producer_count(producer, [](const auto& value) { return value.shutdowns == 1; },
+                            "successful output stop did not shut down producer");
+    wait_for([&] { return adapter.state() == AdapterState::idle; }, "normal stop did not return idle");
+}
+
+void test_output_lifecycle_authority_normative_path_and_exact_binding() {
+    TempRoot root;
+    auto producer = std::make_shared<ProducerState>();
+    FakeFactory factory(producer);
     FakeHost host;
-    ObsJournalAdapter adapter(host, factory, test_options());
+    ObsJournalAdapter adapter(host, factory, test_options(root.path));
     check(adapter.load(), "load failed");
 
-    host.set_signal(R"(P:\smoke\not-supported.mkv)", 1, 0);
-    host.fire(FrontendEvent::recording_started);
-    check(adapter.state() == AdapterState::idle, "non-MP4 changed adapter state");
-    check(factory.creates.load() == 0, "non-MP4 created a producer");
-    check(host.references.load() == 0, "non-MP4 reference leaked");
+    host.fire_frontend(FrontendEvent::recording_started);
+    check(factory.creates.load(std::memory_order_acquire) == 0,
+          "frontend RECORDING_STARTED alone created a producer");
+    bind_output(host, adapter);
+    check(factory.creates.load(std::memory_order_acquire) == 0,
+          "frontend STARTING created a producer before output start");
+    check(!std::filesystem::exists(
+              root.path / L"DimensionWithin" / L"MatrixAutoCutter" / L"producer" / L"journals"),
+          "STARTING performed journal directory IO in the callback");
 
-    host.set_signal(R"(P:\smoke\hybrid.mp4)", 1, 0);
-    check(host.next_signal.output_id.assign("mp4_output"), "hybrid output id was not bounded");
-    host.fire(FrontendEvent::recording_started);
-    check(adapter.state() == AdapterState::idle, "hybrid MP4 changed adapter state");
-    check(factory.creates.load() == 0, "hybrid MP4 created a producer");
-    check(host.references.load() == 0, "hybrid MP4 reference leaked");
+    host.fire_frontend(FrontendEvent::recording_started);
+    check(factory.creates.load(std::memory_order_acquire) == 0,
+          "frontend STARTED became journal authority");
+    host.set_signal(recording_path, 10'000'000'000ULL, 7);
+    host.fire_output(OutputEvent::started);
+    wait_for_producer_count(producer, [](const auto& value) { return value.starts == 1; },
+                            "output start did not create producer");
+    wait_for([&] { return adapter.state() == AdapterState::active; }, "adapter did not activate");
+    {
+        std::lock_guard lock(producer->mutex);
+        const auto expected_directory = root.path / L"DimensionWithin" / L"MatrixAutoCutter" /
+                                        L"producer" / L"journals";
+        check(producer->start.journal_path.parent_path() == expected_directory,
+              "journal was not placed under normative LocalAppData producer directory");
+        check(producer->start.recording_session_id == session_id,
+              "adapter did not pass its explicit session to the producer");
+        check(producer->start.journal_path.filename() ==
+                  std::filesystem::path(
+                      std::string(session_id) + ".recording-journal.ndjson"),
+              "journal filename was not exactly session-bound");
+    }
 
-    host.set_signal(R"(P:\smoke\fragmented.mp4)", 1, 0);
-    host.next_signal.fragmented_mp4 = true;
-    host.fire(FrontendEvent::recording_started);
-    check(adapter.state() == AdapterState::idle, "fragmented MP4 changed adapter state");
-    check(factory.creates.load() == 0, "fragmented MP4 created a producer");
-    check(host.references.load() == 0, "fragmented MP4 reference leaked");
+    anchor_recording(host, producer);
+    host.set_signal(recording_path, 12'016'666'666ULL, 128);
+    host.fire_tick();
+    wait_for_producer_count(producer, [](const auto& value) { return value.calibrations == 1; },
+                            "calibration was not accepted");
 
-    start_normal(host, adapter);
-    host.set_signal(R"(P:\smoke\real-obs.mp4)", 10'100'000'000ULL, 8);
-    host.tick();
-    host.fire(FrontendEvent::recording_started);
-    check(factory.creates.load() == 1, "concurrent start created a second producer");
-    check(host.references.load() == 1, "concurrent start reference was not released");
-    host.set_signal(R"(P:\smoke\real-obs.mp4)", 11'000'000'000ULL, 67);
-    host.fire(FrontendEvent::recording_stopped);
-    wait_for([&] { return adapter.state() == AdapterState::idle; }, "cleanup stop failed");
+    host.fire_frontend(FrontendEvent::recording_stopped);
+    {
+        std::lock_guard lock(producer->mutex);
+        check(producer->stops == 0, "frontend STOPPED authorized a normal stop");
+    }
+    check(adapter.state() == AdapterState::active,
+          "frontend STOPPED changed the authoritative output lifecycle");
+
+    stop_output_successfully(host, adapter, producer);
+    const auto report = adapter.last_report();
+    check(report.has_value() && report->successful, "successful output stop was not reportable");
+    check(report->recording_session_id == session_id, "report session binding changed");
+    check(report->final_frame_count == 248, "final output counter changed");
+    check(host.disconnect_calls.load(std::memory_order_acquire) == 1,
+          "output signal connections were not removed exactly once");
+    check(host.release_calls.load(std::memory_order_acquire) == 1,
+          "output reference was not released exactly once");
+    check(host.cleanup_order == std::vector<std::string>({"disconnect", "release"}),
+          "output reference was released before callback disconnection");
+
+    host.fire_output(OutputEvent::stopped, 0);
     adapter.unload();
+    adapter.unload();
+    check(host.remove_calls.load(std::memory_order_acquire) == 1,
+          "repeated unload removed frontend/tick callbacks twice");
+    check(host.disconnect_calls.load(std::memory_order_acquire) == 1,
+          "repeated stop/unload disconnected output twice");
+    check(host.release_calls.load(std::memory_order_acquire) == 1,
+          "repeated stop/unload released output twice");
 }
 
-void test_overflow_and_io_failure_are_not_success() {
+void test_failed_or_missing_output_stop_never_calls_normal_stop() {
     {
-        auto producer_state = std::make_shared<ProducerState>();
-        producer_state->calibration_result = CallbackResult::full;
-        producer_state->stop_result = ProducerResult::producer_failed_queue_overflow;
-        producer_state->shutdown_result = ProducerResult::producer_failed_queue_overflow;
-        FakeFactory factory(producer_state);
+        TempRoot root;
+        auto producer = std::make_shared<ProducerState>();
+        FakeFactory factory(producer);
         FakeHost host;
-        ObsJournalAdapter adapter(host, factory, test_options());
-        check(adapter.load(), "overflow adapter load failed");
-        start_normal(host, adapter);
-        host.set_signal(R"(P:\smoke\real-obs.mp4)", 12'000'000'000ULL, 127);
-        host.tick();
-        host.set_signal(R"(P:\smoke\real-obs.mp4)", 12'100'000'000ULL, 133);
-        host.tick();
-        host.set_signal(R"(P:\smoke\real-obs.mp4)", 13'000'000'000ULL, 187);
-        host.fire(FrontendEvent::recording_stopped);
-        wait_for([&] { return adapter.state() == AdapterState::failed; }, "overflow did not fail");
-        const auto report = adapter.last_report();
-        check(report.has_value() && !report->successful &&
-                  report->result == ProducerResult::producer_failed_queue_overflow,
-              "overflow was reported as success");
+        ObsJournalAdapter adapter(host, factory, test_options(root.path));
+        check(adapter.load(), "failed-stop load failed");
+        start_output(host, adapter, producer);
+        anchor_recording(host, producer);
+        host.set_signal(recording_path, 14'000'000'000ULL, 248);
+        host.fire_output(OutputEvent::stopped, -4);
+        wait_for([&] { return adapter.state() == AdapterState::failed; },
+                 "failed output stop did not fail run");
+        {
+            std::lock_guard lock(producer->mutex);
+            check(producer->stops == 0, "failed output stop emitted normal stop");
+            check(producer->shutdowns == 1, "failed output stop did not clean producer");
+        }
         adapter.unload();
     }
     {
-        auto producer_state = std::make_shared<ProducerState>();
-        producer_state->start_result = ProducerResult::producer_failed_io;
-        producer_state->shutdown_result = ProducerResult::producer_failed_io;
-        FakeFactory factory(producer_state);
+        TempRoot root;
+        auto producer = std::make_shared<ProducerState>();
+        FakeFactory factory(producer);
         FakeHost host;
-        ObsJournalAdapter adapter(host, factory, test_options());
-        check(adapter.load(), "IO adapter load failed");
-        host.set_signal(R"(P:\smoke\io.mp4)", 1, 0);
-        host.fire(FrontendEvent::recording_started);
-        wait_for([&] { return adapter.state() == AdapterState::failed; }, "IO failure did not fail");
-        const auto report = adapter.last_report();
-        check(report.has_value() && !report->successful, "IO failure was reported as success");
-        check(host.references.load() == 0, "IO failure leaked output reference");
+        ObsJournalAdapter adapter(host, factory, test_options(root.path));
+        check(adapter.load(), "missing-stop load failed");
+        start_output(host, adapter, producer);
+        anchor_recording(host, producer);
+        host.fire_frontend(FrontendEvent::recording_stopped);
+        adapter.unload();
+        std::lock_guard lock(producer->mutex);
+        check(producer->stops == 0, "missing output stop emitted normal stop during unload");
+        check(producer->shutdowns == 1, "missing output stop did not shut producer down");
+    }
+}
+
+void test_invalid_session_localappdata_and_unsupported_or_concurrent_start_fail_closed() {
+    {
+        TempRoot root;
+        auto producer = std::make_shared<ProducerState>();
+        FakeFactory factory(producer);
+        FakeHost host;
+        auto options = test_options(root.path);
+        options.session_uuid_factory = [] {
+            return std::string("11111111-1111-5111-8111-111111111111");
+        };
+        ObsJournalAdapter adapter(host, factory, std::move(options));
+        check(adapter.load(), "invalid-session load failed");
+        bind_output(host, adapter);
+        host.set_signal(recording_path, 10'000'000'000ULL, 7);
+        host.fire_output(OutputEvent::started);
+        wait_for([&] { return adapter.state() == AdapterState::failed; },
+                 "invalid explicit session did not fail closed");
+        check(factory.creates.load(std::memory_order_acquire) == 0,
+              "invalid explicit session reached producer allocation");
+        check(host.references.load(std::memory_order_acquire) == 0,
+              "invalid explicit session leaked output reference");
+        adapter.unload();
+    }
+    {
+        TempRoot root;
+        auto producer = std::make_shared<ProducerState>();
+        FakeFactory factory(producer);
+        FakeHost host;
+        auto options = test_options(root.path);
+        options.local_app_data_provider = [] {
+            return std::optional<std::filesystem::path>{};
+        };
+        ObsJournalAdapter adapter(host, factory, std::move(options));
+        check(adapter.load(), "missing-LocalAppData load failed");
+        bind_output(host, adapter);
+        host.set_signal(recording_path, 10'000'000'000ULL, 7);
+        host.fire_output(OutputEvent::started);
+        wait_for([&] { return adapter.state() == AdapterState::failed; },
+                 "missing LocalAppData did not fail closed");
+        check(factory.creates.load(std::memory_order_acquire) == 0,
+              "missing LocalAppData reached producer allocation");
+        adapter.unload();
+    }
+    const auto unsupported_output_fails_at_actual_start = [](
+                                                             const std::string_view path,
+                                                             const std::string_view output_id,
+                                                             const bool fragmented) {
+        TempRoot root;
+        auto producer = std::make_shared<ProducerState>();
+        FakeFactory factory(producer);
+        FakeHost host;
+        ObsJournalAdapter adapter(host, factory, test_options(root.path));
+        check(adapter.load(), "unsupported-start load failed");
+        host.set_signal(path, 1, 0, output_id, fragmented);
+        host.fire_frontend(FrontendEvent::recording_starting);
+        check(adapter.state() == AdapterState::start_pending,
+              "STARTING did not bind the current output before its settings were authoritative");
+        check(host.references.load(std::memory_order_acquire) == 1,
+              "STARTING did not retain the current output");
+        host.fire_output(OutputEvent::started);
+        wait_for([&] { return adapter.state() == AdapterState::failed; },
+                 "unsupported actual output start did not fail closed");
+        check(factory.creates.load(std::memory_order_acquire) == 0,
+              "unsupported output reached producer allocation");
+        check(host.references.load(std::memory_order_acquire) == 0,
+              "unsupported output leaked its retained reference");
+        adapter.unload();
+    };
+    unsupported_output_fails_at_actual_start(R"(P:\smoke\unsupported.mkv)", "ffmpeg_muxer", false);
+    unsupported_output_fails_at_actual_start(recording_path, "mp4_output", false);
+    unsupported_output_fails_at_actual_start(recording_path, "ffmpeg_muxer", true);
+    {
+        TempRoot root;
+        auto producer = std::make_shared<ProducerState>();
+        FakeFactory factory(producer);
+        FakeHost host;
+        ObsJournalAdapter adapter(host, factory, test_options(root.path));
+        check(adapter.load(), "concurrent-start load failed");
+        bind_output(host, adapter);
+        host.fire_frontend(FrontendEvent::recording_starting);
+        check(host.acquire_calls.load(std::memory_order_acquire) == 1,
+              "concurrent start acquired a second output");
+        check(host.references.load(std::memory_order_acquire) == 1,
+              "concurrent start changed reference ownership");
         adapter.unload();
     }
 }
 
-void test_no_exception_crosses_boundaries() {
-    ObsJournalAdapter::frontend_boundary(FrontendEvent::recording_started, nullptr);
-    ObsJournalAdapter::tick_boundary(nullptr);
-    auto producer_state = std::make_shared<ProducerState>();
-    FakeFactory factory(producer_state);
+enum class BlockedScenario { idle_frontend, start_pending, active_tick, output_stop };
+
+void run_blocked_unload_scenario(const BlockedScenario scenario) {
+    TempRoot root;
+    auto producer = std::make_shared<ProducerState>();
+    auto module = std::make_shared<ModuleCounters>();
+    FakeFactory factory(producer);
     FakeHost host;
-    ObsJournalAdapter adapter(host, factory, test_options());
-    check(adapter.load(), "boundary adapter load failed");
-    host.capture_result = false;
-    host.fire(FrontendEvent::recording_started);
-    host.fire(FrontendEvent::recording_stopped);
-    host.tick();
+    auto options = test_options(root.path, module);
+    auto callback_block = std::make_shared<BlockingPoint>();
+    if (scenario == BlockedScenario::idle_frontend) {
+        callback_block->enabled = true;
+        options.callback_probe = [callback_block](const CallbackKind kind) {
+            if (kind == CallbackKind::frontend) {
+                callback_block->enter_if_enabled();
+            }
+        };
+    } else if (scenario == BlockedScenario::active_tick) {
+        options.callback_probe = [callback_block](const CallbackKind kind) {
+            if (kind == CallbackKind::tick) {
+                callback_block->enter_if_enabled();
+            }
+        };
+    }
+    options.unload_deadline = 1ms;
+    if (scenario == BlockedScenario::start_pending) {
+        host.acquire_block.enabled = true;
+    }
+    ObsJournalAdapter adapter(host, factory, std::move(options));
+    check(adapter.load(), "blocked-unload load failed");
+
+    if (scenario == BlockedScenario::active_tick || scenario == BlockedScenario::output_stop) {
+        start_output(host, adapter, producer);
+        anchor_recording(host, producer);
+    }
+
+    if (scenario == BlockedScenario::active_tick) {
+        callback_block->enabled = true;
+    }
+    if (scenario == BlockedScenario::output_stop) {
+        host.capture_output_block.enabled = true;
+    }
+
+    std::thread callback;
+    BlockingPoint* active_block = callback_block.get();
+    if (scenario == BlockedScenario::idle_frontend) {
+        callback = std::thread([&] { host.fire_frontend(FrontendEvent::other); });
+    } else if (scenario == BlockedScenario::start_pending) {
+        active_block = &host.acquire_block;
+        host.set_signal(recording_path, 9'900'000'000ULL, 0);
+        callback = std::thread([&] { host.fire_frontend(FrontendEvent::recording_starting); });
+    } else if (scenario == BlockedScenario::active_tick) {
+        callback = std::thread([&] { host.fire_tick(); });
+    } else {
+        active_block = &host.capture_output_block;
+        host.set_signal(recording_path, 14'000'000'000ULL, 248);
+        callback = std::thread([&] { host.fire_output(OutputEvent::stopped, 0); });
+    }
+    active_block->wait_until_entered();
+    if (scenario == BlockedScenario::start_pending) {
+        check(adapter.state() == AdapterState::start_pending,
+              "blocked acquire was not visibly start_pending");
+    }
     adapter.unload();
+    check(module->pins.load(std::memory_order_acquire) == 2,
+          "callback/worker DLL pins were released at unload timeout");
+    check(module->callback_releases.load(std::memory_order_acquire) == 0,
+          "callback registration pin released before blocked callback exit");
+    check(module->worker_releases.load(std::memory_order_acquire) == 0,
+          "worker pin released before blocked callback exit");
+    active_block->release();
+    callback.join();
+    wait_for([&] { return module->pins.load(std::memory_order_acquire) == 0; },
+             "module pins did not drain after last callback/thread exit");
+    check(module->callback_releases.load(std::memory_order_acquire) == 1,
+          "callback registration module ref was not released exactly once");
+    check(module->worker_releases.load(std::memory_order_acquire) == 1,
+          "worker module ref was not released exactly once");
+}
+
+void test_unload_drains_blocked_callbacks_in_all_adapter_states() {
+    run_blocked_unload_scenario(BlockedScenario::idle_frontend);
+    run_blocked_unload_scenario(BlockedScenario::start_pending);
+    run_blocked_unload_scenario(BlockedScenario::active_tick);
+    run_blocked_unload_scenario(BlockedScenario::output_stop);
+}
+
+void test_adapter_worker_timeout_keeps_module_pinned_until_shutdown_returns() {
+    TempRoot root;
+    auto producer = std::make_shared<ProducerState>();
+    producer->shutdown_block.enabled = true;
+    auto module = std::make_shared<ModuleCounters>();
+    FakeFactory factory(producer);
+    FakeHost host;
+    auto options = test_options(root.path, module);
+    options.unload_deadline = 1ms;
+    ObsJournalAdapter adapter(host, factory, std::move(options));
+    check(adapter.load(), "worker-timeout load failed");
+    start_output(host, adapter, producer);
+    anchor_recording(host, producer);
+    adapter.unload();
+    producer->shutdown_block.wait_until_entered();
+    check(module->pins.load(std::memory_order_acquire) == 2,
+          "worker/callback registration pins did not survive worker timeout");
+    producer->shutdown_block.release();
+    wait_for([&] { return module->pins.load(std::memory_order_acquire) == 0; },
+             "module pins did not release after worker shutdown completed");
+    check(module->callback_releases.load(std::memory_order_acquire) == 1 &&
+              module->worker_releases.load(std::memory_order_acquire) == 1,
+          "worker-timeout lifetime released a pin more than once");
+}
+
+void test_no_exception_crosses_any_callback_boundary() {
+    ObsJournalAdapter::frontend_boundary(FrontendEvent::recording_starting, nullptr);
+    ObsJournalAdapter::tick_boundary(nullptr);
+    ObsJournalAdapter::output_boundary(OutputEvent::started, 0, nullptr);
+
+    for (const auto kind : {CallbackKind::frontend, CallbackKind::tick,
+                            CallbackKind::output_start, CallbackKind::output_stop}) {
+        TempRoot root;
+        auto producer = std::make_shared<ProducerState>();
+        FakeFactory factory(producer);
+        FakeHost host;
+        auto options = test_options(root.path);
+        options.callback_probe = [kind](const CallbackKind observed) {
+            if (observed == kind) {
+                throw std::runtime_error("injected callback exception");
+            }
+        };
+        ObsJournalAdapter adapter(host, factory, std::move(options));
+        check(adapter.load(), "exception-boundary load failed");
+        if (kind == CallbackKind::frontend) {
+            host.fire_frontend(FrontendEvent::other);
+        } else if (kind == CallbackKind::output_start) {
+            bind_output(host, adapter);
+            host.set_signal(recording_path, 10'000'000'000ULL, 7);
+            host.fire_output(OutputEvent::started, 0);
+        } else {
+            start_output(host, adapter, producer);
+            if (kind == CallbackKind::tick) {
+                host.fire_tick();
+            } else {
+                host.fire_output(OutputEvent::stopped, 0);
+            }
+        }
+        adapter.unload();
+    }
 }
 
 }  // namespace
 
 int main() {
+    std::cout << std::unitbuf;
+    std::cerr << std::unitbuf;
     const std::vector<std::pair<const char*, std::function<void()>>> tests{
-        {"module/start/one-event/calibration/stop/post-stop/references",
-         test_module_initialization_normal_lifecycle_and_cleanup},
-        {"concurrent-start/non-mp4", test_concurrent_start_and_non_mp4_fail_closed},
-        {"overflow/io-fail-closed", test_overflow_and_io_failure_are_not_success},
-        {"no-exception-c-boundary", test_no_exception_crosses_boundaries},
+        {"output-authority/path/session/calibration/stop/cleanup/idempotence",
+         test_output_lifecycle_authority_normative_path_and_exact_binding},
+        {"failed-or-missing-output-stop", test_failed_or_missing_output_stop_never_calls_normal_stop},
+        {"invalid-session/localappdata/unsupported/concurrent-start",
+         test_invalid_session_localappdata_and_unsupported_or_concurrent_start_fail_closed},
+        {"unload-blocked-idle/start-pending/active-tick/output-stop",
+         test_unload_drains_blocked_callbacks_in_all_adapter_states},
+        {"adapter-worker-timeout-module-pin",
+         test_adapter_worker_timeout_keeps_module_pinned_until_shutdown_returns},
+        {"no-exception-C-boundaries", test_no_exception_crosses_any_callback_boundary},
     };
     int failures = 0;
     for (const auto& [name, test] : tests) {
+        std::cout << "RUN " << name << '\n';
         try {
             test();
             std::cout << "PASS " << name << '\n';
