@@ -81,6 +81,7 @@ def probe_json(
     source_path: str,
     data: bytes,
     streams: list[dict[str, object]],
+    format_duration: str = "1.000000000",
 ) -> bytes:
     return golden_json(
         streams,
@@ -89,7 +90,7 @@ def probe_json(
             "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
             "format_long_name": "QuickTime / MOV",
             "start_time": "0.000000000",
-            "duration": "1.000000000",
+            "duration": format_duration,
             "size": str(len(data)),
             "bit_rate": str(len(data) * 8),
             "tags": {"title": "bounded"},
@@ -151,6 +152,7 @@ def make_case(
     streams: list[dict[str, object]] | None = None,
     source_path: str = r"C:\Sources\source.mp4",
     source_data: bytes = b"controlled-source-media" * 5,
+    format_duration: str = "1.000000000",
 ) -> ConfirmationCase:
     port = ConfirmationFakePort()
     workspace = ensure_workspace(port, r"C:\Workspace")
@@ -184,7 +186,12 @@ def make_case(
     process = FakeProcessPort(
         ProbeProcessOk(
             ProcessDiagnostics(
-                probe_json(source.canonical_dos_path, source_data, streams or unique_streams()),
+                probe_json(
+                    source.canonical_dos_path,
+                    source_data,
+                    streams or unique_streams(),
+                    format_duration,
+                ),
                 b"",
             )
         )

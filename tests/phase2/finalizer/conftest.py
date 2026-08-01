@@ -33,12 +33,18 @@ SYNTHETIC_STOP_ID = "44444444-4444-4444-8444-444444444444"
 PROJECT_ID = "550e8400-e29b-41d4-a716-446655440000"
 
 
-def journal_records(source_path: str = r"C:\Sources\source.mp4") -> tuple[dict[str, object], ...]:
+def journal_records(
+    source_path: str = r"C:\Sources\source.mp4",
+    *,
+    output_frame_count: int = 60,
+    stop_monotonic_ns: int = 1_000_000_000,
+    calibration_samples: tuple[tuple[int, int], ...] = (),
+) -> tuple[dict[str, object], ...]:
     common = {
         "artifact_type": "recording_event_journal",
         "journal_schema_version": "1.0",
     }
-    return (
+    records: list[dict[str, object]] = [
         {
             **common,
             "record_type": "header",
@@ -74,16 +80,29 @@ def journal_records(source_path: str = r"C:\Sources\source.mp4") -> tuple[dict[s
         {
             **common,
             "record_type": "stop",
-            "sequence": 2,
+            "sequence": 2 + len(calibration_samples),
             "lifecycle_status": "stopped_unfinalized",
-            "monotonic_ns": 1_000_000_000,
-            "output_frame_count": 60,
+            "monotonic_ns": stop_monotonic_ns,
+            "output_frame_count": output_frame_count,
             "recording_paused": False,
             "last_recording_path": source_path,
             "output_result": "success",
             "file_splitting_detected": False,
         },
-    )
+    ]
+    for index, (monotonic_ns, sample_frame_count) in enumerate(calibration_samples, start=2):
+        records.insert(
+            -1,
+            {
+                **common,
+                "record_type": "calibration_sample",
+                "sequence": index,
+                "monotonic_ns": monotonic_ns,
+                "output_frame_count": sample_frame_count,
+                "recording_paused": False,
+            },
+        )
+    return tuple(records)
 
 
 def journal_bytes(records: tuple[dict[str, object], ...] | None = None) -> bytes:

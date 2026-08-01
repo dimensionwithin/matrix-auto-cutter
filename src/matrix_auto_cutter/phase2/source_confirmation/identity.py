@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from pathlib import PureWindowsPath
 
 from matrix_auto_cutter.models import SourceBinding, SourceIdentity
@@ -37,6 +37,16 @@ def _exact_scaled_integer(value: Decimal, multiplier: int, field: str) -> int:
     return int(integral)
 
 
+def _quantize_duration_milliseconds(value: Decimal) -> int:
+    """Project an authoritative exact format duration to the nearest millisecond."""
+    if not value.is_finite() or value <= 0:
+        raise ValueError("positive finite exact format duration is required")
+    milliseconds = (value * Decimal(1_000)).to_integral_value(rounding=ROUND_HALF_UP)
+    if milliseconds < 1:
+        raise ValueError("quantized format duration must be at least one millisecond")
+    return int(milliseconds)
+
+
 def build_source_identity(
     source_path: str,
     completed: HashCompleted,
@@ -67,11 +77,7 @@ def build_source_identity(
             file_name=PureWindowsPath(source_path).name,
             size_bytes=receipt.bytes_read,
             sha256=receipt.sha256,
-            duration_ms=_exact_scaled_integer(
-                Decimal(format_evidence.duration.value),
-                1_000,
-                "duration",
-            ),
+            duration_ms=_quantize_duration_milliseconds(Decimal(format_evidence.duration.value)),
             video_frame_count=video.nb_frames,
             fps_num=60,
             fps_den=1,
