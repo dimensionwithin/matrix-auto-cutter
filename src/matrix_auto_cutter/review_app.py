@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import msvcrt
+import os
 import sys
 import webbrowser
 from collections.abc import Sequence
@@ -16,6 +18,56 @@ from matrix_auto_cutter.approval import (
 )
 from matrix_auto_cutter.cut_proposal import ProposalFailed, load_proposal
 from matrix_auto_cutter.review import write_review
+
+
+class ReviewSingleInstance:
+    """Allow at most one Matrix Auto Cutter review application per user."""
+
+    def __init__(self, path: Path | None = None) -> None:
+        """Create an unheld lock in the per-user runner state directory."""
+        if path is None:
+            local = os.environ.get("LOCALAPPDATA")
+            if not local:
+                raise RuntimeError("LOCALAPPDATA ist nicht gesetzt")
+            path = (
+                Path(local)
+                / "DimensionWithin"
+                / "MatrixAutoCutter"
+                / "product-runner"
+                / "review.lock"
+            )
+        self.path = path
+        self._descriptor: int | None = None
+
+    def acquire(self) -> bool:
+        """Acquire the one-byte lock without opening any GUI."""
+        if os.name != "nt":
+            raise RuntimeError("Die Review-Anwendung unterstützt nur Windows.")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        if os.fstat(descriptor).st_size == 0:
+            os.write(descriptor, b"\0")
+            os.fsync(descriptor)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        try:
+            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+        except OSError:
+            os.close(descriptor)
+            return False
+        self._descriptor = descriptor
+        return True
+
+    def close(self) -> None:
+        """Release the lock exactly once."""
+        if self._descriptor is None:
+            return
+        descriptor = self._descriptor
+        self._descriptor = None
+        try:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+        finally:
+            os.close(descriptor)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -151,11 +203,16 @@ def run_review(proposal_path: Path) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI entry point used by the product runner."""
     args = _parser().parse_args(argv)
+    guard = ReviewSingleInstance()
     try:
+        if not guard.acquire():
+            return 3
         return run_review(args.proposal.resolve(strict=True))
     except Exception as exc:
         print(f"Review-Startfehler: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
+    finally:
+        guard.close()
 
 
 if __name__ == "__main__":

@@ -124,6 +124,23 @@ def test_incomplete_journal_is_not_finalized(tmp_path: Path) -> None:
     assert not (state / "sessions" / f"{SESSION_A}.json").exists()
 
 
+def test_ten_unchanged_incomplete_polls_log_once(tmp_path: Path) -> None:
+    pending = JournalUnavailable(
+        RunnerStatusCode.JOURNAL_INCOMPLETE,
+        "E_JOURNAL_INCOMPLETE",
+        "Journal ist noch nicht vollständig.",
+        SESSION_A,
+    )
+    runner, ports, _, _ = _case(tmp_path, {_journal_name(SESSION_A): pending})
+
+    for _ in range(10):
+        runner.scan_once()
+
+    output = runner.output.getvalue()
+    assert output.count("[journal_incomplete]") == 1
+    assert ports.requests == []
+
+
 def test_valid_stop_uses_exact_journal_source_and_preserves_raw_file(tmp_path: Path) -> None:
     source_name = "exact recording.mp4"
     source = tmp_path / "sources" / source_name
@@ -287,6 +304,45 @@ def test_finalizer_failure_does_not_block_later_recording(tmp_path: Path) -> Non
     assert len(ports.requests) == 2
     assert _session(state, SESSION_A).status is RunnerStatusCode.FINALIZER_FAILED
     assert _session(state, SESSION_B).status is RunnerStatusCode.SIDECAR_SUCCEEDED
+
+
+def test_historical_finalizer_failure_is_not_retried_or_reannounced(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "sources" / "failed.mp4"
+    source.parent.mkdir(exist_ok=True)
+    source.write_bytes(b"raw")
+    inspections = {_journal_name(SESSION_A): _ready(SESSION_A, source)}
+    failure = ManualFinalizationFailed("finalizer", "E_TEST", "kontrollierter Fehler")
+    first, first_ports, state, _ = _case(tmp_path, inspections, [failure])
+    first.scan_once()
+    assert len(first_ports.requests) == 1
+
+    second_ports = FakePorts(inspections, [])
+    output = io.StringIO()
+    second = ProductRunner(
+        tmp_path / "journals",
+        state,
+        str(tmp_path / "sources"),
+        str(tmp_path / "workspace"),
+        RunnerDependencies(
+            second_ports.inspect,
+            second_ports.ensure,
+            second_ports.finalize,
+            lambda: NOW,
+            uuid4,
+        ),
+        output=output,
+    )
+    second.ready()
+
+    for _ in range(10):
+        second.scan_once()
+
+    assert second_ports.requests == []
+    assert "[recording_detected]" not in output.getvalue()
+    assert "[finalizer_failed]" not in output.getvalue()
+    assert _session(state).status is RunnerStatusCode.FINALIZER_FAILED
 
 
 def test_foreign_claim_fails_closed(tmp_path: Path) -> None:

@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
+from matrix_auto_cutter.approval import approval_path_for, record_decision
 from matrix_auto_cutter.cut_proposal import (
     FfmpegProcessResult,
     ProposalFailed,
@@ -31,6 +32,7 @@ from matrix_auto_cutter.product_runner import (
     RunnerStatusCode,
     SessionState,
 )
+from matrix_auto_cutter.review_app import ReviewSingleInstance
 
 NOW = datetime(2026, 8, 3, 12, tzinfo=UTC)
 SESSION_A = "11111111-1111-4111-8111-111111111111"
@@ -54,12 +56,39 @@ class FakeProcess:
 
 
 @dataclass
+class FakeReviewProcess:
+    pid: int
+    exit_code: int | None = None
+    terminate_calls: int = 0
+    kill_calls: int = 0
+
+    def poll(self) -> int | None:
+        return self.exit_code
+
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+        self.exit_code = 0
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+        self.exit_code = -9
+
+    def wait(self, timeout: float | None = None) -> int:
+        del timeout
+        if self.exit_code is None:
+            raise TimeoutError("fake process is still running")
+        return self.exit_code
+
+
+@dataclass
 class FakeRunnerPorts:
     inspections: dict[str, JournalInspection]
     finalizer_results: list[ManualFinalizationResult]
     proposals: dict[str, ProposalResult]
     proposal_calls: list[str] = field(default_factory=list)
     review_opens: list[Path] = field(default_factory=list)
+    review_processes: list[FakeReviewProcess] = field(default_factory=list)
+    finalizer_calls: int = 0
 
     def inspect(self, path: Path) -> JournalInspection:
         return self.inspections[path.name]
@@ -70,12 +99,19 @@ class FakeRunnerPorts:
 
     def finalize(self, request: ManualFinalizerRequest) -> ManualFinalizationResult:
         del request
+        self.finalizer_calls += 1
         return self.finalizer_results.pop(0)
 
     def propose(self, source: Path, sidecar: Path, recording_id: str, root: Path) -> ProposalResult:
         del source, sidecar, root
         self.proposal_calls.append(recording_id)
         return self.proposals[recording_id]
+
+    def open_review(self, proposal_path: Path) -> FakeReviewProcess:
+        self.review_opens.append(proposal_path)
+        process = FakeReviewProcess(10_000 + len(self.review_processes))
+        self.review_processes.append(process)
+        return process
 
 
 def _materialize_proposal(
@@ -140,7 +176,7 @@ def _runner(
             lambda: NOW,
             uuid4,
             ports.propose,
-            ports.review_opens.append,
+            ports.open_review,
         ),
         output=io.StringIO(),
     )
@@ -191,7 +227,7 @@ def test_runner_proposes_after_sidecar_opens_once_and_restart_reuses(
     second = _runner(tmp_path, second_ports, sources)
     second.scan_once()
 
-    assert second_ports.proposal_calls == [SESSION_A]
+    assert second_ports.proposal_calls == []
     assert second_ports.review_opens == []
     assert process.analysis_calls == 1
     assert _session(tmp_path, SESSION_A).proposal_path == state.proposal_path
@@ -232,3 +268,145 @@ def test_analysis_failure_does_not_block_later_recording(
     assert _session(tmp_path, SESSION_B).status is RunnerStatusCode.APPROVAL_PENDING
     assert ports.proposal_calls == [SESSION_A, SESSION_B]
     assert len(ports.review_opens) == 1
+
+
+def test_unchanged_pending_polls_once_then_approved_transition_once(
+    tmp_path: Path, raw_sidecar: dict[str, object]
+) -> None:
+    sources = tmp_path / "sources"
+    source, sidecar, proposal, _ = _materialize_proposal(
+        sources, tmp_path / "state" / "artifacts", raw_sidecar, SESSION_A
+    )
+    ports = FakeRunnerPorts(
+        {_journal_name(SESSION_A): JournalReady(SESSION_A, "a" * 64, str(source))},
+        [_success(source, sidecar, SESSION_A)],
+        {SESSION_A: proposal},
+    )
+    runner = _runner(tmp_path, ports, sources)
+
+    runner.scan_once()
+    state = _session(tmp_path, SESSION_A)
+    assert state.proposal_path is not None
+    proposal_path = Path(state.proposal_path)
+    approval_path = approval_path_for(proposal_path)
+    proposal_before = proposal_path.read_bytes()
+    approval_before = approval_path.read_bytes()
+    for _ in range(9):
+        runner.scan_once()
+
+    output = runner.output.getvalue()
+    assert output.count("[proposal_ready]") == 1
+    assert output.count("[approval_pending]") == 1
+    assert ports.finalizer_calls == 1
+    assert ports.proposal_calls == [SESSION_A]
+    assert len(ports.review_opens) == 1
+    assert proposal_path.read_bytes() == proposal_before
+    assert approval_path.read_bytes() == approval_before
+
+    record_decision(proposal_path, "approved", now=lambda: NOW)
+    for _ in range(10):
+        runner.scan_once()
+
+    output = runner.output.getvalue()
+    assert output.count("[proposal_approved]") == 1
+    assert output.count("[approval_pending]") == 1
+    assert ports.finalizer_calls == 1
+    assert ports.proposal_calls == [SESSION_A]
+    assert len(ports.review_opens) == 1
+
+
+def test_multiple_generations_replace_global_review_and_shutdown_owned_only(
+    tmp_path: Path, raw_sidecar: dict[str, object]
+) -> None:
+    sources = tmp_path / "sources"
+    source_a, sidecar_a, proposal_a, _ = _materialize_proposal(
+        sources / "a",
+        tmp_path / "state" / "artifacts",
+        deepcopy(raw_sidecar),
+        SESSION_A,
+    )
+    source_b, sidecar_b, proposal_b, _ = _materialize_proposal(
+        sources / "b",
+        tmp_path / "state" / "artifacts",
+        deepcopy(raw_sidecar),
+        SESSION_B,
+    )
+    ports = FakeRunnerPorts(
+        {
+            _journal_name(SESSION_A): JournalReady(SESSION_A, "a" * 64, str(source_a)),
+            _journal_name(SESSION_B): JournalReady(SESSION_B, "b" * 64, str(source_b)),
+        },
+        [
+            _success(source_a, sidecar_a, SESSION_A),
+            _success(source_b, sidecar_b, SESSION_B),
+        ],
+        {SESSION_A: proposal_a, SESSION_B: proposal_b},
+    )
+    runner = _runner(tmp_path, ports, sources)
+    foreign = FakeReviewProcess(99_999)
+
+    runner.scan_once()
+
+    assert len(ports.review_processes) == 2
+    first, second = ports.review_processes
+    assert first.poll() == 0
+    assert first.terminate_calls == 1
+    assert second.poll() is None
+    assert runner.review_process_id == second.pid
+    assert foreign.poll() is None
+
+    runner.shutdown()
+
+    assert second.poll() == 0
+    assert second.terminate_calls == 1
+    assert runner.review_process_id is None
+    assert foreign.poll() is None
+
+
+def test_decided_historical_proposal_is_not_reopened_after_restart(
+    tmp_path: Path, raw_sidecar: dict[str, object]
+) -> None:
+    sources = tmp_path / "sources"
+    source, sidecar, proposal, _ = _materialize_proposal(
+        sources, tmp_path / "state" / "artifacts", raw_sidecar, SESSION_A
+    )
+    inspections = {
+        _journal_name(SESSION_A): JournalReady(SESSION_A, "a" * 64, str(source))
+    }
+    first_ports = FakeRunnerPorts(
+        inspections,
+        [_success(source, sidecar, SESSION_A)],
+        {SESSION_A: proposal},
+    )
+    first = _runner(tmp_path, first_ports, sources)
+    first.scan_once()
+    state = _session(tmp_path, SESSION_A)
+    assert state.proposal_path is not None
+    record_decision(Path(state.proposal_path), "approved", now=lambda: NOW)
+    first.scan_once()
+    first.shutdown()
+
+    second_ports = FakeRunnerPorts(inspections, [], {SESSION_A: proposal})
+    second = _runner(tmp_path, second_ports, sources)
+    for _ in range(10):
+        second.scan_once()
+
+    assert second_ports.proposal_calls == []
+    assert second_ports.review_opens == []
+    assert _session(tmp_path, SESSION_A).status is RunnerStatusCode.PROPOSAL_APPROVED
+
+
+def test_review_single_instance_lock_does_not_open_gui(tmp_path: Path) -> None:
+    lock = tmp_path / "review.lock"
+    first = ReviewSingleInstance(lock)
+    second = ReviewSingleInstance(lock)
+    third = ReviewSingleInstance(lock)
+    try:
+        assert first.acquire() is True
+        assert second.acquire() is False
+        first.close()
+        assert third.acquire() is True
+    finally:
+        first.close()
+        second.close()
+        third.close()

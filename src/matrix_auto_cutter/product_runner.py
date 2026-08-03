@@ -17,7 +17,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from types import FrameType
-from typing import Literal, TextIO, cast
+from typing import Literal, Protocol, TextIO, cast
 from uuid import UUID, uuid4
 
 from pydantic import AwareDatetime, Field, ValidationError
@@ -164,7 +164,34 @@ type JournalInspector = Callable[[Path], JournalInspection]
 type ProjectEnsurer = Callable[[str, str, CancellationToken], str | None]
 type FinalizerRunner = Callable[[ManualFinalizerRequest], ManualFinalizationResult]
 type ProposalRunner = Callable[[Path, Path, str, Path], ProposalResult]
-type ReviewOpener = Callable[[Path], None]
+
+
+class ReviewProcess(Protocol):
+    """Small process handle retained by the runner for one review application."""
+
+    @property
+    def pid(self) -> int:
+        """Return the owned process identifier."""
+        ...
+
+    def poll(self) -> int | None:
+        """Return None while the review is alive."""
+        ...
+
+    def terminate(self) -> None:
+        """Request controlled process-tree termination."""
+        ...
+
+    def kill(self) -> None:
+        """Force process-tree termination after timeout."""
+        ...
+
+    def wait(self, timeout: float | None = None) -> int:
+        """Wait for termination and return the exit code."""
+        ...
+
+
+type ReviewOpener = Callable[[Path], ReviewProcess]
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,15 +319,65 @@ def _ensure_project_native(
     return f"Projekt {project_id} konnte nicht angelegt werden: {getattr(error, 'message', error)}"
 
 
-def _open_review_native(proposal_path: Path) -> None:
-    """Launch one detached local standard-library review application without a shell."""
+@dataclass(slots=True)
+class NativeReviewProcess:
+    """Own one Windows review process tree launched by this runner."""
+
+    process: subprocess.Popen[bytes]
+
+    @property
+    def pid(self) -> int:
+        """Return the root PID of the review process tree."""
+        return self.process.pid
+
+    def poll(self) -> int | None:
+        """Return the root process exit state."""
+        return self.process.poll()
+
+    def terminate(self) -> None:
+        """Request termination of the exact owned process tree."""
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill.exe", "/PID", str(self.pid), "/T"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+                shell=False,
+            )
+            return
+        self.process.terminate()
+
+    def kill(self) -> None:
+        """Force termination of the exact owned process tree."""
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill.exe", "/PID", str(self.pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+                shell=False,
+            )
+            return
+        self.process.kill()
+
+    def wait(self, timeout: float | None = None) -> int:
+        """Wait for the root process after terminating its tree."""
+        return self.process.wait(timeout=timeout)
+
+
+def _open_review_native(proposal_path: Path) -> ReviewProcess:
+    """Launch one owned local review process without a shell or visible console."""
     python = Path(sys.executable)
     pythonw = python.with_name("pythonw.exe")
     executable = pythonw if pythonw.is_file() else python
     creation_flags = 0
     if os.name == "nt":
-        creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
-    subprocess.Popen(
+        creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP
+    process = subprocess.Popen(
         [
             str(executable.resolve(strict=True)),
             "-m",
@@ -315,6 +392,7 @@ def _open_review_native(proposal_path: Path) -> None:
         creationflags=creation_flags,
         shell=False,
     )
+    return NativeReviewProcess(process)
 
 
 def native_dependencies(
@@ -445,7 +523,10 @@ class ProductRunner:
             raise ValueError("runner instance ID must be UUIDv4")
         self._attempted_this_run: set[str] = set()
         self._proposal_attempted_this_run: set[str] = set()
-        self._last_console_key: tuple[object, ...] | None = None
+        self._last_status_by_subject: dict[str, tuple[object, ...]] = {}
+        self._review_process: ReviewProcess | None = None
+        self._review_proposal_id: str | None = None
+        self._shutdown = False
 
     @property
     def status_path(self) -> Path:
@@ -465,6 +546,60 @@ class ProductRunner:
     def _session_path(self, recording_id: str) -> Path:
         return self.sessions_directory / f"{recording_id}.json"
 
+    @property
+    def review_process_id(self) -> int | None:
+        """Return the PID of the one live review process owned by this runner."""
+        process = self._review_process
+        if process is None or process.poll() is not None:
+            return None
+        return process.pid
+
+    def _stop_review_process(self) -> None:
+        """Stop only the review process tree launched and retained by this runner."""
+        process = self._review_process
+        self._review_process = None
+        self._review_proposal_id = None
+        if process is None or process.poll() is not None:
+            return
+        try:
+            process.terminate()
+            process.wait(timeout=5)
+        except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired):
+            with suppress(OSError, subprocess.SubprocessError):
+                process.kill()
+            with suppress(OSError, subprocess.SubprocessError, subprocess.TimeoutExpired):
+                process.wait(timeout=5)
+
+    def _replace_review_process(self, proposal_path: Path, proposal_id: str) -> None:
+        """Replace the globally single runner-owned review with one new generation."""
+        process = self._review_process
+        if (
+            process is not None
+            and process.poll() is None
+            and self._review_proposal_id == proposal_id
+        ):
+            return
+        self._stop_review_process()
+        if self.dependencies.open_review is None:
+            return
+        opened = self.dependencies.open_review(proposal_path)
+        if opened.poll() is not None:
+            return
+        self._review_process = opened
+        self._review_proposal_id = proposal_id
+
+    def shutdown(self) -> None:
+        """Stop the owned review process and publish one controlled runner shutdown."""
+        if self._shutdown:
+            return
+        self._shutdown = True
+        self._stop_review_process()
+        self._publish_status(
+            RunnerStatusCode.RUNNER_STOPPED,
+            "Runner wurde sauber beendet.",
+            ready=False,
+        )
+
     def _publish_status(
         self,
         code: RunnerStatusCode,
@@ -480,6 +615,22 @@ class ProductRunner:
         error_code: str | None = None,
         ready: bool = True,
     ) -> None:
+        subject = recording_id or journal_path or "__runner__"
+        key = (
+            code,
+            journal_path,
+            source_path,
+            sidecar_path,
+            proposal_path,
+            review_path,
+            approval_decision,
+            error_code,
+            message,
+            ready,
+        )
+        if self._last_status_by_subject.get(subject) == key:
+            return
+        self._last_status_by_subject[subject] = key
         status = RunnerStatus(
             artifact_type="matrix_auto_cutter_product_runner_status",
             schema_version=STATUS_SCHEMA_VERSION,
@@ -498,22 +649,8 @@ class ProductRunner:
             error_code=error_code,
         )
         _atomic_bytes(self.status_path, _model_bytes(status), create_only=False)
-        key = (
-            code,
-            recording_id,
-            journal_path,
-            source_path,
-            sidecar_path,
-            proposal_path,
-            review_path,
-            approval_decision,
-            error_code,
-            message,
-        )
-        if key != self._last_console_key:
-            timestamp = status.updated_at.astimezone().strftime("%Y-%m-%d %H:%M:%S")
-            print(f"[{timestamp}] [{code.value}] {message}", file=self.output, flush=True)
-            self._last_console_key = key
+        timestamp = status.updated_at.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{timestamp}] [{code.value}] {message}", file=self.output, flush=True)
 
     def ready(self) -> None:
         """Veröffentliche den sichtbaren Bereitschaftszustand."""
@@ -598,6 +735,12 @@ class ProductRunner:
         message: str,
         error_code: str,
     ) -> None:
+        if (
+            state.status is code
+            and state.error_code == error_code
+            and state.message_de == message
+        ):
+            return
         updated = state.model_copy(
             update={
                 "status": code,
@@ -617,6 +760,12 @@ class ProductRunner:
         )
 
     def _proposal_failure(self, state: SessionState, code: str, message: str) -> None:
+        if (
+            state.status is RunnerStatusCode.PROPOSAL_FAILED
+            and state.error_code == code
+            and state.message_de == message
+        ):
+            return
         failed = state.model_copy(
             update={
                 "status": RunnerStatusCode.PROPOSAL_FAILED,
@@ -726,7 +875,10 @@ class ProductRunner:
             self._store_session(current)
             if self.dependencies.open_review is not None:
                 try:
-                    self.dependencies.open_review(ready.proposal_path)
+                    self._replace_review_process(
+                        ready.proposal_path,
+                        ready.proposal.proposal_id,
+                    )
                 except (OSError, RuntimeError, ValueError) as exc:
                     open_note = (
                         " Automatisches Öffnen scheiterte; Review bleibt unter "
@@ -767,6 +919,87 @@ class ProductRunner:
             approval_decision=gate.decision,
         )
 
+    def _refresh_proposal_state(self, state: SessionState, ready: ProposalReady) -> None:
+        """Observe only approval transitions for an already materialized proposal."""
+        proposal = ready.proposal
+        if (
+            proposal.recording_id != str(state.recording_session_id)
+            or proposal.source_path.casefold()
+            != _canonical_path(Path(state.source_path)).casefold()
+            or state.sidecar_path is None
+            or proposal.sidecar_path.casefold()
+            != _canonical_path(Path(state.sidecar_path)).casefold()
+        ):
+            self._proposal_failure(
+                state,
+                "E_PROPOSAL_RUNNER_BINDING",
+                "Persistiertes Proposal passt nicht mehr exakt zur Runner-Session.",
+            )
+            return
+        gate = check_render_authorization(ready.proposal_path)
+        if gate.approval is None:
+            self._proposal_failure(
+                state,
+                "E_APPROVAL_GATE",
+                "Approval-Gate konnte die gebundene Entscheidung nicht erneut lesen.",
+            )
+            return
+        status_by_decision = {
+            "pending": RunnerStatusCode.APPROVAL_PENDING,
+            "approved": RunnerStatusCode.PROPOSAL_APPROVED,
+            "rejected": RunnerStatusCode.PROPOSAL_REJECTED,
+        }
+        message_by_decision = {
+            "pending": "Schnittvorschlag wartet auf ausdrückliche Freigabe oder Ablehnung.",
+            "approved": "Schnittvorschlag wurde ausdrücklich und digestgebunden freigegeben.",
+            "rejected": (
+                "Schnittvorschlag wurde ausdrücklich abgelehnt; Render ist nicht autorisiert."
+            ),
+        }
+        final_code = status_by_decision[gate.decision]
+        final_message = message_by_decision[gate.decision]
+        current = state
+        if (
+            gate.decision == "pending"
+            and state.review_opened_proposal_id != proposal.proposal_id
+        ):
+            current = state.model_copy(
+                update={
+                    "review_opened_proposal_id": proposal.proposal_id,
+                    "updated_at": self.dependencies.now(),
+                }
+            )
+            self._store_session(current)
+            with suppress(OSError, RuntimeError, ValueError):
+                self._replace_review_process(ready.proposal_path, proposal.proposal_id)
+        if (
+            current.status is final_code
+            and current.approval_decision == gate.decision
+            and current.message_de == final_message
+        ):
+            return
+        updated = current.model_copy(
+            update={
+                "status": final_code,
+                "message_de": final_message,
+                "approval_decision": gate.decision,
+                "error_code": None,
+                "updated_at": self.dependencies.now(),
+            }
+        )
+        self._store_session(updated)
+        self._publish_status(
+            final_code,
+            final_message,
+            recording_id=str(updated.recording_session_id),
+            journal_path=updated.journal_path,
+            source_path=updated.source_path,
+            sidecar_path=updated.sidecar_path,
+            proposal_path=updated.proposal_path,
+            review_path=updated.review_path,
+            approval_decision=gate.decision,
+        )
+
     def _propose(self, state: SessionState) -> None:
         if self.dependencies.propose is None:
             self._publish_status(
@@ -783,14 +1016,15 @@ class ProductRunner:
             )
             return
         recording_id = str(state.recording_session_id)
-        if recording_id in self._proposal_attempted_this_run:
-            if state.proposal_path is None:
-                return
+        if state.proposal_path is not None:
+            self._proposal_attempted_this_run.add(recording_id)
             loaded = load_proposal(Path(state.proposal_path))
             if isinstance(loaded, ProposalFailed):
                 self._proposal_failure(state, loaded.code, loaded.message_de)
                 return
-            self._complete_proposal(state, loaded)
+            self._refresh_proposal_state(state, loaded)
+            return
+        if recording_id in self._proposal_attempted_this_run:
             return
         self._proposal_attempted_this_run.add(recording_id)
         if state.sidecar_path is None:
@@ -969,16 +1203,13 @@ class ProductRunner:
         state = self._state_for(normalized, journal_path)
         if state is None:
             return
-        if state.status is RunnerStatusCode.SOURCE_OUTSIDE_ROOT:
-            self._publish_status(
-                state.status,
-                state.message_de,
-                recording_id=str(state.recording_session_id),
-                journal_path=state.journal_path,
-                source_path=state.source_path,
-                sidecar_path=state.sidecar_path,
-                error_code=state.error_code,
-            )
+        terminal_states = {
+            RunnerStatusCode.SOURCE_OUTSIDE_ROOT,
+            RunnerStatusCode.FINALIZER_FAILED,
+            RunnerStatusCode.FFPROBE_UNAVAILABLE,
+            RunnerStatusCode.FFPROBE_UNTRUSTED,
+        }
+        if state.status in terminal_states:
             return
         proposal_states = {
             RunnerStatusCode.SIDECAR_SUCCEEDED,
@@ -1133,6 +1364,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("Fehler: --poll-seconds muss zwischen 0.25 und 60 liegen.", file=sys.stderr)
         return 2
     guard = SingleInstance()
+    runner: ProductRunner | None = None
     try:
         if not guard.acquire():
             print("Matrix Auto Cutter Product Runner läuft bereits.")
@@ -1158,11 +1390,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             signal.signal(signal.SIGTERM, stop)
         while not stopped.wait(args.poll_seconds):
             runner.scan_once()
-        runner._publish_status(
-            RunnerStatusCode.RUNNER_STOPPED,
-            "Runner wurde sauber beendet.",
-            ready=False,
-        )
         return 0
     except KeyboardInterrupt:
         return 130
@@ -1170,6 +1397,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Runner-Startfehler: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
     finally:
+        if runner is not None:
+            runner.shutdown()
         guard.close()
 
 
