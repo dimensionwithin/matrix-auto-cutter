@@ -8,7 +8,7 @@ import os
 from contextlib import suppress
 from pathlib import Path
 
-from matrix_auto_cutter.approval import ApprovalGateResult, check_render_authorization
+from matrix_auto_cutter.approval import ApprovalGateResult, inspect_approval_state
 from matrix_auto_cutter.cut_proposal import CutProposal, ProposalFailed, load_proposal
 
 REVIEW_FILE_NAME = "review.html"
@@ -158,7 +158,7 @@ def write_review(proposal_path: Path) -> Path:
     if isinstance(loaded, ProposalFailed):
         raise ValueError(loaded.message_de)
     target = review_path_for(proposal_path)
-    data = render_review_html(loaded.proposal, check_render_authorization(proposal_path))
+    data = render_review_html(loaded.proposal, inspect_approval_state(proposal_path))
     temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
     try:
         with temporary.open("xb") as stream:

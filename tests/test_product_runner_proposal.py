@@ -3,11 +3,12 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import sys
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from matrix_auto_cutter.approval import approval_path_for, record_decision
 from matrix_auto_cutter.cut_proposal import (
@@ -31,6 +32,14 @@ from matrix_auto_cutter.product_runner import (
     RunnerDependencies,
     RunnerStatusCode,
     SessionState,
+)
+from matrix_auto_cutter.render import (
+    RenderAccepted,
+    RenderExecution,
+    RenderFailed,
+    RenderRequest,
+    StatusCallback,
+    submit_render_request,
 )
 from matrix_auto_cutter.review_app import ReviewSingleInstance
 
@@ -89,6 +98,8 @@ class FakeRunnerPorts:
     review_opens: list[Path] = field(default_factory=list)
     review_processes: list[FakeReviewProcess] = field(default_factory=list)
     finalizer_calls: int = 0
+    render_results: list[RenderExecution] = field(default_factory=list)
+    render_calls: list[str] = field(default_factory=list)
 
     def inspect(self, path: Path) -> JournalInspection:
         return self.inspections[path.name]
@@ -112,6 +123,17 @@ class FakeRunnerPorts:
         process = FakeReviewProcess(10_000 + len(self.review_processes))
         self.review_processes.append(process)
         return process
+
+    def render(
+        self,
+        proposal_path: Path,
+        request: RenderRequest,
+        cancellation: object,
+        callback: StatusCallback | None,
+    ) -> RenderExecution:
+        del proposal_path, cancellation, callback
+        self.render_calls.append(request.attempt_id)
+        return self.render_results.pop(0)
 
 
 def _materialize_proposal(
@@ -177,6 +199,7 @@ def _runner(
             uuid4,
             ports.propose,
             ports.open_review,
+            render=ports.render,
         ),
         output=io.StringIO(),
     )
@@ -370,9 +393,7 @@ def test_decided_historical_proposal_is_not_reopened_after_restart(
     source, sidecar, proposal, _ = _materialize_proposal(
         sources, tmp_path / "state" / "artifacts", raw_sidecar, SESSION_A
     )
-    inspections = {
-        _journal_name(SESSION_A): JournalReady(SESSION_A, "a" * 64, str(source))
-    }
+    inspections = {_journal_name(SESSION_A): JournalReady(SESSION_A, "a" * 64, str(source))}
     first_ports = FakeRunnerPorts(
         inspections,
         [_success(source, sidecar, SESSION_A)],
@@ -410,3 +431,110 @@ def test_review_single_instance_lock_does_not_open_gui(tmp_path: Path) -> None:
         first.close()
         second.close()
         third.close()
+
+
+def test_native_review_launch_bypasses_venv_launcher_child(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    import matrix_auto_cutter.product_runner as runner_module
+
+    proposal = tmp_path / "cut-proposal.json"
+    proposal.write_bytes(b"proposal")
+    captured: dict[str, object] = {}
+
+    class DirectProcess:
+        pid = 12345
+
+        def poll(self) -> None:
+            return None
+
+        def terminate(self) -> None:
+            return None
+
+        def kill(self) -> None:
+            return None
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            return 0
+
+    def fake_popen(arguments: object, **kwargs: object) -> DirectProcess:
+        captured["arguments"] = arguments
+        captured["kwargs"] = kwargs
+        return DirectProcess()
+
+    monkeypatch.setattr(runner_module.subprocess, "Popen", fake_popen)  # type: ignore[attr-defined]
+    opened = runner_module._open_review_native(proposal)
+    arguments = captured["arguments"]
+    assert isinstance(arguments, list)
+    expected_base = Path(str(getattr(sys, "_base_executable", sys.executable)))
+    expected = expected_base.with_name("pythonw.exe")
+    assert Path(arguments[0]) == expected.resolve(strict=True)
+    assert arguments[1:3] == ["-m", "matrix_auto_cutter.review_app"]
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["shell"] is False
+    assert str(Path(sys.prefix) / "Lib" / "site-packages") in kwargs["env"]["PYTHONPATH"]
+    opened.terminate()
+    opened.kill()
+
+
+def test_render_request_runs_once_retry_is_explicit_and_failure_does_not_block_later(
+    tmp_path: Path, raw_sidecar: dict[str, object]
+) -> None:
+    sources = tmp_path / "sources"
+    source_a, sidecar_a, proposal_a, _ = _materialize_proposal(
+        sources / "a", tmp_path / "state" / "artifacts", deepcopy(raw_sidecar), SESSION_A
+    )
+    source_b, sidecar_b, proposal_b, _ = _materialize_proposal(
+        sources / "b", tmp_path / "state" / "artifacts", deepcopy(raw_sidecar), SESSION_B
+    )
+    ports = FakeRunnerPorts(
+        {_journal_name(SESSION_A): JournalReady(SESSION_A, "a" * 64, str(source_a))},
+        [_success(source_a, sidecar_a, SESSION_A)],
+        {SESSION_A: proposal_a, SESSION_B: proposal_b},
+        render_results=[
+            RenderFailed("E_TEST_RENDER", "kontrollierter Renderfehler"),
+            RenderFailed("E_TEST_RETRY", "kontrollierter Retryfehler"),
+        ],
+    )
+    runner = _runner(tmp_path, ports, sources)
+    runner.scan_once()
+    state_a = _session(tmp_path, SESSION_A)
+    assert state_a.proposal_path is not None
+    proposal_path = Path(state_a.proposal_path)
+    record_decision(proposal_path, "approved", now=lambda: NOW)
+    runner.scan_once()
+    first = submit_render_request(
+        proposal_path,
+        tmp_path / "rendered",
+        now=lambda: NOW,
+        uuid_factory=lambda: UUID("44444444-4444-4444-8444-444444444444"),
+    )
+    assert isinstance(first, RenderAccepted)
+    runner.scan_once()
+    assert runner._render_thread is not None
+    runner._render_thread.join(timeout=5)
+    for _ in range(5):
+        runner.scan_once()
+    assert len(ports.render_calls) == 1
+    assert _session(tmp_path, SESSION_A).status is RunnerStatusCode.RENDER_FAILED
+
+    second = submit_render_request(
+        proposal_path,
+        tmp_path / "rendered",
+        now=lambda: NOW,
+        uuid_factory=lambda: UUID("55555555-5555-4555-8555-555555555555"),
+    )
+    assert isinstance(second, RenderAccepted)
+    runner.scan_once()
+    assert runner._render_thread is not None
+    runner._render_thread.join(timeout=5)
+    assert len(ports.render_calls) == 2
+
+    name_b = _journal_name(SESSION_B)
+    ports.inspections[name_b] = JournalReady(SESSION_B, "b" * 64, str(source_b))
+    ports.finalizer_results.append(_success(source_b, sidecar_b, SESSION_B))
+    (runner.journal_directory / name_b).write_bytes(b"journal\n")
+    runner.scan_once()
+    assert _session(tmp_path, SESSION_B).status is RunnerStatusCode.APPROVAL_PENDING

@@ -212,8 +212,41 @@ def _matches(approval: ProposalApproval, ready: ProposalReady) -> bool:
     )
 
 
-def check_render_authorization(proposal_path: Path) -> ApprovalGateResult:
-    """Central fail-closed gate; no other render authorization API exists."""
+def _sha256_file(path: Path) -> str | None:
+    """Hash one regular file without ever opening it for writing."""
+    try:
+        if not path.is_file():
+            return None
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _live_bindings_match(ready: ProposalReady) -> str | None:
+    """Return a fail-closed reason when current source or sidecar evidence changed."""
+    proposal = ready.proposal
+    source = Path(proposal.source_path)
+    try:
+        source_stat = source.stat()
+    except OSError:
+        return "Source fehlt oder kann nicht mehr gelesen werden."
+    if (
+        not source.is_file()
+        or source.name != proposal.source_identity.file_name
+        or source_stat.st_size != proposal.source_identity.size_bytes
+        or _sha256_file(source) != proposal.source_identity.sha256
+    ):
+        return "Aktuelle SourceIdentity passt nicht mehr zum freigegebenen Proposal."
+    if _sha256_file(Path(proposal.sidecar_path)) != proposal.sidecar_sha256:
+        return "Aktuelles Sidecar passt nicht mehr zum freigegebenen Proposal."
+    return None
+
+
+def _check_authorization(proposal_path: Path, *, verify_live_bindings: bool) -> ApprovalGateResult:
     loaded = load_proposal(proposal_path)
     if isinstance(loaded, ProposalFailed):
         return ApprovalGateResult(False, "pending", loaded.message_de)
@@ -233,6 +266,16 @@ def check_render_authorization(proposal_path: Path) -> ApprovalGateResult:
             loaded.proposal,
             approval,
         )
+    if verify_live_bindings:
+        live_failure = _live_bindings_match(loaded)
+        if live_failure is not None:
+            return ApprovalGateResult(
+                False,
+                approval.decision,
+                live_failure,
+                loaded.proposal,
+                approval,
+            )
     if approval.decision == "rejected":
         return ApprovalGateResult(
             False,
@@ -264,3 +307,13 @@ def check_render_authorization(proposal_path: Path) -> ApprovalGateResult:
         loaded.proposal,
         approval,
     )
+
+
+def inspect_approval_state(proposal_path: Path) -> ApprovalGateResult:
+    """Inspect proposal/approval artifacts without authorizing a render."""
+    return _check_authorization(proposal_path, verify_live_bindings=False)
+
+
+def check_render_authorization(proposal_path: Path) -> ApprovalGateResult:
+    """Central fail-closed gate including current source and sidecar evidence."""
+    return _check_authorization(proposal_path, verify_live_bindings=True)

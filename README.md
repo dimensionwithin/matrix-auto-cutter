@@ -7,11 +7,10 @@ geschnitten werden dürfen.
 
 **Status: in aktiver Entwicklung.**
 
-Fertig und getestet ist der Unterbau — Zeitbasis, Journal- und Sidecar-Verträge,
-Schutzbereiche, Quellenprüfung und das atomare Schreiben des Projektstands.
-Der eigentliche Schnitt ist noch nicht gebaut: Transkription, Erkennung entfernbarer
-Passagen, CTA-Planung, EDL-Ausgabe und Rendern fehlen. Wer das Repo öffnet, findet
-die Ingest- und Sicherungsschicht, nicht das fertige Werkzeug.
+Fertig und getestet sind der Unterbau, die konservative Silence-Analyse, ein
+digestgebundener Review-/Approval-Schritt und der explizite finale Render der
+freigegebenen Schnitte. Transkription, semantische Analyse, CTA-Planung und Overlays
+bleiben bewusst außerhalb dieses Produktpfads.
 
 ## Was es löst
 
@@ -47,6 +46,11 @@ Originaldateien werden nie verändert.
 - `sidecar` — Sidecar-1.1-Vertrag mit einem Validator, der keine Exceptions wirft,
   sondern strukturierte Fehler zurückgibt.
 - `atomic` — atomares Schreiben, damit ein Abbruch keinen halben Zustand hinterlässt.
+- `cut_proposal` und `approval` — konservative Silence-Cuts, statische Review und ein
+  fail-closed, an Source, Sidecar und den vollständigen Proposal-Digest gebundenes Gate.
+- `render` — bildet framegenaue Keep-Segmente, rendert Video und Audio gemeinsam in
+  eine attempt-eigene Partial-MP4 und veröffentlicht sie erst nach ffprobe- und
+  vollständigem Decode-Test create-only.
 
 **Phase 2 — Vertrauensgrenze zur Datei**
 
@@ -73,19 +77,13 @@ jeden Fall behandeln muss.
 - Windows-spezifisch, wo es sein muss: direkte Win32-Aufrufe über `ctypes` für
   Handle- und Dateiidentität, jeweils hinter einem Port mit austauschbarer
   Implementierung für die Tests
-- Externe Abhängigkeit zur Laufzeit: `ffprobe`. Kein Netzwerkzugriff, keine
-  Cloud-API, keine Telemetrie
+- Externe Abhängigkeiten zur Laufzeit: `ffmpeg` und `ffprobe`. Kein
+  Netzwerkzugriff, keine Cloud-API, keine Telemetrie
 - `mypy --strict` — fehlerfrei über 70 Quelldateien
 - `ruff` — fehlerfrei, inklusive Docstring- und Annotationsregeln
-- 1273 Tests mit `pytest`, davon Property-based-Tests mit `Hypothesis` sowie
+- mehr als 1300 Tests mit `pytest`, davon Property-based-Tests mit `Hypothesis` sowie
   Integrationstests gegen echte `ffprobe`-Binaries und echte Win32-Handles
-- 100 % Branch Coverage, erzwungen über `fail_under = 100` (9274 Statements,
-  2808 Branches)
 - Testcode ist umfangreicher als Produktivcode (ca. 25 700 zu 22 100 Zeilen)
-
-Bekannt: ein Windows-Integrationstest schlägt gelegentlich fehl, wenn die gesamte
-Suite läuft, und ist einzeln grün — eine Race Condition im Test, nicht im
-Produktivcode. Noch nicht behoben.
 
 ## Automatischer Post-Stop-Produktpfad
 
@@ -108,8 +106,12 @@ Nach einem normalen erfolgreichen Stop beobachtet der Runner die normative Ablag
 ein vollständig validiertes Journal mit erfolgreichem Stop, liest den exakten MP4-Pfad
 aus dessen validiertem Schlussrecord und akzeptiert im Produktbetrieb ausschließlich
 Direct MP4 unter `F:\MatrixMarketAutoEdit`. Anschließend verwendet er direkt den
-bestehenden Finalizer und dessen erneute Sidecar-1.1-Validierung. Die MP4 wird nur
-gelesen.
+bestehenden Finalizer und dessen erneute Sidecar-1.1-Validierung, erzeugt einen
+konservativen Schnittvorschlag und öffnet genau eine lokale Review. Approval startet
+noch keinen Render. Erst die separate Schaltfläche `Final rendern` schreibt einen
+proposal- und approvalgebundenen Auftrag. Der Runner prüft das zentrale Gate direkt
+vor FFmpeg erneut; die Roh-MP4 wird ausschließlich gelesen. Verifizierte Ausgaben
+erscheinen getrennt unter `F:\MatrixMarketAutoEdit\Rendered`.
 
 Der aktuelle maschinenlesbare Zustand liegt unter
 `%LOCALAPPDATA%\DimensionWithin\MatrixAutoCutter\product-runner\status.json`.

@@ -25,8 +25,8 @@ from pydantic import AwareDatetime, Field, ValidationError
 from matrix_auto_cutter.approval import (
     DecisionFailed,
     DecisionWritten,
-    check_render_authorization,
     ensure_pending_approval,
+    inspect_approval_state,
 )
 from matrix_auto_cutter.cut_proposal import (
     ProposalFailed,
@@ -64,6 +64,20 @@ from matrix_auto_cutter.phase2.workspace import (
     open_project,
     resolve_default_workspace_root,
 )
+from matrix_auto_cutter.render import (
+    NativeProcessRunner,
+    RenderExecution,
+    RenderFailed,
+    RenderRequest,
+    RenderStatus,
+    RenderSucceeded,
+    StatusCallback,
+    discover_ffprobe,
+    execute_approved_render,
+    load_render_request,
+    render_request_path,
+    write_render_status,
+)
 from matrix_auto_cutter.review import write_review
 
 JOURNAL_SUFFIX = ".recording-journal.ndjson"
@@ -87,6 +101,12 @@ class RunnerStatusCode(StrEnum):
     APPROVAL_PENDING = "approval_pending"
     PROPOSAL_APPROVED = "proposal_approved"
     PROPOSAL_REJECTED = "proposal_rejected"
+    RENDER_NOT_AUTHORIZED = "render_not_authorized"
+    RENDER_READY = "render_ready"
+    RENDER_RUNNING = "render_running"
+    RENDER_VERIFYING = "render_verifying"
+    RENDER_SUCCEEDED = "render_succeeded"
+    RENDER_FAILED = "render_failed"
     SOURCE_OUTSIDE_ROOT = "source_outside_root"
     SOURCE_MISSING = "source_missing"
     JOURNAL_INVALID = "journal_invalid"
@@ -137,6 +157,10 @@ class SessionState(CanonicalModel):
     review_path: str | None = None
     approval_decision: Literal["pending", "approved", "rejected"] | None = None
     review_opened_proposal_id: str | None = Field(default=None, max_length=100)
+    render_attempt_id: str | None = Field(default=None, max_length=100)
+    render_id: str | None = Field(default=None, max_length=100)
+    render_target_path: str | None = None
+    render_result_path: str | None = None
     error_code: str | None = None
 
 
@@ -164,6 +188,9 @@ type JournalInspector = Callable[[Path], JournalInspection]
 type ProjectEnsurer = Callable[[str, str, CancellationToken], str | None]
 type FinalizerRunner = Callable[[ManualFinalizerRequest], ManualFinalizationResult]
 type ProposalRunner = Callable[[Path, Path, str, Path], ProposalResult]
+type RenderRunner = Callable[
+    [Path, RenderRequest, threading.Event, StatusCallback | None], RenderExecution
+]
 
 
 class ReviewProcess(Protocol):
@@ -205,6 +232,8 @@ class RunnerDependencies:
     uuid_factory: Callable[[], UUID] = uuid4
     propose: ProposalRunner | None = None
     open_review: ReviewOpener | None = None
+    render: RenderRunner | None = None
+    cancel_render: Callable[[], None] | None = None
 
 
 def default_journal_directory() -> Path:
@@ -321,7 +350,7 @@ def _ensure_project_native(
 
 @dataclass(slots=True)
 class NativeReviewProcess:
-    """Own one Windows review process tree launched by this runner."""
+    """Own one directly launched Windows review process."""
 
     process: subprocess.Popen[bytes]
 
@@ -335,33 +364,11 @@ class NativeReviewProcess:
         return self.process.poll()
 
     def terminate(self) -> None:
-        """Request termination of the exact owned process tree."""
-        if os.name == "nt":
-            subprocess.run(
-                ["taskkill.exe", "/PID", str(self.pid), "/T"],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=5,
-                check=False,
-                shell=False,
-            )
-            return
+        """Request termination of the exact directly owned process."""
         self.process.terminate()
 
     def kill(self) -> None:
-        """Force termination of the exact owned process tree."""
-        if os.name == "nt":
-            subprocess.run(
-                ["taskkill.exe", "/PID", str(self.pid), "/T", "/F"],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=5,
-                check=False,
-                shell=False,
-            )
-            return
+        """Force termination of the exact directly owned process."""
         self.process.kill()
 
     def wait(self, timeout: float | None = None) -> int:
@@ -370,10 +377,18 @@ class NativeReviewProcess:
 
 
 def _open_review_native(proposal_path: Path) -> ReviewProcess:
-    """Launch one owned local review process without a shell or visible console."""
-    python = Path(sys.executable)
-    pythonw = python.with_name("pythonw.exe")
-    executable = pythonw if pythonw.is_file() else python
+    """Launch one directly owned local review process without a launcher child."""
+    base_python = Path(str(getattr(sys, "_base_executable", sys.executable)))
+    base_pythonw = base_python.with_name("pythonw.exe")
+    executable = base_pythonw if base_pythonw.is_file() else base_python
+    environment = os.environ.copy()
+    import_root = Path(__file__).resolve(strict=True).parents[1]
+    site_packages = Path(sys.prefix) / "Lib" / "site-packages"
+    inherited_pythonpath = environment.get("PYTHONPATH")
+    python_paths = [str(import_root), str(site_packages)]
+    if inherited_pythonpath:
+        python_paths.append(inherited_pythonpath)
+    environment["PYTHONPATH"] = os.pathsep.join(python_paths)
     creation_flags = 0
     if os.name == "nt":
         creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -390,6 +405,7 @@ def _open_review_native(proposal_path: Path) -> ReviewProcess:
         stderr=subprocess.DEVNULL,
         close_fds=True,
         creationflags=creation_flags,
+        env=environment,
         shell=False,
     )
     return NativeReviewProcess(process)
@@ -413,6 +429,7 @@ def native_dependencies(
         return run_manual_finalizer(ports, replace(request, ffprobe_path=ffprobe_path))
 
     resolved_ffmpeg = discover_ffmpeg(ffmpeg_path)
+    media_processes = NativeProcessRunner()
 
     def propose(
         source_path: Path,
@@ -433,12 +450,35 @@ def native_dependencies(
             resolved_ffmpeg,
         )
 
+    def render(
+        proposal_path: Path,
+        request: RenderRequest,
+        cancellation: threading.Event,
+        callback: StatusCallback | None,
+    ) -> RenderExecution:
+        if resolved_ffmpeg is None:
+            return RenderFailed("E_FFMPEG_UNAVAILABLE", "FFmpeg.exe wurde nicht gefunden.")
+        resolved_ffprobe = discover_ffprobe(resolved_ffmpeg, ffprobe_path)
+        if resolved_ffprobe is None:
+            return RenderFailed("E_FFPROBE_UNAVAILABLE", "FFprobe.exe wurde nicht gefunden.")
+        return execute_approved_render(
+            proposal_path,
+            request,
+            resolved_ffmpeg,
+            resolved_ffprobe,
+            process_runner=media_processes,
+            cancellation=cancellation,
+            status_callback=callback,
+        )
+
     return RunnerDependencies(
         inspect,
         ensure,
         finalize_existing,
         propose=propose,
         open_review=_open_review_native,
+        render=render,
+        cancel_render=media_processes.cancel,
     )
 
 
@@ -526,6 +566,9 @@ class ProductRunner:
         self._last_status_by_subject: dict[str, tuple[object, ...]] = {}
         self._review_process: ReviewProcess | None = None
         self._review_proposal_id: str | None = None
+        self._render_thread: threading.Thread | None = None
+        self._render_cancel = threading.Event()
+        self._render_recording_id: str | None = None
         self._shutdown = False
 
     @property
@@ -589,16 +632,226 @@ class ProductRunner:
         self._review_proposal_id = proposal_id
 
     def shutdown(self) -> None:
-        """Stop the owned review process and publish one controlled runner shutdown."""
+        """Stop owned review/render children and publish one controlled shutdown."""
         if self._shutdown:
             return
         self._shutdown = True
         self._stop_review_process()
+        self._render_cancel.set()
+        if self.dependencies.cancel_render is not None:
+            self.dependencies.cancel_render()
+        thread = self._render_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=15)
         self._publish_status(
             RunnerStatusCode.RUNNER_STOPPED,
             "Runner wurde sauber beendet.",
             ready=False,
         )
+
+    def _on_render_status(self, state: SessionState, status: RenderStatus) -> None:
+        """Publish only actual renderer transitions to the shared runner status."""
+        self._publish_status(
+            RunnerStatusCode(status.state),
+            status.message_de,
+            recording_id=str(state.recording_session_id),
+            journal_path=state.journal_path,
+            source_path=state.source_path,
+            sidecar_path=state.sidecar_path,
+            proposal_path=state.proposal_path,
+            review_path=state.review_path,
+            approval_decision=state.approval_decision,
+            error_code=status.error_code,
+        )
+
+    def _render_worker(
+        self,
+        state: SessionState,
+        proposal_path: Path,
+        request: RenderRequest,
+    ) -> None:
+        """Execute one request and persist its terminal session binding."""
+        assert self.dependencies.render is not None
+        try:
+            outcome = self.dependencies.render(
+                proposal_path,
+                request,
+                self._render_cancel,
+                lambda status: self._on_render_status(state, status),
+            )
+        except Exception as exc:
+            outcome = RenderFailed(
+                "E_RENDER_EXCEPTION",
+                f"Unerwarteter Render-Infrastrukturfehler: {type(exc).__name__}: {exc}",
+            )
+        current = _read_session(self._session_path(str(state.recording_session_id))) or state
+        if isinstance(outcome, RenderSucceeded):
+            updated = current.model_copy(
+                update={
+                    "status": RunnerStatusCode.RENDER_SUCCEEDED,
+                    "message_de": outcome.result.message_de,
+                    "render_attempt_id": request.attempt_id,
+                    "render_id": outcome.result.render_id,
+                    "render_target_path": outcome.result.target_path,
+                    "render_result_path": str(outcome.result_path),
+                    "error_code": None,
+                    "updated_at": self.dependencies.now(),
+                }
+            )
+        else:
+            updated = current.model_copy(
+                update={
+                    "status": RunnerStatusCode.RENDER_FAILED,
+                    "message_de": outcome.message_de,
+                    "render_attempt_id": request.attempt_id,
+                    "render_id": outcome.result.render_id if outcome.result is not None else None,
+                    "render_target_path": request.target_path,
+                    "render_result_path": (
+                        str(outcome.result_path) if outcome.result_path is not None else None
+                    ),
+                    "error_code": outcome.code,
+                    "updated_at": self.dependencies.now(),
+                }
+            )
+        self._store_session(updated)
+        self._publish_status(
+            updated.status,
+            updated.message_de,
+            recording_id=str(updated.recording_session_id),
+            journal_path=updated.journal_path,
+            source_path=updated.source_path,
+            sidecar_path=updated.sidecar_path,
+            proposal_path=updated.proposal_path,
+            review_path=updated.review_path,
+            approval_decision=updated.approval_decision,
+            error_code=updated.error_code,
+        )
+        self._render_recording_id = None
+
+    def _start_render(
+        self,
+        state: SessionState,
+        proposal_path: Path,
+        request: RenderRequest,
+    ) -> None:
+        """Claim and start exactly one background render worker."""
+        thread = self._render_thread
+        if thread is not None and thread.is_alive():
+            return
+        self._render_cancel = threading.Event()
+        self._render_recording_id = str(state.recording_session_id)
+        running = state.model_copy(
+            update={
+                "status": RunnerStatusCode.RENDER_RUNNING,
+                "message_de": "Expliziter Renderauftrag wurde angenommen.",
+                "render_attempt_id": request.attempt_id,
+                "render_target_path": request.target_path,
+                "render_result_path": None,
+                "error_code": None,
+                "updated_at": self.dependencies.now(),
+            }
+        )
+        self._store_session(running)
+        thread = threading.Thread(
+            target=self._render_worker,
+            args=(running, proposal_path, request),
+            name=f"matrix-render-{request.attempt_id[-8:]}",
+            daemon=False,
+        )
+        self._render_thread = thread
+        thread.start()
+
+    def _handle_render_request(
+        self,
+        state: SessionState,
+        ready: ProposalReady,
+        *,
+        authorized: bool,
+        reason: str,
+    ) -> None:
+        """Observe one proposal-local request and never render implicitly."""
+        request_path = render_request_path(ready.proposal_path)
+        request = load_render_request(ready.proposal_path)
+        if request is None:
+            render_state: Literal["render_not_authorized", "render_ready", "render_failed"]
+            error_code: str | None = None
+            message = reason
+            if request_path.exists():
+                render_state = "render_failed"
+                message = "Renderauftrag ist beschädigt oder hat ein unbekanntes Schema."
+                error_code = "E_RENDER_REQUEST_INVALID"
+            elif authorized:
+                render_state = "render_ready"
+                message = "Freigabe gültig; Render wartet auf die bewusste Benutzeraktion."
+            else:
+                render_state = "render_not_authorized"
+            write_render_status(
+                ready.proposal_path,
+                RenderStatus(
+                    artifact_type="matrix_auto_cutter_render_status",
+                    schema_version="1.0",
+                    proposal_id=ready.proposal.proposal_id,
+                    state=render_state,
+                    message_de=message,
+                    updated_at=self.dependencies.now(),
+                    error_code=error_code,
+                ),
+            )
+            return
+        if not authorized:
+            write_render_status(
+                ready.proposal_path,
+                RenderStatus(
+                    artifact_type="matrix_auto_cutter_render_status",
+                    schema_version="1.0",
+                    proposal_id=ready.proposal.proposal_id,
+                    state="render_not_authorized",
+                    message_de=reason,
+                    updated_at=self.dependencies.now(),
+                    attempt_id=request.attempt_id,
+                    target_path=request.target_path,
+                    error_code="E_RENDER_NOT_AUTHORIZED",
+                ),
+            )
+            return
+        if state.render_attempt_id == request.attempt_id:
+            active = self._render_thread
+            if state.status in {
+                RunnerStatusCode.RENDER_RUNNING,
+                RunnerStatusCode.RENDER_VERIFYING,
+            } and (active is None or not active.is_alive()):
+                interrupted = state.model_copy(
+                    update={
+                        "status": RunnerStatusCode.RENDER_FAILED,
+                        "message_de": (
+                            "Früherer Renderlauf besitzt nach Runnerneustart keinen Prozess; "
+                            "manueller Retry ist möglich."
+                        ),
+                        "error_code": "E_RENDER_INTERRUPTED",
+                        "updated_at": self.dependencies.now(),
+                    }
+                )
+                self._store_session(interrupted)
+                write_render_status(
+                    ready.proposal_path,
+                    RenderStatus(
+                        artifact_type="matrix_auto_cutter_render_status",
+                        schema_version="1.0",
+                        proposal_id=ready.proposal.proposal_id,
+                        state="render_failed",
+                        message_de=interrupted.message_de,
+                        updated_at=self.dependencies.now(),
+                        attempt_id=request.attempt_id,
+                        target_path=request.target_path,
+                        error_code=interrupted.error_code,
+                    ),
+                )
+            return
+        active = self._render_thread
+        if active is not None and active.is_alive():
+            return
+        if self.dependencies.render is not None:
+            self._start_render(state, ready.proposal_path, request)
 
     def _publish_status(
         self,
@@ -735,11 +988,7 @@ class ProductRunner:
         message: str,
         error_code: str,
     ) -> None:
-        if (
-            state.status is code
-            and state.error_code == error_code
-            and state.message_de == message
-        ):
+        if state.status is code and state.error_code == error_code and state.message_de == message:
             return
         updated = state.model_copy(
             update={
@@ -828,7 +1077,7 @@ class ProductRunner:
         recording_id = str(state.recording_session_id)
         proposal_path_text = _canonical_path(ready.proposal_path)
         review_path_text = _canonical_path(review_path)
-        gate = check_render_authorization(ready.proposal_path)
+        gate = inspect_approval_state(ready.proposal_path)
         if gate.approval is None:
             self._proposal_failure(
                 state,
@@ -918,6 +1167,12 @@ class ProductRunner:
             review_path=review_path_text,
             approval_decision=gate.decision,
         )
+        self._handle_render_request(
+            current,
+            ready,
+            authorized=gate.authorized,
+            reason=gate.reason,
+        )
 
     def _refresh_proposal_state(self, state: SessionState, ready: ProposalReady) -> None:
         """Observe only approval transitions for an already materialized proposal."""
@@ -936,12 +1191,25 @@ class ProductRunner:
                 "Persistiertes Proposal passt nicht mehr exakt zur Runner-Session.",
             )
             return
-        gate = check_render_authorization(ready.proposal_path)
+        gate = inspect_approval_state(ready.proposal_path)
         if gate.approval is None:
             self._proposal_failure(
                 state,
                 "E_APPROVAL_GATE",
                 "Approval-Gate konnte die gebundene Entscheidung nicht erneut lesen.",
+            )
+            return
+        if state.status in {
+            RunnerStatusCode.RENDER_RUNNING,
+            RunnerStatusCode.RENDER_VERIFYING,
+            RunnerStatusCode.RENDER_SUCCEEDED,
+            RunnerStatusCode.RENDER_FAILED,
+        }:
+            self._handle_render_request(
+                state,
+                ready,
+                authorized=gate.authorized,
+                reason=gate.reason,
             )
             return
         status_by_decision = {
@@ -959,10 +1227,7 @@ class ProductRunner:
         final_code = status_by_decision[gate.decision]
         final_message = message_by_decision[gate.decision]
         current = state
-        if (
-            gate.decision == "pending"
-            and state.review_opened_proposal_id != proposal.proposal_id
-        ):
+        if gate.decision == "pending" and state.review_opened_proposal_id != proposal.proposal_id:
             current = state.model_copy(
                 update={
                     "review_opened_proposal_id": proposal.proposal_id,
@@ -977,6 +1242,12 @@ class ProductRunner:
             and current.approval_decision == gate.decision
             and current.message_de == final_message
         ):
+            self._handle_render_request(
+                current,
+                ready,
+                authorized=gate.authorized,
+                reason=gate.reason,
+            )
             return
         updated = current.model_copy(
             update={
@@ -998,6 +1269,12 @@ class ProductRunner:
             proposal_path=updated.proposal_path,
             review_path=updated.review_path,
             approval_decision=gate.decision,
+        )
+        self._handle_render_request(
+            updated,
+            ready,
+            authorized=gate.authorized,
+            reason=gate.reason,
         )
 
     def _propose(self, state: SessionState) -> None:
@@ -1220,6 +1497,12 @@ class ProductRunner:
             RunnerStatusCode.APPROVAL_PENDING,
             RunnerStatusCode.PROPOSAL_APPROVED,
             RunnerStatusCode.PROPOSAL_REJECTED,
+            RunnerStatusCode.RENDER_NOT_AUTHORIZED,
+            RunnerStatusCode.RENDER_READY,
+            RunnerStatusCode.RENDER_RUNNING,
+            RunnerStatusCode.RENDER_VERIFYING,
+            RunnerStatusCode.RENDER_SUCCEEDED,
+            RunnerStatusCode.RENDER_FAILED,
         }
         if state.status in proposal_states and state.sidecar_path is not None:
             self._propose(state)
