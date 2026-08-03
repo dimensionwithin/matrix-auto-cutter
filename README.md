@@ -87,6 +87,47 @@ Bekannt: ein Windows-Integrationstest schlägt gelegentlich fehl, wenn die gesam
 Suite läuft, und ist einzeln grün — eine Race Condition im Test, nicht im
 Produktivcode. Noch nicht behoben.
 
+## Automatischer Post-Stop-Produktpfad
+
+Der eindeutige Startpunkt unter Windows ist:
+
+```text
+START-MATRIX-AUTO-CUTTER.cmd
+```
+
+Er prüft die normale Installation
+`C:\Program Files\obs-studio\bin\64bit\obs64.exe` auf Version 32.1.2, installiert
+bei geschlossenem OBS die gebaute Plugin-DLL in die von OBS empfohlene Pluginablage
+`C:\ProgramData\obs-studio\plugins` und startet
+den sichtbaren Product Runner. Danach startet er das normale OBS oder akzeptiert die
+bereits laufende normale Instanz. Portable OBS wird dabei nicht verwendet; Profile,
+Szenen und OBS-Einstellungen werden weder kopiert noch geändert.
+
+Nach einem normalen erfolgreichen Stop beobachtet der Runner die normative Ablage
+`%LOCALAPPDATA%\DimensionWithin\MatrixAutoCutter\producer\journals`. Er übernimmt nur
+ein vollständig validiertes Journal mit erfolgreichem Stop, liest den exakten MP4-Pfad
+aus dessen validiertem Schlussrecord und akzeptiert im Produktbetrieb ausschließlich
+Direct MP4 unter `F:\MatrixMarketAutoEdit`. Anschließend verwendet er direkt den
+bestehenden Finalizer und dessen erneute Sidecar-1.1-Validierung. Die MP4 wird nur
+gelesen.
+
+Der aktuelle maschinenlesbare Zustand liegt unter
+`%LOCALAPPDATA%\DimensionWithin\MatrixAutoCutter\product-runner\status.json`.
+Dauerhafte atomare Session-Claims liegen im Unterverzeichnis `sessions`; dadurch
+bleiben erfolgreiche Läufe nach einem Runnerneustart erledigt und unterbrochene
+Finalisierungen verwenden wieder dasselbe Projekt. Das sichtbare Runnerfenster zeigt
+dieselben Zustände als deutsche Meldungen. Ein Fehler einer Aufnahme beendet den
+Runner nicht und blockiert spätere Aufnahmen nicht.
+
+Ein frisch gebautes Plugin kann separat und reproduzierbar installiert werden:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_obs_plugin.ps1
+```
+
+Das Skript verweigert den Austausch bei laufendem OBS, prüft OBS 32.1.2 sowie den
+SHA-256 der Kopie und berührt keine anderen Plugins.
+
 Quellcode und Dokumentation sind auf Deutsch.
 
 ## Lizenz

@@ -12,6 +12,7 @@ dependencies = ["pydantic>=2.11,<3"]
 
 [project.scripts]
 matrix-auto-finalize = "matrix_auto_cutter.manual_finalizer:main"
+matrix-auto-runner = "matrix_auto_cutter.product_runner:main"
 
 [project.optional-dependencies]
 dev = [
