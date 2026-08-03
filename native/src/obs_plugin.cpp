@@ -25,6 +25,7 @@ using matrix_auto_cutter::JournalProducer;
 using matrix_auto_cutter::JournalSnapshot;
 using matrix_auto_cutter::ProducerOptions;
 using matrix_auto_cutter::ProducerResult;
+using matrix_auto_cutter::ProducerStatus;
 using matrix_auto_cutter::RecordingStart;
 using matrix_auto_cutter::RecordingStop;
 using namespace matrix_auto_cutter::obs_adapter;
@@ -188,11 +189,13 @@ class NativeProducerPort final : public ProducerPort {
     CallbackResult submit(JournalSnapshot snapshot) noexcept override {
         return producer_.submit(std::move(snapshot));
     }
+    ProducerResult confirm_durable() noexcept override { return producer_.confirm_durable(); }
     ProducerResult normal_stop(const RecordingStop& stop) noexcept override {
         return producer_.normal_stop(stop);
     }
     ProducerResult shutdown() noexcept override { return producer_.shutdown(); }
     ProducerResult result() const noexcept override { return producer_.result(); }
+    ProducerStatus status() const noexcept override { return producer_.status(); }
     std::string recording_session_id() const noexcept override {
         return producer_.recording_session_id();
     }

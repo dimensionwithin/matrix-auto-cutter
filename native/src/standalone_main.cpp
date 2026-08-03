@@ -253,7 +253,12 @@ int wmain(const int argc, wchar_t** argv) {
         if (arguments->resume_ns.has_value() && point == *arguments->resume_ns &&
             !accepted(producer.submit(ResumeSnapshot{
                           matrix_auto_cutter::uuid_v4(),
-                          ClockSnapshot{point, counter_at(point), false}}),
+                          ClockSnapshot{
+                              point,
+                              // OBS 32.1.2 was observed draining 49 already-encoded video
+                              // packets after its pause signal before unpause.
+                              counter_at(point) + 49,
+                              false}}),
                       "resume")) {
             static_cast<void>(producer.shutdown());
             return 1;

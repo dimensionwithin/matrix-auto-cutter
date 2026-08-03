@@ -43,6 +43,18 @@ bool direct_mp4_signal(const RecordingSignal& signal) noexcept {
            !signal.fragmented_mp4;
 }
 
+std::string producer_status_text(const ProducerStatus& status) {
+    return std::string("state=") + to_string(status.state) +
+           " result=" + to_string(status.result) +
+           " read=" + std::to_string(status.read_position) +
+           " write=" + std::to_string(status.write_position) +
+           " durable=" + std::to_string(status.durable_position) +
+           " writer_failure=" + to_string(status.writer_failure) +
+           " failure_qpc=" + std::to_string(status.failure_monotonic_ns) +
+           " failure_counter=" + std::to_string(status.failure_output_frame_count) +
+           " pause_counter=" + std::to_string(status.failure_pause_counter);
+}
+
 std::optional<std::filesystem::path> default_local_app_data() noexcept {
     try {
         SetLastError(ERROR_SUCCESS);
@@ -240,6 +252,10 @@ void ObsJournalAdapter::unload() noexcept {
 
 AdapterState ObsJournalAdapter::state() const noexcept {
     return state_.load(std::memory_order_acquire);
+}
+
+unsigned ObsJournalAdapter::pending_pause_resume_commands() const noexcept {
+    return pause_resume_commands_pending_.load(std::memory_order_acquire);
 }
 
 std::optional<RunReport> ObsJournalAdapter::last_report() const {
@@ -779,7 +795,8 @@ void ObsJournalAdapter::process_clock(const ClockCommand& command) noexcept {
         fail_current_run(
             outcome == CallbackResult::full ? ProducerResult::producer_failed_queue_overflow
                                             : ProducerResult::producer_internal_error,
-            "producer rejected calibration; run cannot be successful");
+            std::string("producer rejected calibration; run cannot be successful; ") +
+                producer_status_text(producer_->status()));
     } catch (...) {
         fail_current_run(ProducerResult::producer_internal_error, "clock processing threw");
     }
@@ -811,6 +828,16 @@ void ObsJournalAdapter::process_pause_or_resume(const ControlCommand& command) n
         const ClockSnapshot clock{
             command.absolute_monotonic_ns - origin, command.output_frame_count,
             command.kind == ControlKind::pause};
+        host_.log(
+            LogLevel::info,
+            std::string(command.kind == ControlKind::pause ? "pause" : "resume") +
+                " writer boundary before submit qpc=" + std::to_string(clock.monotonic_ns) +
+                " counter=" + std::to_string(clock.output_frame_count) +
+                " observed_pause=" +
+                std::to_string(observed_pause_state_.load(std::memory_order_acquire)) +
+                " pending=" +
+                std::to_string(pause_resume_commands_pending_.load(std::memory_order_acquire)) +
+                " " + producer_status_text(producer_->status()));
         const CallbackResult outcome = command.kind == ControlKind::pause
                                            ? producer_->submit(PauseSnapshot{event_id, clock})
                                            : producer_->submit(ResumeSnapshot{event_id, clock});
@@ -821,6 +848,24 @@ void ObsJournalAdapter::process_pause_or_resume(const ControlCommand& command) n
                 "producer rejected pause/resume snapshot; run cannot be successful");
             return;
         }
+        host_.log(
+            LogLevel::info,
+            std::string(command.kind == ControlKind::pause ? "pause" : "resume") +
+                " snapshot accepted by producer queue; " +
+                producer_status_text(producer_->status()));
+        const auto durable = producer_->confirm_durable();
+        if (durable != ProducerResult::producer_ok) {
+            fail_current_run(
+                durable,
+                std::string(command.kind == ControlKind::pause ? "pause" : "resume") +
+                    " was not durably written by producer; run cannot be successful");
+            return;
+        }
+        host_.log(
+            LogLevel::info,
+            std::string(command.kind == ControlKind::pause ? "pause" : "resume") +
+                " durably written by producer writer; " +
+                producer_status_text(producer_->status()));
         const auto previous_pending =
             pause_resume_commands_pending_.fetch_sub(1, std::memory_order_acq_rel);
         if (previous_pending == 0) {
@@ -838,9 +883,12 @@ void ObsJournalAdapter::process_pause_or_resume(const ControlCommand& command) n
                         : AdapterState::paused,
                     std::memory_order_release);
             }
-            host_.log(LogLevel::info, "resume snapshot accepted by native producer");
+            host_.log(
+                LogLevel::info,
+                std::string("producer remains active after durable resume; ") +
+                    producer_status_text(producer_->status()));
         } else {
-            host_.log(LogLevel::info, "pause snapshot accepted by native producer");
+            host_.log(LogLevel::info, "durable pause processing complete");
         }
     } catch (...) {
         fail_current_run(ProducerResult::producer_internal_error, "pause/resume processing threw");
@@ -1005,6 +1053,17 @@ void ObsJournalAdapter::process_stop(const ControlCommand& command) noexcept {
 void ObsJournalAdapter::force_cleanup(
     ProducerResult result,
     const std::string_view reason) noexcept {
+    if (producer_) {
+        host_.log(
+            LogLevel::error,
+            std::string("fail-closed cleanup entered: ") + std::string(reason) + "; " +
+                producer_status_text(producer_->status()));
+    } else {
+        host_.log(
+            LogLevel::error,
+            std::string("fail-closed cleanup entered without producer: ") +
+                std::string(reason));
+    }
     accepting_snapshots_.store(false, std::memory_order_release);
     if (state_.load(std::memory_order_acquire) != AdapterState::unloading) {
         state_.store(AdapterState::stopping, std::memory_order_release);

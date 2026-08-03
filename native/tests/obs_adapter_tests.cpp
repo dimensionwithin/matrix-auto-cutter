@@ -2,6 +2,7 @@
 
 #include <Windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -91,6 +92,7 @@ struct ProducerState final {
     ProducerResult start_result{ProducerResult::producer_ok};
     ProducerResult stop_result{ProducerResult::producer_ok};
     ProducerResult shutdown_result{ProducerResult::producer_ok};
+    ProducerResult durable_result{ProducerResult::producer_ok};
     CallbackResult calibration_result{CallbackResult::accepted};
     unsigned starts{};
     unsigned events{};
@@ -99,10 +101,12 @@ struct ProducerState final {
     unsigned resumes{};
     unsigned stops{};
     unsigned shutdowns{};
+    unsigned durable_confirms{};
     RecordingStart start{};
     RecordingStop stop{};
     BlockingPoint shutdown_block;
     BlockingPoint pause_submit_block;
+    BlockingPoint durable_confirm_block;
 };
 
 class FakeProducer final : public ProducerPort {
@@ -147,6 +151,14 @@ class FakeProducer final : public ProducerPort {
         return state_->stop_result;
     }
 
+    ProducerResult confirm_durable() noexcept override {
+        state_->durable_confirm_block.enter_if_enabled();
+        std::lock_guard lock(state_->mutex);
+        ++state_->durable_confirms;
+        state_->changed.notify_all();
+        return state_->durable_result;
+    }
+
     ProducerResult shutdown() noexcept override {
         state_->shutdown_block.enter_if_enabled();
         std::lock_guard lock(state_->mutex);
@@ -158,6 +170,14 @@ class FakeProducer final : public ProducerPort {
     ProducerResult result() const noexcept override {
         std::lock_guard lock(state_->mutex);
         return state_->shutdown_result;
+    }
+
+    matrix_auto_cutter::ProducerStatus status() const noexcept override {
+        std::lock_guard lock(state_->mutex);
+        return matrix_auto_cutter::ProducerStatus{
+            matrix_auto_cutter::ProducerState::recording_active,
+            state_->shutdown_result,
+        };
     }
 
     std::string recording_session_id() const noexcept override {
@@ -303,6 +323,13 @@ class FakeHost final : public AdapterHost {
         next_signal_.absolute_monotonic_ns = absolute_ns;
         next_signal_.output_frame_count = frames;
         next_signal_.fragmented_mp4 = fragmented;
+    }
+
+    bool has_log(const std::string_view text) const {
+        std::lock_guard lock(mutex_);
+        return std::any_of(logs.begin(), logs.end(), [&](const auto& line) {
+            return line.find(text) != std::string::npos;
+        });
     }
 
     void fire_frontend(const FrontendEvent event) noexcept {
@@ -631,12 +658,29 @@ void test_actual_output_pause_resume_is_ordered_and_gates_calibration() {
         check(producer->calibrations == 0, "calibration was accepted during pause");
     }
 
-    host.set_signal(recording_path, 15'000'000'000ULL, 122);
+    host.set_signal(recording_path, 15'000'000'000ULL, 169);
+    producer->durable_confirm_block.enabled = true;
     host.fire_output(OutputEvent::resumed);
     wait_for_producer_count(producer, [](const auto& value) { return value.resumes == 1; },
                             "actual output unpause did not submit one resume snapshot");
+    producer->durable_confirm_block.wait_until_entered();
+    check(adapter.state() == AdapterState::paused,
+          "queue acceptance reactivated adapter before durable resume");
+    check(adapter.pending_pause_resume_commands() == 1,
+          "resume pending counter cleared before durable confirmation");
+    check(host.output_connected, "stop signal disconnected while valid resume was pending");
+    host.set_signal(recording_path, 16'000'000'000ULL, 180);
+    host.fire_tick();
+    {
+        std::lock_guard lock(producer->mutex);
+        check(producer->calibrations == 0,
+              "tick was accepted before resume became durable");
+    }
+    producer->durable_confirm_block.release();
     wait_for([&] { return adapter.state() == AdapterState::active; },
              "resume did not reactivate adapter");
+    check(adapter.pending_pause_resume_commands() == 0,
+          "resume pending counter did not return to zero");
     host.set_signal(recording_path, 17'100'000'000ULL, 248);
     host.fire_tick();
     wait_for_producer_count(producer, [](const auto& value) { return value.calibrations == 1; },
@@ -644,6 +688,50 @@ void test_actual_output_pause_resume_is_ordered_and_gates_calibration() {
     stop_output_successfully(host, adapter, producer);
     std::lock_guard lock(producer->mutex);
     check(!producer->stop.clock.recording_paused, "stop after resume retained paused flag");
+}
+
+void test_writer_terminal_resume_is_immediate_visible_cleanup() {
+    TempRoot root;
+    auto producer = std::make_shared<ProducerState>();
+    FakeFactory factory(producer);
+    FakeHost host;
+    ObsJournalAdapter adapter(host, factory, test_options(root.path));
+    check(adapter.load(), "terminal-resume load failed");
+    start_output(host, adapter, producer);
+    anchor_recording(host, producer);
+    host.set_signal(recording_path, 12'000'000'000ULL, 120);
+    host.fire_output(OutputEvent::paused);
+    wait_for_producer_count(producer, [](const auto& value) { return value.pauses == 1; },
+                            "pause did not precede terminal resume");
+    wait_for_producer_count(
+        producer,
+        [](const auto& value) { return value.durable_confirms == 1; },
+        "pause was not durably confirmed before terminal resume");
+    wait_for([&] { return adapter.pending_pause_resume_commands() == 0; },
+             "pause pending command did not drain before terminal resume");
+    {
+        std::lock_guard lock(producer->mutex);
+        producer->durable_result = ProducerResult::producer_internal_error;
+    }
+    host.set_signal(recording_path, 15'000'000'000ULL, 124);
+    host.fire_output(OutputEvent::resumed);
+    wait_for([&] { return adapter.state() == AdapterState::failed; },
+             "writer-terminal resume was not immediately fail closed");
+    check(host.disconnect_calls.load(std::memory_order_acquire) == 1,
+          "writer-terminal cleanup did not disconnect signals exactly once");
+    check(host.release_calls.load(std::memory_order_acquire) == 1,
+          "writer-terminal cleanup did not release output exactly once");
+    check(!host.output_connected, "writer-terminal cleanup left output signals connected");
+    host.fire_output(OutputEvent::stopped, 0);
+    {
+        std::lock_guard lock(producer->mutex);
+        check(producer->stops == 0, "post-cleanup stop reached failed producer");
+        check(producer->shutdowns == 1, "writer-terminal cleanup did not shut down once");
+    }
+    wait_for([&] { return host.has_log("resume was not durably written"); },
+             "writer-terminal cleanup reason was not logged");
+    check(host.has_log("fail-closed cleanup entered"),
+          "fail-closed cleanup entry was not logged");
 }
 
 void test_pause_sequence_failure_and_stop_while_paused() {
@@ -1173,6 +1261,8 @@ int main() {
         {"failed-or-missing-output-stop", test_failed_or_missing_output_stop_never_calls_normal_stop},
         {"actual-output-pause-resume/calibration-gate/order",
          test_actual_output_pause_resume_is_ordered_and_gates_calibration},
+        {"writer-terminal-resume/immediate-visible-cleanup",
+         test_writer_terminal_resume_is_immediate_visible_cleanup},
         {"pause-sequence-failure/stop-while-paused", test_pause_sequence_failure_and_stop_while_paused},
         {"ordered-pause-resume-pause/blocked-worker",
          test_ordered_pause_resume_pause_survives_a_blocked_worker},

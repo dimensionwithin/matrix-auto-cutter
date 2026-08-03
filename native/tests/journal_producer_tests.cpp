@@ -34,6 +34,7 @@ using matrix_auto_cutter::PauseSnapshot;
 using matrix_auto_cutter::RecordingStart;
 using matrix_auto_cutter::RecordingStop;
 using matrix_auto_cutter::ResumeSnapshot;
+using matrix_auto_cutter::WriterFailure;
 
 constexpr std::string_view session_id = "11111111-1111-4111-8111-111111111111";
 constexpr std::string_view start_id = "22222222-2222-4222-8222-222222222222";
@@ -44,6 +45,7 @@ struct SinkState final {
     std::condition_variable changed;
     std::vector<std::string> lines;
     bool block_event{};
+    bool block_resume{};
     bool event_entered{};
     bool release{};
     int fail_at{-1};
@@ -61,8 +63,12 @@ class TestSink final : public JournalSink {
                 return false;
             }
             state_->lines.emplace_back(line);
-            if (state_->block_event && line.find("\"record_type\":\"event\"") != std::string_view::npos &&
-                !state_->event_entered) {
+            const bool blocking_record =
+                (state_->block_event &&
+                 line.find("\"record_type\":\"event\"") != std::string_view::npos) ||
+                (state_->block_resume &&
+                 line.find("\"record_type\":\"resume\"") != std::string_view::npos);
+            if (blocking_record && !state_->event_entered) {
                 state_->event_entered = true;
                 state_->changed.notify_all();
                 state_->changed.wait(lock, [&] { return state_->release; });
@@ -458,6 +464,106 @@ void test_pause_resume_are_canonical_and_writer_sequenced() {
     }
 }
 
+void test_real_obs_interleaver_drain_resume_is_durable_and_run_continues_to_stop() {
+    auto state = std::make_shared<SinkState>();
+    JournalProducer producer(options_for(state));
+    check(producer.start_recording(start_request()) == ProducerResult::producer_ok, "start failed");
+    check(producer.submit(start_event()) == CallbackResult::accepted, "start event rejected");
+    check(producer.confirm_durable() == ProducerResult::producer_ok,
+          "start event was not durable");
+    check(producer.submit(CalibrationSnapshot{
+              ClockSnapshot{115'999'995'360ULL, 6'897, false}}) == CallbackResult::accepted,
+          "pre-pause calibration rejected");
+    check(producer.confirm_durable() == ProducerResult::producer_ok,
+          "pre-pause calibration was not durable");
+    check(producer.submit(PauseSnapshot{
+              "33333333-3333-4333-8333-333333333333",
+              ClockSnapshot{117'766'661'956ULL, 7'004, true}}) == CallbackResult::accepted,
+          "real pause rejected");
+    check(producer.confirm_durable() == ProducerResult::producer_ok,
+          "real pause was not durable");
+    check(producer.status().durable_position == 3, "pause durable position was not published");
+    check(producer.submit(ResumeSnapshot{
+              "44444444-4444-4444-8444-444444444444",
+              ClockSnapshot{176'383'326'278ULL, 7'053, false}}) == CallbackResult::accepted,
+          "real 49-frame interleaver drain was not queue-accepted");
+    check(producer.confirm_durable() == ProducerResult::producer_ok,
+          "real 49-frame interleaver drain was not durable");
+    check(producer.status().durable_position == 4, "resume durable position was not published");
+    check(producer.submit(CalibrationSnapshot{
+              ClockSnapshot{178'399'992'864ULL, 7'174, false}}) == CallbackResult::accepted,
+          "post-resume calibration rejected");
+    check(producer.confirm_durable() == ProducerResult::producer_ok,
+          "post-resume calibration was not durable");
+    check(producer.normal_stop(RecordingStop{
+              ClockSnapshot{180'416'659'450ULL, 7'295, false}, std::string(recording_path)}) ==
+              ProducerResult::producer_ok,
+          "post-resume stop rejected");
+    check(producer.shutdown() == ProducerResult::producer_ok, "post-resume shutdown failed");
+    std::lock_guard lock(state->mutex);
+    check(state->lines.size() == 7, "complete real resume journal line count differs");
+    check(state->lines[3].find("\"record_type\":\"pause\"") != std::string::npos &&
+              state->lines[4].find("\"record_type\":\"resume\"") != std::string::npos &&
+              state->lines[5].find("\"record_type\":\"calibration_sample\"") !=
+                  std::string::npos &&
+              state->lines[6].find("\"record_type\":\"stop\"") != std::string::npos,
+          "real resume journal did not continue through calibration and stop");
+}
+
+void test_resume_counter_failures_are_durable_and_visible() {
+    for (const auto& [counter, failure] :
+         std::vector<std::pair<std::uint64_t, WriterFailure>>{
+             {119, WriterFailure::resume_counter_underflow},
+         }) {
+        auto state = std::make_shared<SinkState>();
+        JournalProducer producer(options_for(state));
+        check(producer.start_recording(start_request()) == ProducerResult::producer_ok,
+              "counter failure start failed");
+        check(producer.submit(start_event()) == CallbackResult::accepted,
+              "counter failure start event rejected");
+        check(producer.confirm_durable() == ProducerResult::producer_ok,
+              "counter failure start event not durable");
+        check(producer.submit(pause_snapshot()) == CallbackResult::accepted,
+              "counter failure pause rejected");
+        check(producer.confirm_durable() == ProducerResult::producer_ok,
+              "counter failure pause not durable");
+        check(producer.submit(resume_snapshot(4, counter)) == CallbackResult::accepted,
+              "invalid resume did not reach writer");
+        check(producer.confirm_durable() == ProducerResult::producer_internal_error,
+              "writer-invalid resume was not visible to its submitter");
+        const auto status = producer.status();
+        check(status.writer_failure == failure, "wrong resume writer failure detail");
+        check(status.read_position == 3 && status.write_position == 3 &&
+                  status.durable_position == 2,
+              "writer positions did not expose the rejected resume boundary");
+        check(producer.shutdown() == ProducerResult::producer_internal_error,
+              "invalid resume result changed during shutdown");
+    }
+}
+
+void test_durable_confirmation_timeout_fails_closed_without_shutdown_hang() {
+    auto state = std::make_shared<SinkState>();
+    state->block_resume = true;
+    JournalProducer producer(options_for(state));
+    check(producer.start_recording(start_request()) == ProducerResult::producer_ok, "start failed");
+    check(producer.submit(start_event()) == CallbackResult::accepted, "start event rejected");
+    check(producer.confirm_durable() == ProducerResult::producer_ok, "start event not durable");
+    check(producer.submit(pause_snapshot()) == CallbackResult::accepted, "pause rejected");
+    check(producer.confirm_durable() == ProducerResult::producer_ok, "pause not durable");
+    check(producer.submit(resume_snapshot()) == CallbackResult::accepted, "resume rejected");
+    wait_for_block(state);
+    check(producer.confirm_durable() == ProducerResult::producer_internal_error,
+          "blocked writer did not time out durable confirmation");
+    check(producer.status().writer_failure == WriterFailure::durable_confirmation_timeout,
+          "durable timeout detail was not retained");
+    release_writer(state);
+    const auto before = std::chrono::steady_clock::now();
+    check(producer.shutdown() == ProducerResult::producer_internal_error,
+          "durable timeout shutdown result changed");
+    check(std::chrono::steady_clock::now() - before < 2s,
+          "durable timeout caused a shutdown hang");
+}
+
 void test_pause_lifecycle_rejects_invalid_order_and_accepts_paused_stop() {
     auto invalid = std::make_shared<SinkState>();
     JournalProducer bad(options_for(invalid));
@@ -484,7 +590,7 @@ void test_pause_lifecycle_rejects_invalid_order_and_accepts_paused_stop() {
           "stop while paused did not retain pause flag");
 }
 
-void test_pause_lifecycle_rejects_duplicate_transitions_and_large_counter_motion() {
+void test_pause_lifecycle_rejects_duplicate_transitions_and_accepts_interleaver_drain() {
     {
         auto state = std::make_shared<SinkState>();
         JournalProducer producer(options_for(state));
@@ -512,29 +618,17 @@ void test_pause_lifecycle_rejects_duplicate_transitions_and_large_counter_motion
         check(producer.shutdown() == ProducerResult::producer_internal_error,
               "duplicate resume was not fail closed");
     }
-    for (const std::uint64_t movement : {0ULL, 1ULL, 2ULL}) {
+    for (const std::uint64_t movement : {0ULL, 3ULL, 49ULL}) {
         auto state = std::make_shared<SinkState>();
         JournalProducer producer(options_for(state));
         check(producer.start_recording(start_request()) == ProducerResult::producer_ok, "start failed");
         check(producer.submit(start_event()) == CallbackResult::accepted, "start event rejected");
         check(producer.submit(pause_snapshot()) == CallbackResult::accepted, "pause rejected");
         check(producer.submit(resume_snapshot(4, 120 + movement)) == CallbackResult::accepted,
-              "bounded resume movement rejected");
+              "OBS interleaver drain rejected");
         check(producer.normal_stop(stop_request()) == ProducerResult::producer_ok, "stop rejected");
         check(producer.shutdown() == ProducerResult::producer_ok,
-              "bounded resume movement failed writer validation");
-    }
-    {
-        auto state = std::make_shared<SinkState>();
-        JournalProducer producer(options_for(state));
-        check(producer.start_recording(start_request()) == ProducerResult::producer_ok, "start failed");
-        check(producer.submit(start_event()) == CallbackResult::accepted, "start event rejected");
-        check(producer.submit(pause_snapshot()) == CallbackResult::accepted, "pause rejected");
-        check(producer.submit(resume_snapshot(4, 123)) == CallbackResult::accepted,
-              "large resume movement did not reach writer");
-        check(producer.normal_stop(stop_request()) == ProducerResult::producer_ok, "stop rejected");
-        check(producer.shutdown() == ProducerResult::producer_internal_error,
-              "resume movement above two frames was not fail closed");
+              "OBS interleaver drain failed writer validation");
     }
 }
 
@@ -591,10 +685,16 @@ int main() {
         {"no-exception-escape", test_public_boundary_contains_factory_exception},
         {"bounded-callback-snapshot", test_unbounded_callback_snapshot_fails_without_escape},
         {"pause-resume/canonical/uuid/sequence", test_pause_resume_are_canonical_and_writer_sequenced},
+        {"pause-resume/real-interleaver-drain/durable/calibration/stop",
+         test_real_obs_interleaver_drain_resume_is_durable_and_run_continues_to_stop},
+        {"pause-resume/counter-failures/durable-visible",
+         test_resume_counter_failures_are_durable_and_visible},
+        {"pause-resume/durable-timeout/no-shutdown-hang",
+         test_durable_confirmation_timeout_fails_closed_without_shutdown_hang},
         {"pause-lifecycle/invalid-order/paused-stop",
          test_pause_lifecycle_rejects_invalid_order_and_accepts_paused_stop},
-        {"pause-lifecycle/duplicate/counter-motion",
-         test_pause_lifecycle_rejects_duplicate_transitions_and_large_counter_motion},
+        {"pause-lifecycle/duplicate/interleaver-drain",
+         test_pause_lifecycle_rejects_duplicate_transitions_and_accepts_interleaver_drain},
         {"pause-resume/queue-overflow-drain",
          test_queue_overflow_with_accepted_pause_resume_drains_without_stop},
         {"pause-resume/duplicate-event-id", test_pause_resume_event_ids_cannot_reuse_an_existing_event_id},

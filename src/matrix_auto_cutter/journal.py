@@ -325,7 +325,6 @@ def validate_journal(records: Sequence[Mapping[str, object]]) -> JournalValidati
         )
 
     paused = False
-    pause_counter = 0
     previous_monotonic_ns: int | None = None
     previous_counter: int | None = None
     for record in parsed:
@@ -337,7 +336,6 @@ def validate_journal(records: Sequence[Mapping[str, object]]) -> JournalValidati
             if (
                 previous_counter is not None
                 and counter is not None
-                and not paused
                 and counter < previous_counter
             ):
                 errors.append(
@@ -352,15 +350,10 @@ def validate_journal(records: Sequence[Mapping[str, object]]) -> JournalValidati
                     core_error(ErrorCode.SIDECAR_PAUSE_SEQUENCE, {"reason": "double_pause"})
                 )
             paused = True
-            pause_counter = record.output_frame_count
         elif isinstance(record, JournalResume):
             if not paused:
                 errors.append(
                     core_error(ErrorCode.SIDECAR_PAUSE_SEQUENCE, {"reason": "resume_without_pause"})
-                )
-            elif record.output_frame_count - pause_counter not in range(3):
-                errors.append(
-                    core_error(ErrorCode.SIDECAR_PAUSE_SEQUENCE, {"reason": "pause_counter_moved"})
                 )
             paused = False
         elif (
@@ -378,16 +371,6 @@ def validate_journal(records: Sequence[Mapping[str, object]]) -> JournalValidati
             errors.append(
                 core_error(ErrorCode.SIDECAR_PAUSE_SEQUENCE, {"reason": "wrong_paused_flag"})
             )
-        elif (
-            paused
-            and clock is not None
-            and clock[1] is not None
-            and clock[1] - pause_counter not in range(3)
-        ):
-            errors.append(
-                core_error(ErrorCode.SIDECAR_PAUSE_SEQUENCE, {"reason": "pause_counter_moved"})
-            )
-
     return JournalValidationResult(
         valid=not errors, recording_session_id=session_id, errors=tuple(errors)
     )

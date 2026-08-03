@@ -229,6 +229,13 @@ struct JournalProducer::Shared final {
     std::vector<std::optional<JournalSnapshot>> slots;
     std::atomic<std::uint64_t> read_position{};
     std::atomic<std::uint64_t> write_position{};
+    std::atomic<std::uint64_t> durable_position{};
+    std::atomic<WriterFailure> writer_failure{WriterFailure::none};
+    std::atomic<std::uint64_t> failure_monotonic_ns{};
+    std::atomic<std::uint64_t> failure_output_frame_count{};
+    std::atomic<std::uint64_t> failure_pause_counter{};
+    std::mutex progress_mutex;
+    std::condition_variable progress_changed;
     std::optional<RecordingStop> stop;
     std::unique_ptr<JournalSink> sink;
     std::string session_id;
@@ -299,9 +306,22 @@ void set_primary_failure(
                 current, failure, std::memory_order_acq_rel, std::memory_order_acquire)) {
             shared->stable_result.store(result, std::memory_order_release);
             shared->queue_changed.notify_one();
+            shared->progress_changed.notify_all();
             return;
         }
     }
+}
+
+void set_writer_failure(
+    const std::shared_ptr<JournalProducer::Shared>& shared,
+    const WriterFailure failure,
+    const ClockSnapshot& clock = {},
+    const std::uint64_t pause_counter = 0) noexcept {
+    shared->writer_failure.store(failure, std::memory_order_release);
+    shared->failure_monotonic_ns.store(clock.monotonic_ns, std::memory_order_release);
+    shared->failure_output_frame_count.store(
+        clock.output_frame_count, std::memory_order_release);
+    shared->failure_pause_counter.store(pause_counter, std::memory_order_release);
 }
 
 std::string header_line(const JournalProducer::Shared& shared) {
@@ -520,12 +540,34 @@ void writer_main(const std::shared_ptr<JournalProducer::Shared>& shared) noexcep
             const bool is_resume = std::holds_alternative<ResumeSnapshot>(*item);
             const bool requires_active = std::holds_alternative<EventSnapshot>(*item) ||
                                          std::holds_alternative<CalibrationSnapshot>(*item);
-            const bool valid_transition =
-                (!is_pause || !paused) && (!is_resume || paused) &&
-                (!is_resume || clock.output_frame_count - pause_counter <= 2) &&
-                (!requires_active || !paused);
-            if (!snapshot_valid(*item) || !clock_valid(clock, previous, requires_active) ||
-                !valid_transition || !event_id_is_unique(*item, event_ids)) {
+            WriterFailure failure = WriterFailure::none;
+            if (!snapshot_valid(*item)) {
+                failure = WriterFailure::snapshot_invalid;
+            } else if (previous.has_value() &&
+                       clock.monotonic_ns < previous->monotonic_ns) {
+                failure = WriterFailure::qpc_regression;
+            } else if (previous.has_value() &&
+                       clock.output_frame_count < previous->output_frame_count) {
+                failure = is_resume ? WriterFailure::resume_counter_underflow
+                                    : WriterFailure::counter_regression;
+            } else if (is_pause && paused) {
+                failure = WriterFailure::pause_while_paused;
+            } else if (is_resume && !paused) {
+                failure = WriterFailure::resume_while_active;
+            } else if (is_resume && clock.output_frame_count < pause_counter) {
+                failure = WriterFailure::resume_counter_underflow;
+                // OBS 32.1.2 increments total_frames when already-encoded packets leave
+                // its A/V interleaver. That backlog may drain after the pause signal, so
+                // monotonicity is the only configuration-independent upper contract.
+            } else if (requires_active && paused) {
+                failure = WriterFailure::active_snapshot_while_paused;
+            } else if (!clock_valid(clock, previous, requires_active)) {
+                failure = WriterFailure::snapshot_invalid;
+            } else if (!event_id_is_unique(*item, event_ids)) {
+                failure = WriterFailure::duplicate_event_id;
+            }
+            if (failure != WriterFailure::none) {
+                set_writer_failure(shared, failure, clock, pause_counter);
                 set_primary_failure(
                     shared,
                     ProducerState::producer_failed_internal,
@@ -549,6 +591,8 @@ void writer_main(const std::shared_ptr<JournalProducer::Shared>& shared) noexcep
                     },
                     *item));
             } catch (...) {
+                set_writer_failure(
+                    shared, WriterFailure::serialization_failed, clock, pause_counter);
                 set_primary_failure(
                     shared,
                     ProducerState::producer_failed_internal,
@@ -556,10 +600,14 @@ void writer_main(const std::shared_ptr<JournalProducer::Shared>& shared) noexcep
                 continue;
             }
             if (!shared->sink->write_line(*line)) {
+                set_writer_failure(
+                    shared, WriterFailure::write_or_flush_failed, clock, pause_counter);
                 set_primary_failure(
                     shared, ProducerState::producer_failed_io, ProducerResult::producer_failed_io);
                 continue;
             }
+            shared->durable_position.store(read + 1, std::memory_order_release);
+            shared->progress_changed.notify_all();
             ++sequence;
             previous = clock;
             if (is_pause) {
@@ -571,7 +619,6 @@ void writer_main(const std::shared_ptr<JournalProducer::Shared>& shared) noexcep
             continue;
         }
         if (!stop.has_value() || stop->clock.recording_paused != paused ||
-            (paused && stop->clock.output_frame_count - pause_counter > 2) ||
             !clock_valid(stop->clock, previous, !paused) ||
             stop->recording_path_utf8 != shared->start.recording_path_utf8) {
             set_primary_failure(
@@ -735,6 +782,43 @@ CallbackResult JournalProducer::submit(JournalSnapshot snapshot) noexcept {
     }
 }
 
+ProducerResult JournalProducer::confirm_durable() noexcept {
+    try {
+        const auto target = shared_->write_position.load(std::memory_order_acquire);
+        std::unique_lock lock(shared_->progress_mutex);
+        const bool completed = shared_->progress_changed.wait_for(
+            lock, producer_durable_confirmation_deadline, [&] {
+                return shared_->durable_position.load(std::memory_order_acquire) >= target ||
+                       shared_->state.load(std::memory_order_acquire) !=
+                           ProducerState::recording_active;
+            });
+        lock.unlock();
+        if (shared_->durable_position.load(std::memory_order_acquire) >= target) {
+            return result();
+        }
+        if (!completed) {
+            set_writer_failure(shared_, WriterFailure::durable_confirmation_timeout);
+            set_primary_failure(
+                shared_,
+                ProducerState::producer_failed_internal,
+                ProducerResult::producer_internal_error);
+        }
+        const auto stable = result();
+        return stable == ProducerResult::producer_ok ? ProducerResult::producer_internal_error
+                                                     : stable;
+    } catch (...) {
+        set_primary_failure(
+            shared_, shared_->state.load(std::memory_order_acquire) ==
+                             ProducerState::producer_failed_io
+                         ? ProducerState::producer_failed_io
+                         : ProducerState::producer_failed_internal,
+            shared_->state.load(std::memory_order_acquire) == ProducerState::producer_failed_io
+                ? ProducerResult::producer_failed_io
+                : ProducerResult::producer_internal_error);
+        return result();
+    }
+}
+
 ProducerResult JournalProducer::normal_stop(const RecordingStop& stop) noexcept {
     try {
         if (stop.recording_path_utf8.empty() || !valid_utf8(stop.recording_path_utf8) ||
@@ -848,6 +932,20 @@ ProducerState JournalProducer::state() const noexcept {
     return shared_->state.load(std::memory_order_acquire);
 }
 
+ProducerStatus JournalProducer::status() const noexcept {
+    return ProducerStatus{
+        shared_->state.load(std::memory_order_acquire),
+        result(),
+        shared_->read_position.load(std::memory_order_acquire),
+        shared_->write_position.load(std::memory_order_acquire),
+        shared_->durable_position.load(std::memory_order_acquire),
+        shared_->writer_failure.load(std::memory_order_acquire),
+        shared_->failure_monotonic_ns.load(std::memory_order_acquire),
+        shared_->failure_output_frame_count.load(std::memory_order_acquire),
+        shared_->failure_pause_counter.load(std::memory_order_acquire),
+    };
+}
+
 std::string JournalProducer::recording_session_id() const noexcept {
     try {
         return shared_->session_id;
@@ -935,6 +1033,26 @@ const char* to_string(const ProducerState value) noexcept {
         case ProducerState::closed: return "closed";
     }
     return "producer_failed_internal";
+}
+
+const char* to_string(const WriterFailure value) noexcept {
+    switch (value) {
+        case WriterFailure::none: return "none";
+        case WriterFailure::snapshot_invalid: return "snapshot_invalid";
+        case WriterFailure::qpc_regression: return "qpc_regression";
+        case WriterFailure::counter_regression: return "counter_regression";
+        case WriterFailure::pause_while_paused: return "pause_while_paused";
+        case WriterFailure::resume_while_active: return "resume_while_active";
+        case WriterFailure::resume_counter_underflow: return "resume_counter_underflow";
+        case WriterFailure::active_snapshot_while_paused:
+            return "active_snapshot_while_paused";
+        case WriterFailure::duplicate_event_id: return "duplicate_event_id";
+        case WriterFailure::serialization_failed: return "serialization_failed";
+        case WriterFailure::write_or_flush_failed: return "write_or_flush_failed";
+        case WriterFailure::durable_confirmation_timeout:
+            return "durable_confirmation_timeout";
+    }
+    return "snapshot_invalid";
 }
 
 }  // namespace matrix_auto_cutter

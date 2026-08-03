@@ -219,7 +219,7 @@ def main() -> int:
             or len(resumes) != 1
             or not pauses[0]["recording_paused"]
             or resumes[0]["recording_paused"]
-            or resumes[0]["output_frame_count"] - pauses[0]["output_frame_count"] > 2
+            or resumes[0]["output_frame_count"] - pauses[0]["output_frame_count"] != 49
         ):
             raise AssertionError("native pause/resume records are not canonical")
         build_and_check_sidecar(

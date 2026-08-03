@@ -81,9 +81,11 @@ class ProducerPort {
     virtual ~ProducerPort() = default;
     virtual ProducerResult start_recording(const RecordingStart& start) noexcept = 0;
     virtual CallbackResult submit(JournalSnapshot snapshot) noexcept = 0;
+    virtual ProducerResult confirm_durable() noexcept = 0;
     virtual ProducerResult normal_stop(const RecordingStop& stop) noexcept = 0;
     virtual ProducerResult shutdown() noexcept = 0;
     virtual ProducerResult result() const noexcept = 0;
+    virtual ProducerStatus status() const noexcept = 0;
     virtual std::string recording_session_id() const noexcept = 0;
 };
 
@@ -139,6 +141,7 @@ class ObsJournalAdapter final {
     [[nodiscard]] bool load() noexcept;
     void unload() noexcept;
     [[nodiscard]] AdapterState state() const noexcept;
+    [[nodiscard]] unsigned pending_pause_resume_commands() const noexcept;
     [[nodiscard]] std::optional<RunReport> last_report() const;
 
     static void frontend_boundary(FrontendEvent event, void* private_data) noexcept;

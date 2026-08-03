@@ -123,6 +123,28 @@ def test_complete_journal_and_event_during_pause_are_valid() -> None:
     assert result.valid and not result.errors and result.recording_session_id is not None
 
 
+def test_real_obs_interleaver_pause_drain_is_monotonic_and_valid() -> None:
+    accepted = validate_journal(
+        [
+            journal_header(),
+            journal_record("pause", 1, 1_000, 60),
+            journal_record("resume", 2, 2_000, 109),
+            journal_stop(3, counter=169),
+        ]
+    )
+    assert accepted.valid
+
+    rejected = validate_journal(
+        [
+            journal_header(),
+            journal_record("pause", 1, 1_000, 60),
+            journal_record("resume", 2, 2_000, 59),
+            journal_stop(3, counter=120),
+        ]
+    )
+    assert ErrorCode.JOURNAL_SEQUENCE in {error.code for error in rejected.errors}
+
+
 def test_stop_while_paused_is_valid() -> None:
     result = validate_journal(
         [
@@ -181,10 +203,19 @@ def test_journal_record_types_clock_and_pause_failures() -> None:
     moved = [
         journal_header(),
         journal_record("pause", 1, 100, 10),
-        journal_record("resume", 2, 200, 13),
+        journal_record("resume", 2, 200, 14),
         journal_stop(3),
     ]
-    assert not validate_journal(moved).valid
+    assert validate_journal(moved).valid
+    regressed = [
+        journal_header(),
+        journal_record("pause", 1, 100, 10),
+        journal_record("resume", 2, 200, 9),
+        journal_stop(3),
+    ]
+    assert ErrorCode.JOURNAL_SEQUENCE in {
+        error.code for error in validate_journal(regressed).errors
+    }
     qpc_back = [
         journal_header(),
         journal_record("calibration_sample", 1, 200, 20) | {"recording_paused": False},
@@ -267,7 +298,8 @@ def test_canonical_model_validation_branches() -> None:
         PauseInterval.model_validate_json(json.dumps(base))
     base["pause_monotonic_ns"] = 0
     base["end_monotonic_ns"] = 1
-    base["mapped_source_frame_after"] = 3
+    base["mapped_source_frame_before"] = 5
+    base["mapped_source_frame_after"] = 4
     with pytest.raises(ValidationError):
         PauseInterval.model_validate_json(json.dumps(base))
 

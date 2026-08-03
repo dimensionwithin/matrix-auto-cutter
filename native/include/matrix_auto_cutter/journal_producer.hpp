@@ -17,6 +17,7 @@ namespace matrix_auto_cutter {
 
 inline constexpr std::size_t default_queue_capacity = 8192;
 inline constexpr auto producer_shutdown_deadline = std::chrono::seconds(5);
+inline constexpr auto producer_durable_confirmation_deadline = std::chrono::seconds(1);
 
 enum class CallbackResult {
     accepted,
@@ -44,6 +45,33 @@ enum class ProducerState {
     producer_failed_shutdown_timeout,
     stopped_unfinalized,
     closed,
+};
+
+enum class WriterFailure {
+    none,
+    snapshot_invalid,
+    qpc_regression,
+    counter_regression,
+    pause_while_paused,
+    resume_while_active,
+    resume_counter_underflow,
+    active_snapshot_while_paused,
+    duplicate_event_id,
+    serialization_failed,
+    write_or_flush_failed,
+    durable_confirmation_timeout,
+};
+
+struct ProducerStatus final {
+    ProducerState state{ProducerState::not_started};
+    ProducerResult result{ProducerResult::producer_ok};
+    std::uint64_t read_position{};
+    std::uint64_t write_position{};
+    std::uint64_t durable_position{};
+    WriterFailure writer_failure{WriterFailure::none};
+    std::uint64_t failure_monotonic_ns{};
+    std::uint64_t failure_output_frame_count{};
+    std::uint64_t failure_pause_counter{};
 };
 
 enum class EventType {
@@ -158,11 +186,13 @@ class JournalProducer final {
 
     [[nodiscard]] ProducerResult start_recording(const RecordingStart& start) noexcept;
     [[nodiscard]] CallbackResult submit(JournalSnapshot snapshot) noexcept;
+    [[nodiscard]] ProducerResult confirm_durable() noexcept;
     [[nodiscard]] ProducerResult normal_stop(const RecordingStop& stop) noexcept;
     [[nodiscard]] ProducerResult shutdown() noexcept;
 
     [[nodiscard]] ProducerResult result() const noexcept;
     [[nodiscard]] ProducerState state() const noexcept;
+    [[nodiscard]] ProducerStatus status() const noexcept;
     [[nodiscard]] std::string recording_session_id() const noexcept;
 
   private:
@@ -189,5 +219,6 @@ class MonotonicQpcClock final {
 [[nodiscard]] const char* to_string(CallbackResult value) noexcept;
 [[nodiscard]] const char* to_string(ProducerResult value) noexcept;
 [[nodiscard]] const char* to_string(ProducerState value) noexcept;
+[[nodiscard]] const char* to_string(WriterFailure value) noexcept;
 
 }  // namespace matrix_auto_cutter

@@ -679,11 +679,11 @@ class PauseInterval(CanonicalModel):
 
     @model_validator(mode="after")
     def consistent(self) -> PauseInterval:
-        """Prüfe QPC-Reihenfolge und erlaubte Counterbewegung."""
+        """Prüfe QPC-Reihenfolge und monotone Sourceframe-Abbildung."""
         if self.pause_monotonic_ns >= self.end_monotonic_ns:
             msg = "Pauseintervall benötigt aufsteigende QPC-Werte."
             raise ValueError(msg)
-        if self.mapped_source_frame_after - self.mapped_source_frame_before not in range(3):
-            msg = "Der Framecounter darf während Pause höchstens zwei Frames steigen."
+        if self.mapped_source_frame_after < self.mapped_source_frame_before:
+            msg = "Die Sourceframe-Abbildung darf während Pause nicht zurücklaufen."
             raise ValueError(msg)
         return self
