@@ -93,13 +93,11 @@ Der eindeutige Startpunkt unter Windows ist:
 START-MATRIX-AUTO-CUTTER.cmd
 ```
 
-Er prüft die normale Installation
-`C:\Program Files\obs-studio\bin\64bit\obs64.exe` auf Version 32.1.2, installiert
-bei geschlossenem OBS die gebaute Plugin-DLL in die von OBS empfohlene Pluginablage
-`C:\ProgramData\obs-studio\plugins` und startet
-den sichtbaren Product Runner. Danach startet er das normale OBS oder akzeptiert die
-bereits laufende normale Instanz. Portable OBS wird dabei nicht verwendet; Profile,
-Szenen und OBS-Einstellungen werden weder kopiert noch geändert.
+Er startet ausschließlich den Product Runner im Hintergrund und prüft kurz dessen
+Bereitschaft. Die Diagnose liegt unter
+`%LOCALAPPDATA%\DimensionWithin\MatrixAutoCutter\product-runner\logs\runner.log`
+und ist über die Review-Anwendung erreichbar. OBS, dessen Plugin, Profile, Szenen und
+Einstellungen werden durch diesen Startpunkt nicht gesteuert oder geändert.
 
 Nach einem normalen erfolgreichen Stop beobachtet der Runner die normative Ablage
 `%LOCALAPPDATA%\DimensionWithin\MatrixAutoCutter\producer\journals`. Er übernimmt nur

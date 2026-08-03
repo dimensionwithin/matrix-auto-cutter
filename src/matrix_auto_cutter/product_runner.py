@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import io
+import json
 import msvcrt
 import ntpath
 import os
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 from collections.abc import Callable, Sequence
 from contextlib import suppress
@@ -84,11 +87,15 @@ JOURNAL_SUFFIX = ".recording-journal.ndjson"
 DEFAULT_SOURCE_ROOT = r"F:\MatrixMarketAutoEdit"
 POLL_SECONDS = 2.0
 STATUS_SCHEMA_VERSION: Literal["1.0"] = "1.0"
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_GENERATIONS = 5
+HEARTBEAT_STALE_SECONDS = 15.0
 
 
 class RunnerStatusCode(StrEnum):
     """Maschinenlesbare Zustände mit stabiler Bedeutung."""
 
+    RUNNER_STARTING = "runner_starting"
     RUNNER_READY = "runner_ready"
     JOURNAL_INCOMPLETE = "journal_incomplete"
     RECORDING_DETECTED = "recording_detected"
@@ -118,6 +125,16 @@ class RunnerStatusCode(StrEnum):
     RUNNER_STOPPED = "runner_stopped"
 
 
+RUNNER_FAILURE_CODES = frozenset(
+    {
+        RunnerStatusCode.PROPOSAL_FAILED,
+        RunnerStatusCode.RENDER_FAILED,
+        RunnerStatusCode.FINALIZER_FAILED,
+        RunnerStatusCode.INFRASTRUCTURE_ERROR,
+    }
+)
+
+
 class RunnerStatus(CanonicalModel):
     """Persistierte Betriebsansicht des zuletzt beobachteten Ereignisses."""
 
@@ -128,6 +145,13 @@ class RunnerStatus(CanonicalModel):
     message_de: str = Field(min_length=1, max_length=2000)
     runner_ready: bool
     updated_at: AwareDatetime
+    runner_pid: int = Field(default_factory=os.getpid, ge=1)
+    runner_started_at: AwareDatetime = Field(default_factory=lambda: datetime.now(UTC))
+    last_heartbeat_at: AwareDatetime = Field(default_factory=lambda: datetime.now(UTC))
+    last_status_code: RunnerStatusCode = RunnerStatusCode.RUNNER_STARTING
+    last_run_failed: bool = False
+    last_error_code: str | None = None
+    last_error_message_de: str | None = Field(default=None, max_length=2000)
     recording_session_id: CanonicalUuid4 | None = None
     journal_path: str | None = None
     source_path: str | None = None
@@ -136,6 +160,7 @@ class RunnerStatus(CanonicalModel):
     review_path: str | None = None
     approval_decision: Literal["pending", "approved", "rejected"] | None = None
     error_code: str | None = None
+    render_id: str | None = Field(default=None, max_length=100)
 
 
 class SessionState(CanonicalModel):
@@ -250,6 +275,232 @@ def default_state_directory() -> Path:
     if not local:
         raise RuntimeError("LOCALAPPDATA ist nicht gesetzt")
     return Path(local) / "DimensionWithin" / "MatrixAutoCutter" / "product-runner"
+
+
+def default_log_directory() -> Path:
+    """Liefere die feste, lokale und nur diagnostische Runner-Logablage."""
+    return default_state_directory() / "logs"
+
+
+class RunnerLogSink(io.TextIOBase):
+    """Schreibe Runner-Diagnosen rotationsbegrenzt mit einem kleinen Fallback."""
+
+    def __init__(self, directory: Path) -> None:
+        """Initialisiere den nur lokalen Haupt- und Fallbackpfad."""
+        self.directory = directory
+        self.path = directory / "runner.log"
+        self._fallback_path = Path(tempfile.gettempdir()) / "MatrixAutoCutter-runner-fallback.log"
+        self._buffer = ""
+        self._lock = threading.Lock()
+
+    def writable(self) -> bool:
+        """Melde die Textstream-Faehigkeit fuer print und Bibliotheksausgaben."""
+        return True
+
+    def write(self, text: str) -> int:
+        """Nimm stdout/stderr ohne Verlust einzelner Zeilen in das Diagnoseprotokoll auf."""
+        if not text:
+            return 0
+        with self._lock:
+            self._buffer += text
+            while "\n" in self._buffer:
+                line, self._buffer = self._buffer.split("\n", 1)
+                if line:
+                    self._write_record("INFO", "stdout", line)
+        return len(text)
+
+    def flush(self) -> None:
+        """Schreibe einen noch nicht zeilenweise abgeschlossenen Rest sicher weg."""
+        with self._lock:
+            if self._buffer:
+                self._write_record("INFO", "stdout", self._buffer)
+                self._buffer = ""
+
+    def event(
+        self,
+        level: str,
+        message: str,
+        *,
+        status_code: str | None = None,
+        recording_id: str | None = None,
+        proposal_id: str | None = None,
+        render_id: str | None = None,
+        error_code: str | None = None,
+    ) -> None:
+        """Schreibe eine strukturierte fachliche Runner-Meldung."""
+        with self._lock:
+            self._write_record(
+                level,
+                status_code or "diagnostic",
+                message,
+                recording_id=recording_id,
+                proposal_id=proposal_id,
+                render_id=render_id,
+                error_code=error_code,
+            )
+
+    def status(self, status: RunnerStatus) -> None:
+        """Protokolliere eine persistierte Statusaenderung samt vorhandener Kennungen."""
+        proposal_id = None
+        if status.proposal_path:
+            parent = Path(status.proposal_path).parent.name
+            proposal_id = parent.removeprefix("proposal-") or None
+        self.event(
+            "ERROR" if status.error_code else "INFO",
+            status.message_de,
+            status_code=status.code.value,
+            recording_id=(
+                str(status.recording_session_id) if status.recording_session_id else None
+            ),
+            proposal_id=proposal_id,
+            render_id=status.render_id,
+            error_code=status.error_code,
+        )
+
+    def _write_record(
+        self,
+        level: str,
+        event: str,
+        message: str,
+        *,
+        recording_id: str | None = None,
+        proposal_id: str | None = None,
+        render_id: str | None = None,
+        error_code: str | None = None,
+    ) -> None:
+        timestamp = datetime.now(UTC).astimezone().isoformat(timespec="seconds")
+        fields: dict[str, str | None] = {
+            "time": timestamp,
+            "level": level,
+            "status_code": event,
+            "recording_id": recording_id,
+            "proposal_id": proposal_id,
+            "render_id": render_id,
+            "error_code": error_code,
+            "message": message,
+        }
+        line = " ".join(
+            f"{key}={json.dumps(value, ensure_ascii=False)}" for key, value in fields.items()
+        )
+        try:
+            self._rotate_if_needed(len(line.encode("utf-8")) + 1)
+            with self.path.open("a", encoding="utf-8", newline="\n") as stream:
+                stream.write(line + "\n")
+        except (OSError, UnicodeError):
+            self._write_fallback(line)
+
+    def _rotate_if_needed(self, incoming_bytes: int) -> None:
+        self.directory.mkdir(parents=True, exist_ok=True)
+        if not self.path.exists() or self.path.stat().st_size + incoming_bytes <= LOG_MAX_BYTES:
+            return
+        for index in range(LOG_GENERATIONS - 1, 0, -1):
+            source = self.path.with_name(f"{self.path.name}.{index}")
+            target = self.path.with_name(f"{self.path.name}.{index + 1}")
+            if index == LOG_GENERATIONS - 1:
+                with suppress(FileNotFoundError):
+                    source.unlink()
+            elif source.exists():
+                os.replace(source, target)
+        os.replace(self.path, self.path.with_name(f"{self.path.name}.1"))
+
+    def _write_fallback(self, line: str) -> None:
+        """Erhalte zumindest eine begrenzte lokale Fehlerspur, wenn das Hauptlog ausfaellt."""
+        try:
+            if self._fallback_path.exists() and self._fallback_path.stat().st_size >= 1024 * 1024:
+                return
+            with self._fallback_path.open("a", encoding="utf-8", newline="\n") as stream:
+                stream.write(line + "\n")
+        except (OSError, UnicodeError):
+            with suppress(OSError):
+                os.write(2, (line + "\n").encode("utf-8", errors="replace"))
+
+
+@dataclass(frozen=True, slots=True)
+class RunnerHealth:
+    """Sichere UI-Projektion der lokalen Runner-Statusdatei."""
+
+    state: Literal["active", "starting", "not_reachable", "stale"]
+    message_de: str
+    last_run_failed: bool
+
+
+def load_runner_status(state_directory: Path | None = None) -> RunnerStatus | None:
+    """Lade ausschliesslich die kleine, lokale Statusdatei ohne Fehlerweitergabe."""
+    path = (state_directory or default_state_directory()) / "status.json"
+    try:
+        return RunnerStatus.model_validate_json(path.read_bytes())
+    except (OSError, UnicodeError, ValidationError, ValueError):
+        return None
+
+
+def _pid_exists(pid: int) -> bool:
+    if os.name == "nt":
+        import ctypes
+
+        process_query_limited_information = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(process_query_limited_information, False, pid)
+        if handle:
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        return ctypes.get_last_error() == 5
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def runner_health(
+    status: RunnerStatus | None,
+    *,
+    now: datetime | None = None,
+    pid_exists: Callable[[int], bool] = _pid_exists,
+) -> RunnerHealth:
+    """Erkenne aktive, anlaufende, tote und veraltete Runner ohne Netzwerkdienst."""
+    if status is None:
+        return RunnerHealth(
+            "not_reachable", "Runner ist nicht erreichbar; keine Statusdatei vorhanden.", False
+        )
+    failed = status.last_run_failed
+    if status.code is RunnerStatusCode.RUNNER_STOPPED:
+        return RunnerHealth("not_reachable", "Runner wurde kontrolliert beendet.", failed)
+    if not status.runner_ready:
+        return RunnerHealth("starting", "Runner startet noch.", failed)
+    observed_at = now or datetime.now(UTC)
+    age_seconds = (observed_at - status.last_heartbeat_at).total_seconds()
+    if age_seconds > HEARTBEAT_STALE_SECONDS:
+        return RunnerHealth("stale", "Runner-Status ist veraltet.", failed)
+    if not pid_exists(status.runner_pid):
+        return RunnerHealth("not_reachable", "Runner-Prozess ist nicht mehr vorhanden.", failed)
+    message = "Runner ist aktiv."
+    if failed:
+        message += " Der letzte fachliche Lauf ist fehlgeschlagen."
+    return RunnerHealth("active", message, failed)
+
+
+def tail_runner_log(log_directory: Path | None = None, *, maximum_bytes: int = 192 * 1024) -> str:
+    """Lese einen begrenzten, lokal validierten Log-Ausschnitt ohne Shell-Auswertung."""
+    if not 1024 <= maximum_bytes <= 1024 * 1024:
+        raise ValueError("maximum_bytes muss zwischen 1024 und 1048576 liegen")
+    directory = (log_directory or default_log_directory()).resolve(strict=False)
+    path = (directory / "runner.log").resolve(strict=False)
+    try:
+        path.relative_to(directory)
+        with path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            stream.seek(max(0, size - maximum_bytes), os.SEEK_SET)
+            data = stream.read(maximum_bytes)
+    except OSError as exc:
+        return f"Protokoll ist derzeit nicht lesbar: {type(exc).__name__}: {exc}"
+    text = data.decode("utf-8", errors="replace")
+    if size > maximum_bytes:
+        text = "… (ältere Zeilen ausgelassen)\n" + text
+    return text
 
 
 def _canonical_path(path: Path) -> str:
@@ -504,6 +755,12 @@ def _atomic_bytes(path: Path, data: bytes, *, create_only: bool) -> bool:
     return True
 
 
+def request_runner_stop(state_directory: Path | None = None) -> bool:
+    """Fordere einen kontrollierten Stop ueber die feste lokale State-Ablage an."""
+    directory = state_directory or default_state_directory()
+    return _atomic_bytes(directory / "stop.request", b"stop\n", create_only=False)
+
+
 def _model_bytes(model: CanonicalModel) -> bytes:
     return model.model_dump_json(indent=2).encode("utf-8") + b"\n"
 
@@ -544,6 +801,8 @@ class ProductRunner:
         dependencies: RunnerDependencies,
         *,
         output: TextIO = sys.stdout,
+        diagnostics: RunnerLogSink | None = None,
+        runner_pid: int | None = None,
     ) -> None:
         """Binde Verzeichnisse, Produktgrenze und kontrollierbare Abhängigkeiten."""
         self.journal_directory = journal_directory
@@ -558,6 +817,9 @@ class ProductRunner:
         self.workspace_path = workspace_path
         self.dependencies = dependencies
         self.output = output
+        self.diagnostics = diagnostics
+        self.runner_pid = runner_pid or os.getpid()
+        self.runner_started_at = dependencies.now()
         self.instance_id = dependencies.uuid_factory()
         if self.instance_id.version != 4:
             raise ValueError("runner instance ID must be UUIDv4")
@@ -570,11 +832,19 @@ class ProductRunner:
         self._render_cancel = threading.Event()
         self._render_recording_id: str | None = None
         self._shutdown = False
+        self._last_status: RunnerStatus | None = None
+        self._last_error_code: str | None = None
+        self._last_error_message_de: str | None = None
 
     @property
     def status_path(self) -> Path:
         """Liefere den Pfad der aktuellen maschinenlesbaren Betriebsansicht."""
         return self.state_directory / "status.json"
+
+    @property
+    def stop_request_path(self) -> Path:
+        """Liefere den festen lokalen Request fuer einen kontrollierten Runner-Stop."""
+        return self.state_directory / "stop.request"
 
     @property
     def sessions_directory(self) -> Path:
@@ -648,6 +918,35 @@ class ProductRunner:
             "Runner wurde sauber beendet.",
             ready=False,
         )
+        with suppress(OSError):
+            self.stop_request_path.unlink(missing_ok=True)
+
+    def starting(self) -> None:
+        """Veröffentliche vor der Bereitschaft einen kurzen, stillen Anlaufzustand."""
+        self.state_directory.mkdir(parents=True, exist_ok=True)
+        with suppress(OSError):
+            self.stop_request_path.unlink(missing_ok=True)
+        self._publish_status(
+            RunnerStatusCode.RUNNER_STARTING,
+            "Runner startet.",
+            ready=False,
+        )
+
+    def heartbeat(self) -> None:
+        """Aktualisiere die lokale Lebensmarke ohne sichtbares Protokollrauschen."""
+        status = self._last_status
+        if status is None:
+            return
+        refreshed = status.model_copy(update={"last_heartbeat_at": self.dependencies.now()})
+        self._last_status = refreshed
+        _atomic_bytes(self.status_path, _model_bytes(refreshed), create_only=False)
+
+    def stop_requested(self) -> bool:
+        """Pruefe den lokalen Stop-Request ohne Netzwerk oder Prozessmanipulation."""
+        try:
+            return self.stop_request_path.is_file()
+        except OSError:
+            return False
 
     def _on_render_status(self, state: SessionState, status: RenderStatus) -> None:
         """Publish only actual renderer transitions to the shared runner status."""
@@ -662,6 +961,7 @@ class ProductRunner:
             review_path=state.review_path,
             approval_decision=state.approval_decision,
             error_code=status.error_code,
+            render_id=status.render_id,
         )
 
     def _render_worker(
@@ -725,6 +1025,7 @@ class ProductRunner:
             review_path=updated.review_path,
             approval_decision=updated.approval_decision,
             error_code=updated.error_code,
+            render_id=updated.render_id,
         )
         self._render_recording_id = None
 
@@ -866,6 +1167,7 @@ class ProductRunner:
         review_path: str | None = None,
         approval_decision: Literal["pending", "approved", "rejected"] | None = None,
         error_code: str | None = None,
+        render_id: str | None = None,
         ready: bool = True,
     ) -> None:
         subject = recording_id or journal_path or "__runner__"
@@ -878,12 +1180,17 @@ class ProductRunner:
             review_path,
             approval_decision,
             error_code,
+            render_id,
             message,
             ready,
         )
         if self._last_status_by_subject.get(subject) == key:
             return
         self._last_status_by_subject[subject] = key
+        if error_code is not None:
+            self._last_error_code = error_code
+            self._last_error_message_de = message
+        now = self.dependencies.now()
         status = RunnerStatus(
             artifact_type="matrix_auto_cutter_product_runner_status",
             schema_version=STATUS_SCHEMA_VERSION,
@@ -891,7 +1198,14 @@ class ProductRunner:
             code=code,
             message_de=message,
             runner_ready=ready,
-            updated_at=self.dependencies.now(),
+            updated_at=now,
+            runner_pid=self.runner_pid,
+            runner_started_at=self.runner_started_at,
+            last_heartbeat_at=now,
+            last_status_code=code,
+            last_run_failed=code in RUNNER_FAILURE_CODES,
+            last_error_code=self._last_error_code,
+            last_error_message_de=self._last_error_message_de,
             recording_session_id=UUID(recording_id) if recording_id is not None else None,
             journal_path=journal_path,
             source_path=source_path,
@@ -900,8 +1214,12 @@ class ProductRunner:
             review_path=review_path,
             approval_decision=approval_decision,
             error_code=error_code,
+            render_id=render_id,
         )
+        self._last_status = status
         _atomic_bytes(self.status_path, _model_bytes(status), create_only=False)
+        if self.diagnostics is not None:
+            self.diagnostics.status(status)
         timestamp = status.updated_at.astimezone().strftime("%Y-%m-%d %H:%M:%S")
         print(f"[{timestamp}] [{code.value}] {message}", file=self.output, flush=True)
 
@@ -1554,28 +1872,29 @@ class ProductRunner:
                 f"Journalablage konnte nicht gelesen werden: {exc}",
                 error_code="E_RUNNER_JOURNAL_DIRECTORY",
             )
-            return
-        for journal in journals:
-            try:
-                inspected = self.dependencies.inspect_journal(journal)
-                if isinstance(inspected, JournalUnavailable):
+        else:
+            for journal in journals:
+                try:
+                    inspected = self.dependencies.inspect_journal(journal)
+                    if isinstance(inspected, JournalUnavailable):
+                        self._publish_status(
+                            inspected.code,
+                            inspected.message_de,
+                            recording_id=inspected.recording_session_id,
+                            journal_path=_canonical_path(journal),
+                            error_code=inspected.error_code,
+                        )
+                        continue
+                    self._process_ready(journal, inspected)
+                except Exception as exc:
                     self._publish_status(
-                        inspected.code,
-                        inspected.message_de,
-                        recording_id=inspected.recording_session_id,
+                        RunnerStatusCode.INFRASTRUCTURE_ERROR,
+                        f"Unerwarteter Infrastrukturfehler für {journal.name}: "
+                        f"{type(exc).__name__}: {exc}",
                         journal_path=_canonical_path(journal),
-                        error_code=inspected.error_code,
+                        error_code="E_RUNNER_UNEXPECTED",
                     )
-                    continue
-                self._process_ready(journal, inspected)
-            except Exception as exc:
-                self._publish_status(
-                    RunnerStatusCode.INFRASTRUCTURE_ERROR,
-                    f"Unerwarteter Infrastrukturfehler für {journal.name}: "
-                    f"{type(exc).__name__}: {exc}",
-                    journal_path=_canonical_path(journal),
-                    error_code="E_RUNNER_UNEXPECTED",
-                )
+        self.heartbeat()
 
 
 class SingleInstance:
@@ -1637,14 +1956,41 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--ffmpeg")
     parser.add_argument("--poll-seconds", type=float, default=POLL_SECONDS)
     parser.add_argument("--once", action="store_true", help="genau einen Poll für Tests/Diagnose")
+    parser.add_argument("--stop", action="store_true", help="kontrollierten Runner-Stop anfordern")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Den sichtbaren Einzelinstanz-Runner bis Ctrl+C starten."""
+    """Run the quiet single-instance runner until a controlled stop."""
     args = _parser().parse_args(argv)
+    try:
+        state_directory = args.state_directory or default_state_directory()
+    except RuntimeError as exc:
+        print(f"Runner-Startfehler: {exc}", file=sys.stderr)
+        return 1
+    diagnostics = RunnerLogSink(state_directory / "logs")
+    previous_stdout, previous_stderr = sys.stdout, sys.stderr
+    sys.stdout = diagnostics
+    sys.stderr = diagnostics
+    if args.stop:
+        requested = request_runner_stop(state_directory)
+        diagnostics.event(
+            "INFO" if requested else "ERROR",
+            (
+                "Kontrollierter Runner-Stop wurde angefordert."
+                if requested
+                else "Kontrollierter Runner-Stop konnte nicht angefordert werden."
+            ),
+            status_code="runner_stop_requested",
+            error_code=None if requested else "E_RUNNER_STOP_REQUEST",
+        )
+        diagnostics.flush()
+        sys.stdout, sys.stderr = previous_stdout, previous_stderr
+        return 0 if requested else 1
     if not 0.25 <= args.poll_seconds <= 60:
         print("Fehler: --poll-seconds muss zwischen 0.25 und 60 liegen.", file=sys.stderr)
+        diagnostics.flush()
+        sys.stdout, sys.stderr = previous_stdout, previous_stderr
         return 2
     guard = SingleInstance()
     runner: ProductRunner | None = None
@@ -1654,11 +2000,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
         runner = ProductRunner(
             args.journal_directory or default_journal_directory(),
-            args.state_directory or default_state_directory(),
+            state_directory,
             args.source_root,
             args.workspace,
             native_dependencies(args.workspace, args.ffprobe, args.ffmpeg),
+            output=cast(TextIO, diagnostics),
+            diagnostics=diagnostics,
         )
+        runner.starting()
         runner.ready()
         runner.scan_once()
         if args.once:
@@ -1672,17 +2021,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         if hasattr(signal, "SIGTERM"):
             signal.signal(signal.SIGTERM, stop)
         while not stopped.wait(args.poll_seconds):
-            runner.scan_once()
+            if runner.stop_requested():
+                stopped.set()
+            else:
+                runner.scan_once()
         return 0
     except KeyboardInterrupt:
         return 130
     except Exception as exc:
+        diagnostics.event(
+            "ERROR",
+            f"Runner-Startfehler: {type(exc).__name__}: {exc}",
+            status_code=RunnerStatusCode.INFRASTRUCTURE_ERROR.value,
+            error_code="E_RUNNER_STARTUP",
+        )
+        if runner is not None:
+            runner._publish_status(
+                RunnerStatusCode.INFRASTRUCTURE_ERROR,
+                f"Runner-Startfehler: {type(exc).__name__}: {exc}",
+                error_code="E_RUNNER_STARTUP",
+            )
         print(f"Runner-Startfehler: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
     finally:
         if runner is not None:
             runner.shutdown()
         guard.close()
+        diagnostics.flush()
+        sys.stdout, sys.stderr = previous_stdout, previous_stderr
 
 
 if __name__ == "__main__":
