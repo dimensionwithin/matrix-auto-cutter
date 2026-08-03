@@ -7,6 +7,7 @@ import msvcrt
 import ntpath
 import os
 import signal
+import subprocess
 import sys
 import threading
 from collections.abc import Callable, Sequence
@@ -21,6 +22,20 @@ from uuid import UUID, uuid4
 
 from pydantic import AwareDatetime, Field, ValidationError
 
+from matrix_auto_cutter.approval import (
+    DecisionFailed,
+    DecisionWritten,
+    check_render_authorization,
+    ensure_pending_approval,
+)
+from matrix_auto_cutter.cut_proposal import (
+    ProposalFailed,
+    ProposalReady,
+    ProposalResult,
+    discover_ffmpeg,
+    generate_proposal,
+    load_proposal,
+)
 from matrix_auto_cutter.manual_finalizer import (
     ManualFinalizationFailed,
     ManualFinalizationResult,
@@ -49,6 +64,7 @@ from matrix_auto_cutter.phase2.workspace import (
     open_project,
     resolve_default_workspace_root,
 )
+from matrix_auto_cutter.review import write_review
 
 JOURNAL_SUFFIX = ".recording-journal.ndjson"
 DEFAULT_SOURCE_ROOT = r"F:\MatrixMarketAutoEdit"
@@ -64,6 +80,13 @@ class RunnerStatusCode(StrEnum):
     RECORDING_DETECTED = "recording_detected"
     FINALIZER_RUNNING = "finalizer_running"
     SIDECAR_SUCCEEDED = "sidecar_succeeded"
+    ANALYSIS_PENDING = "analysis_pending"
+    ANALYSIS_RUNNING = "analysis_running"
+    PROPOSAL_READY = "proposal_ready"
+    PROPOSAL_FAILED = "proposal_failed"
+    APPROVAL_PENDING = "approval_pending"
+    PROPOSAL_APPROVED = "proposal_approved"
+    PROPOSAL_REJECTED = "proposal_rejected"
     SOURCE_OUTSIDE_ROOT = "source_outside_root"
     SOURCE_MISSING = "source_missing"
     JOURNAL_INVALID = "journal_invalid"
@@ -89,6 +112,9 @@ class RunnerStatus(CanonicalModel):
     journal_path: str | None = None
     source_path: str | None = None
     sidecar_path: str | None = None
+    proposal_path: str | None = None
+    review_path: str | None = None
+    approval_decision: Literal["pending", "approved", "rejected"] | None = None
     error_code: str | None = None
 
 
@@ -107,6 +133,10 @@ class SessionState(CanonicalModel):
     attempt: int = Field(ge=0, le=1000)
     updated_at: AwareDatetime
     sidecar_path: str | None = None
+    proposal_path: str | None = None
+    review_path: str | None = None
+    approval_decision: Literal["pending", "approved", "rejected"] | None = None
+    review_opened_proposal_id: str | None = Field(default=None, max_length=100)
     error_code: str | None = None
 
 
@@ -133,6 +163,8 @@ type JournalInspection = JournalReady | JournalUnavailable
 type JournalInspector = Callable[[Path], JournalInspection]
 type ProjectEnsurer = Callable[[str, str, CancellationToken], str | None]
 type FinalizerRunner = Callable[[ManualFinalizerRequest], ManualFinalizationResult]
+type ProposalRunner = Callable[[Path, Path, str, Path], ProposalResult]
+type ReviewOpener = Callable[[Path], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +176,8 @@ class RunnerDependencies:
     finalize: FinalizerRunner
     now: Callable[[], datetime] = lambda: datetime.now(UTC)
     uuid_factory: Callable[[], UUID] = uuid4
+    propose: ProposalRunner | None = None
+    open_review: ReviewOpener | None = None
 
 
 def default_journal_directory() -> Path:
@@ -258,7 +292,36 @@ def _ensure_project_native(
     return f"Projekt {project_id} konnte nicht angelegt werden: {getattr(error, 'message', error)}"
 
 
-def native_dependencies(workspace_path: str, ffprobe_path: str | None) -> RunnerDependencies:
+def _open_review_native(proposal_path: Path) -> None:
+    """Launch one detached local standard-library review application without a shell."""
+    python = Path(sys.executable)
+    pythonw = python.with_name("pythonw.exe")
+    executable = pythonw if pythonw.is_file() else python
+    creation_flags = 0
+    if os.name == "nt":
+        creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+    subprocess.Popen(
+        [
+            str(executable.resolve(strict=True)),
+            "-m",
+            "matrix_auto_cutter.review_app",
+            "--proposal",
+            str(proposal_path.resolve(strict=True)),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+        creationflags=creation_flags,
+        shell=False,
+    )
+
+
+def native_dependencies(
+    workspace_path: str,
+    ffprobe_path: str | None,
+    ffmpeg_path: str | None = None,
+) -> RunnerDependencies:
     """Verdrahte den Runner mit den bestehenden nativen Produktkompositionen."""
     ports = ManualFinalizerPorts.native()
 
@@ -271,7 +334,34 @@ def native_dependencies(workspace_path: str, ffprobe_path: str | None) -> Runner
     def finalize_existing(request: ManualFinalizerRequest) -> ManualFinalizationResult:
         return run_manual_finalizer(ports, replace(request, ffprobe_path=ffprobe_path))
 
-    return RunnerDependencies(inspect, ensure, finalize_existing)
+    resolved_ffmpeg = discover_ffmpeg(ffmpeg_path)
+
+    def propose(
+        source_path: Path,
+        sidecar_path: Path,
+        recording_id: str,
+        artifacts_root: Path,
+    ) -> ProposalResult:
+        if resolved_ffmpeg is None:
+            return ProposalFailed(
+                "E_FFMPEG_UNAVAILABLE",
+                "FFmpeg.exe wurde nicht als absolute reguläre Datei gefunden.",
+            )
+        return generate_proposal(
+            source_path,
+            sidecar_path,
+            recording_id,
+            artifacts_root,
+            resolved_ffmpeg,
+        )
+
+    return RunnerDependencies(
+        inspect,
+        ensure,
+        finalize_existing,
+        propose=propose,
+        open_review=_open_review_native,
+    )
 
 
 def _atomic_bytes(path: Path, data: bytes, *, create_only: bool) -> bool:
@@ -354,6 +444,7 @@ class ProductRunner:
         if self.instance_id.version != 4:
             raise ValueError("runner instance ID must be UUIDv4")
         self._attempted_this_run: set[str] = set()
+        self._proposal_attempted_this_run: set[str] = set()
         self._last_console_key: tuple[object, ...] | None = None
 
     @property
@@ -365,6 +456,11 @@ class ProductRunner:
     def sessions_directory(self) -> Path:
         """Liefere die Ablage der dauerhaften Session-Claims."""
         return self.state_directory / "sessions"
+
+    @property
+    def artifacts_directory(self) -> Path:
+        """Liefere die kontrollierte generationsgebundene Runner-Artefaktablage."""
+        return self.state_directory / "artifacts"
 
     def _session_path(self, recording_id: str) -> Path:
         return self.sessions_directory / f"{recording_id}.json"
@@ -378,6 +474,9 @@ class ProductRunner:
         journal_path: str | None = None,
         source_path: str | None = None,
         sidecar_path: str | None = None,
+        proposal_path: str | None = None,
+        review_path: str | None = None,
+        approval_decision: Literal["pending", "approved", "rejected"] | None = None,
         error_code: str | None = None,
         ready: bool = True,
     ) -> None:
@@ -393,10 +492,24 @@ class ProductRunner:
             journal_path=journal_path,
             source_path=source_path,
             sidecar_path=sidecar_path,
+            proposal_path=proposal_path,
+            review_path=review_path,
+            approval_decision=approval_decision,
             error_code=error_code,
         )
         _atomic_bytes(self.status_path, _model_bytes(status), create_only=False)
-        key = (code, recording_id, journal_path, source_path, sidecar_path, error_code, message)
+        key = (
+            code,
+            recording_id,
+            journal_path,
+            source_path,
+            sidecar_path,
+            proposal_path,
+            review_path,
+            approval_decision,
+            error_code,
+            message,
+        )
         if key != self._last_console_key:
             timestamp = status.updated_at.astimezone().strftime("%Y-%m-%d %H:%M:%S")
             print(f"[{timestamp}] [{code.value}] {message}", file=self.output, flush=True)
@@ -406,6 +519,7 @@ class ProductRunner:
         """Veröffentliche den sichtbaren Bereitschaftszustand."""
         self.state_directory.mkdir(parents=True, exist_ok=True)
         self.sessions_directory.mkdir(parents=True, exist_ok=True)
+        self.artifacts_directory.mkdir(parents=True, exist_ok=True)
         self.journal_directory.mkdir(parents=True, exist_ok=True)
         self._publish_status(
             RunnerStatusCode.RUNNER_READY,
@@ -502,6 +616,241 @@ class ProductRunner:
             error_code=error_code,
         )
 
+    def _proposal_failure(self, state: SessionState, code: str, message: str) -> None:
+        failed = state.model_copy(
+            update={
+                "status": RunnerStatusCode.PROPOSAL_FAILED,
+                "message_de": message,
+                "error_code": code,
+                "updated_at": self.dependencies.now(),
+            }
+        )
+        self._store_session(failed)
+        self._publish_status(
+            RunnerStatusCode.PROPOSAL_FAILED,
+            message,
+            recording_id=str(state.recording_session_id),
+            journal_path=state.journal_path,
+            source_path=state.source_path,
+            sidecar_path=state.sidecar_path,
+            proposal_path=state.proposal_path,
+            review_path=state.review_path,
+            approval_decision=state.approval_decision,
+            error_code=code,
+        )
+
+    def _complete_proposal(self, state: SessionState, ready: ProposalReady) -> None:
+        proposal = ready.proposal
+        try:
+            proposal_in_runner_workspace = ready.proposal_path.resolve(strict=True).is_relative_to(
+                self.artifacts_directory.resolve(strict=True)
+            )
+        except OSError:
+            proposal_in_runner_workspace = False
+        if (
+            not proposal_in_runner_workspace
+            or proposal.recording_id != str(state.recording_session_id)
+            or proposal.source_path.casefold()
+            != _canonical_path(Path(state.source_path)).casefold()
+            or state.sidecar_path is None
+            or proposal.sidecar_path.casefold()
+            != _canonical_path(Path(state.sidecar_path)).casefold()
+        ):
+            self._proposal_failure(
+                state,
+                "E_PROPOSAL_RUNNER_BINDING",
+                "Proposal passt nicht exakt zu Recording, Source und Sidecar der Runner-Session.",
+            )
+            return
+        pending = ensure_pending_approval(ready.proposal_path, now=self.dependencies.now)
+        if isinstance(pending, DecisionFailed):
+            self._proposal_failure(state, pending.code, pending.message_de)
+            return
+        assert isinstance(pending, DecisionWritten)
+        try:
+            review_path = write_review(ready.proposal_path)
+        except (OSError, ValueError) as exc:
+            self._proposal_failure(
+                state,
+                "E_REVIEW_WRITE",
+                f"Lokale Review konnte nicht atomar erzeugt werden: {exc}",
+            )
+            return
+        recording_id = str(state.recording_session_id)
+        proposal_path_text = _canonical_path(ready.proposal_path)
+        review_path_text = _canonical_path(review_path)
+        gate = check_render_authorization(ready.proposal_path)
+        if gate.approval is None:
+            self._proposal_failure(
+                state,
+                "E_APPROVAL_GATE",
+                "Approval-Gate konnte die gebundene Entscheidung nicht erneut lesen.",
+            )
+            return
+        proposal_message = (
+            f"Schnittvorschlag bereit: {ready.proposal.total_proposed_cuts} Schnitt(e), "
+            f"{ready.proposal.total_proposed_savings_ms / 1000:.3f} s mögliche Kürzung."
+        )
+        current = state.model_copy(
+            update={
+                "status": RunnerStatusCode.PROPOSAL_READY,
+                "message_de": proposal_message,
+                "proposal_path": proposal_path_text,
+                "review_path": review_path_text,
+                "approval_decision": gate.decision,
+                "error_code": None,
+                "updated_at": self.dependencies.now(),
+            }
+        )
+        self._store_session(current)
+        self._publish_status(
+            RunnerStatusCode.PROPOSAL_READY,
+            proposal_message,
+            recording_id=recording_id,
+            journal_path=current.journal_path,
+            source_path=current.source_path,
+            sidecar_path=current.sidecar_path,
+            proposal_path=proposal_path_text,
+            review_path=review_path_text,
+            approval_decision=gate.decision,
+        )
+        open_note = ""
+        if current.review_opened_proposal_id != ready.proposal.proposal_id:
+            current = current.model_copy(
+                update={
+                    "review_opened_proposal_id": ready.proposal.proposal_id,
+                    "updated_at": self.dependencies.now(),
+                }
+            )
+            # Persist before launch: a crash may suppress a retry, never cause a second auto-open.
+            self._store_session(current)
+            if self.dependencies.open_review is not None:
+                try:
+                    self.dependencies.open_review(ready.proposal_path)
+                except (OSError, RuntimeError, ValueError) as exc:
+                    open_note = (
+                        " Automatisches Öffnen scheiterte; Review bleibt unter "
+                        f"{review_path_text} verfügbar: {exc}"
+                    )
+        status_by_decision = {
+            "pending": RunnerStatusCode.APPROVAL_PENDING,
+            "approved": RunnerStatusCode.PROPOSAL_APPROVED,
+            "rejected": RunnerStatusCode.PROPOSAL_REJECTED,
+        }
+        message_by_decision = {
+            "pending": "Schnittvorschlag wartet auf ausdrückliche Freigabe oder Ablehnung.",
+            "approved": "Schnittvorschlag wurde ausdrücklich und digestgebunden freigegeben.",
+            "rejected": (
+                "Schnittvorschlag wurde ausdrücklich abgelehnt; Render ist nicht autorisiert."
+            ),
+        }
+        final_code = status_by_decision[gate.decision]
+        final_message = message_by_decision[gate.decision] + open_note
+        current = current.model_copy(
+            update={
+                "status": final_code,
+                "message_de": final_message,
+                "approval_decision": gate.decision,
+                "updated_at": self.dependencies.now(),
+            }
+        )
+        self._store_session(current)
+        self._publish_status(
+            final_code,
+            final_message,
+            recording_id=recording_id,
+            journal_path=current.journal_path,
+            source_path=current.source_path,
+            sidecar_path=current.sidecar_path,
+            proposal_path=proposal_path_text,
+            review_path=review_path_text,
+            approval_decision=gate.decision,
+        )
+
+    def _propose(self, state: SessionState) -> None:
+        if self.dependencies.propose is None:
+            self._publish_status(
+                state.status,
+                state.message_de,
+                recording_id=str(state.recording_session_id),
+                journal_path=state.journal_path,
+                source_path=state.source_path,
+                sidecar_path=state.sidecar_path,
+                proposal_path=state.proposal_path,
+                review_path=state.review_path,
+                approval_decision=state.approval_decision,
+                error_code=state.error_code,
+            )
+            return
+        recording_id = str(state.recording_session_id)
+        if recording_id in self._proposal_attempted_this_run:
+            if state.proposal_path is None:
+                return
+            loaded = load_proposal(Path(state.proposal_path))
+            if isinstance(loaded, ProposalFailed):
+                self._proposal_failure(state, loaded.code, loaded.message_de)
+                return
+            self._complete_proposal(state, loaded)
+            return
+        self._proposal_attempted_this_run.add(recording_id)
+        if state.sidecar_path is None:
+            self._proposal_failure(
+                state,
+                "E_PROPOSAL_SIDECAR_MISSING",
+                "Sidecarpfad fehlt; kein zeitentfernender Vorschlag wurde erzeugt.",
+            )
+            return
+        pending = state.model_copy(
+            update={
+                "status": RunnerStatusCode.ANALYSIS_PENDING,
+                "message_de": "Konservative Audioanalyse ist eingeplant.",
+                "error_code": None,
+                "updated_at": self.dependencies.now(),
+            }
+        )
+        self._store_session(pending)
+        self._publish_status(
+            RunnerStatusCode.ANALYSIS_PENDING,
+            pending.message_de,
+            recording_id=recording_id,
+            journal_path=pending.journal_path,
+            source_path=pending.source_path,
+            sidecar_path=pending.sidecar_path,
+        )
+        running = pending.model_copy(
+            update={
+                "status": RunnerStatusCode.ANALYSIS_RUNNING,
+                "message_de": "FFmpeg analysiert die Aufnahme ausschließlich lesend auf Stille.",
+                "updated_at": self.dependencies.now(),
+            }
+        )
+        self._store_session(running)
+        self._publish_status(
+            RunnerStatusCode.ANALYSIS_RUNNING,
+            running.message_de,
+            recording_id=recording_id,
+            journal_path=running.journal_path,
+            source_path=running.source_path,
+            sidecar_path=running.sidecar_path,
+        )
+        try:
+            assert running.sidecar_path is not None
+            result = self.dependencies.propose(
+                Path(running.source_path),
+                Path(running.sidecar_path),
+                recording_id,
+                self.artifacts_directory,
+            )
+        except Exception as exc:
+            result = ProposalFailed(
+                "E_PROPOSAL_EXCEPTION",
+                f"Unerwarteter Analyse-Infrastrukturfehler: {type(exc).__name__}: {exc}",
+            )
+        if isinstance(result, ProposalFailed):
+            self._proposal_failure(running, result.code, result.message_de)
+            return
+        self._complete_proposal(running, result)
+
     def _finalize(self, state: SessionState) -> None:
         recording_id = str(state.recording_session_id)
         if recording_id in self._attempted_this_run:
@@ -573,6 +922,7 @@ class ProductRunner:
                 source_path=running.source_path,
                 sidecar_path=result.sidecar_path,
             )
+            self._propose(succeeded)
             return
         code = RunnerStatusCode.FINALIZER_FAILED
         if result.stage == "ffprobe_discovery":
@@ -619,11 +969,7 @@ class ProductRunner:
         state = self._state_for(normalized, journal_path)
         if state is None:
             return
-        terminal = {
-            RunnerStatusCode.SIDECAR_SUCCEEDED,
-            RunnerStatusCode.SOURCE_OUTSIDE_ROOT,
-        }
-        if state.status in terminal:
+        if state.status is RunnerStatusCode.SOURCE_OUTSIDE_ROOT:
             self._publish_status(
                 state.status,
                 state.message_de,
@@ -633,6 +979,19 @@ class ProductRunner:
                 sidecar_path=state.sidecar_path,
                 error_code=state.error_code,
             )
+            return
+        proposal_states = {
+            RunnerStatusCode.SIDECAR_SUCCEEDED,
+            RunnerStatusCode.ANALYSIS_PENDING,
+            RunnerStatusCode.ANALYSIS_RUNNING,
+            RunnerStatusCode.PROPOSAL_READY,
+            RunnerStatusCode.PROPOSAL_FAILED,
+            RunnerStatusCode.APPROVAL_PENDING,
+            RunnerStatusCode.PROPOSAL_APPROVED,
+            RunnerStatusCode.PROPOSAL_REJECTED,
+        }
+        if state.status in proposal_states and state.sidecar_path is not None:
+            self._propose(state)
             return
         if not _under_root(normalized_source, self.source_root):
             self._terminal_without_finalizer(
@@ -761,6 +1120,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-root", default=DEFAULT_SOURCE_ROOT)
     parser.add_argument("--workspace", default=resolve_default_workspace_root())
     parser.add_argument("--ffprobe")
+    parser.add_argument("--ffmpeg")
     parser.add_argument("--poll-seconds", type=float, default=POLL_SECONDS)
     parser.add_argument("--once", action="store_true", help="genau einen Poll für Tests/Diagnose")
     return parser
@@ -782,7 +1142,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.state_directory or default_state_directory(),
             args.source_root,
             args.workspace,
-            native_dependencies(args.workspace, args.ffprobe),
+            native_dependencies(args.workspace, args.ffprobe, args.ffmpeg),
         )
         runner.ready()
         runner.scan_once()
