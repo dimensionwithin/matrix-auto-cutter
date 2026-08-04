@@ -16,6 +16,7 @@ matrix-auto-runner = "matrix_auto_cutter.product_runner:main"
 matrix-auto-review = "matrix_auto_cutter.review_app:main"
 
 [project.optional-dependencies]
+repeat = ["rapidfuzz>=3,<4"]
 dev = [
   "hypothesis>=6.135,<7",
   "mypy>=1.16,<2",
