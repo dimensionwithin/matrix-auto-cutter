@@ -71,7 +71,7 @@ from matrix_auto_cutter.render import (
     NativeProcessRunner,
     RenderExecution,
     RenderFailed,
-    RenderRequest,
+    RenderRequestModel,
     RenderStatus,
     RenderStatusV11,
     RenderSucceeded,
@@ -159,7 +159,10 @@ class RunnerStatus(CanonicalModel):
     sidecar_path: str | None = None
     proposal_path: str | None = None
     review_path: str | None = None
-    approval_decision: Literal["pending", "approved", "rejected"] | None = None
+    approval_decision: (
+        Literal["pending", "approved", "rejected", "selected_cuts_approved", "all_rejected"]
+        | None
+    ) = None
     error_code: str | None = None
     render_id: str | None = Field(default=None, max_length=100)
 
@@ -181,7 +184,10 @@ class SessionState(CanonicalModel):
     sidecar_path: str | None = None
     proposal_path: str | None = None
     review_path: str | None = None
-    approval_decision: Literal["pending", "approved", "rejected"] | None = None
+    approval_decision: (
+        Literal["pending", "approved", "rejected", "selected_cuts_approved", "all_rejected"]
+        | None
+    ) = None
     review_opened_proposal_id: str | None = Field(default=None, max_length=100)
     render_attempt_id: str | None = Field(default=None, max_length=100)
     render_id: str | None = Field(default=None, max_length=100)
@@ -215,7 +221,7 @@ type ProjectEnsurer = Callable[[str, str, CancellationToken], str | None]
 type FinalizerRunner = Callable[[ManualFinalizerRequest], ManualFinalizationResult]
 type ProposalRunner = Callable[[Path, Path, str, Path], ProposalResult]
 type RenderRunner = Callable[
-    [Path, RenderRequest, threading.Event, StatusCallback | None], RenderExecution
+    [Path, RenderRequestModel, threading.Event, StatusCallback | None], RenderExecution
 ]
 
 
@@ -704,7 +710,7 @@ def native_dependencies(
 
     def render(
         proposal_path: Path,
-        request: RenderRequest,
+        request: RenderRequestModel,
         cancellation: threading.Event,
         callback: StatusCallback | None,
     ) -> RenderExecution:
@@ -971,7 +977,7 @@ class ProductRunner:
         self,
         state: SessionState,
         proposal_path: Path,
-        request: RenderRequest,
+        request: RenderRequestModel,
     ) -> None:
         """Execute one request and persist its terminal session binding."""
         assert self.dependencies.render is not None
@@ -1036,7 +1042,7 @@ class ProductRunner:
         self,
         state: SessionState,
         proposal_path: Path,
-        request: RenderRequest,
+        request: RenderRequestModel,
     ) -> None:
         """Claim and start exactly one background render worker."""
         thread = self._render_thread
@@ -1168,7 +1174,10 @@ class ProductRunner:
         sidecar_path: str | None = None,
         proposal_path: str | None = None,
         review_path: str | None = None,
-        approval_decision: Literal["pending", "approved", "rejected"] | None = None,
+        approval_decision: (
+            Literal["pending", "approved", "rejected", "selected_cuts_approved", "all_rejected"]
+            | None
+        ) = None,
         error_code: str | None = None,
         render_id: str | None = None,
         ready: bool = True,

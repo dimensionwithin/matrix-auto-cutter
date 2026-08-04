@@ -3,19 +3,25 @@
 from __future__ import annotations
 
 import argparse
+import json
 import msvcrt
 import os
+import secrets
 import sys
+import threading
 import webbrowser
 from collections.abc import Sequence
+from contextlib import suppress
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from matrix_auto_cutter.approval import (
     DecisionFailed,
     inspect_approval_state,
-    record_decision,
+    record_selected_decision,
 )
 from matrix_auto_cutter.cut_proposal import ProposalFailed, load_proposal
 from matrix_auto_cutter.product_runner import (
@@ -32,6 +38,12 @@ from matrix_auto_cutter.render import (
     target_path_for,
 )
 from matrix_auto_cutter.review import write_review
+from matrix_auto_cutter.selection import (
+    SelectionFailed,
+    SelectionReady,
+    ensure_selection,
+    update_selection,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,6 +233,154 @@ class LogViewerSingleInstance:
             os.close(descriptor)
 
 
+class ReviewSelectionBridge:
+    """Proposal-specific loopback bridge for the browser's selection controls."""
+
+    max_request_bytes = 64 * 1024
+
+    def __init__(self, proposal_path: Path) -> None:
+        """Prepare an unstarted, random-token bridge for exactly one proposal."""
+        self.proposal_path = proposal_path.resolve(strict=True)
+        self.token = secrets.token_urlsafe(32)
+        self._server: ThreadingHTTPServer | None = None
+        self._thread: threading.Thread | None = None
+
+    @property
+    def api_prefix(self) -> str:
+        """Return the only browser-visible endpoint prefix for this bridge."""
+        server = self._server
+        if server is None:
+            raise RuntimeError("Review bridge is not started")
+        port = server.server_address[1]
+        return f"http://127.0.0.1:{port}/{self.token}"
+
+    def _selection_payload(self) -> tuple[int, dict[str, object]]:
+        selected = ensure_selection(self.proposal_path)
+        if isinstance(selected, SelectionFailed):
+            return 409, {"message": selected.message_de}
+        selection = selected.selection
+        return 200, {
+            "selection_digest": selection.selection_digest,
+            "enabled_count": selection.enabled_count,
+            "selected_savings_ms": selection.selected_savings_ms,
+            "candidates": [
+                {"candidate_id": item.candidate_id, "enabled": item.enabled}
+                for item in selection.candidates
+            ],
+        }
+
+    def start(self) -> None:
+        """Bind only IPv4 loopback and start one daemon request thread."""
+        if self._server is not None:
+            return
+        bridge = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, _format: str, *_args: object) -> None:
+                """Avoid leaking browser request details into product logs."""
+
+            def _respond(self, status: int, payload: dict[str, object]) -> None:
+                data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Access-Control-Allow-Origin", "null")
+                self.send_header("Vary", "Origin")
+                self.end_headers()
+                self.wfile.write(data)
+
+            def _authorized_path(self, suffix: str) -> bool:
+                return urlsplit(self.path).path == f"/{bridge.token}{suffix}"
+
+            def do_OPTIONS(self) -> None:
+                """Permit only the one content type needed by local file review."""
+                if not self._authorized_path("/selection"):
+                    self._respond(404, {"message": "Unbekannter Review-Endpunkt."})
+                    return
+                self.send_response(204)
+                self.send_header("Access-Control-Allow-Origin", "null")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type")
+                self.send_header("Vary", "Origin")
+                self.end_headers()
+
+            def do_GET(self) -> None:
+                """Return only the canonical persisted selection state."""
+                if not self._authorized_path("/selection"):
+                    self._respond(404, {"message": "Unbekannter Review-Endpunkt."})
+                    return
+                status, payload = bridge._selection_payload()
+                self._respond(status, payload)
+
+            def do_POST(self) -> None:
+                """Persist an all-candidate boolean selection after strict validation."""
+                if not self._authorized_path("/selection"):
+                    self._respond(404, {"message": "Unbekannter Review-Endpunkt."})
+                    return
+                try:
+                    length = int(self.headers.get("Content-Length", "-1"))
+                except ValueError:
+                    length = -1
+                if length < 1 or length > bridge.max_request_bytes:
+                    self._respond(413, {"message": "Ungültige Request-Größe."})
+                    return
+                if self.headers.get_content_type() != "application/json":
+                    self._respond(415, {"message": "Content-Type muss application/json sein."})
+                    return
+                try:
+                    body = json.loads(self.rfile.read(length))
+                    if not isinstance(body, dict) or set(body) != {
+                        "enabled",
+                        "expected_selection_digest",
+                    }:
+                        raise ValueError("body")
+                    enabled = body.get("enabled")
+                    expected = body.get("expected_selection_digest")
+                    if (
+                        not isinstance(enabled, dict)
+                        or not all(
+                            isinstance(key, str) and isinstance(value, bool)
+                            for key, value in enabled.items()
+                        )
+                        or not isinstance(expected, str)
+                    ):
+                        raise ValueError("shape")
+                except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+                    self._respond(400, {"message": "Ungültige Auswahl-Anforderung."})
+                    return
+                result = update_selection(
+                    bridge.proposal_path,
+                    enabled,
+                    expected_selection_digest=expected,
+                )
+                if isinstance(result, SelectionFailed):
+                    _status, payload = bridge._selection_payload()
+                    payload["message"] = result.message_de
+                    self._respond(409, payload)
+                    return
+                status, payload = bridge._selection_payload()
+                self._respond(status, payload)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server = server
+        thread = threading.Thread(target=server.serve_forever, name="matrix-review-bridge")
+        thread.daemon = True
+        thread.start()
+        self._thread = thread
+
+    def close(self) -> None:
+        """Stop the listener before the owning review process exits."""
+        server = self._server
+        self._server = None
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+        thread = self._thread
+        self._thread = None
+        if thread is not None:
+            thread.join(timeout=2)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Lokale Matrix-Schnittvorschlag-Review")
     parser.add_argument("--proposal", type=Path, required=True)
@@ -237,9 +397,16 @@ def run_review(proposal_path: Path) -> int:
         messagebox.showerror("Matrix Auto Cutter", loaded.message_de)
         return 2
     proposal = loaded.proposal
+    persisted_selection = ensure_selection(proposal_path)
+    if isinstance(persisted_selection, SelectionFailed):
+        messagebox.showerror("Matrix Auto Cutter", persisted_selection.message_de)
+        return 2
+    bridge = ReviewSelectionBridge(proposal_path)
     try:
-        review_path = write_review(proposal_path)
+        bridge.start()
+        review_path = write_review(proposal_path, api_prefix=bridge.api_prefix)
     except (OSError, ValueError) as exc:
+        bridge.close()
         messagebox.showerror("Matrix Auto Cutter", f"Review konnte nicht erzeugt werden: {exc}")
         return 2
 
@@ -281,6 +448,42 @@ def run_review(proposal_path: Path) -> int:
     log_text: tk.Text | None = None
     log_viewer_guard: LogViewerSingleInstance | None = None
     log_content = ""
+    selected_index = 0
+    selection_var = tk.StringVar()
+    selection_summary_var = tk.StringVar()
+
+    def current_selection() -> SelectionReady | None:
+        current = ensure_selection(proposal_path)
+        return current if isinstance(current, SelectionReady) else None
+
+    def refresh_selection() -> None:
+        nonlocal persisted_selection
+        current = current_selection()
+        if current is None:
+            selection_var.set("Auswahl ist ungültig")
+            return
+        persisted_selection = current
+        if not proposal.proposed_cuts:
+            selection_var.set("Keine renderbaren Schnitte")
+            selection_summary_var.set("0 aktiviert · 0 deaktiviert")
+            return
+        item = proposal.proposed_cuts[selected_index]
+        enabled = current.selection.candidates[selected_index].enabled
+        selection_var.set(
+            f"Schnitt {selected_index + 1} von {len(proposal.proposed_cuts)} · "
+            f"{item.candidate_id}\n"
+            f"Start: {item.start_timecode} · Ende: {item.end_timecode} · "
+            f"Dauer: {item.duration_ms / 1000:.3f} s · "
+            f"Status: {'aktiviert' if enabled else 'deaktiviert'}"
+        )
+        selection_summary_var.set(
+            f"{current.selection.enabled_count} aktiviert · "
+            f"{len(current.selection.candidates) - current.selection.enabled_count} deaktiviert · "
+            f"Kürzung {current.selection.selected_savings_ms / 1000:.3f} s · "
+            f"Ausgabe "
+            f"{(proposal.source_duration_ms-current.selection.selected_savings_ms)/1000:.3f} s · "
+            f"Selection {current.selection.selection_digest[:16]}…"
+        )
 
     def refresh_runner_status() -> None:
         status = load_runner_status()
@@ -306,6 +509,8 @@ def run_review(proposal_path: Path) -> int:
             "pending": "NOCH KEINE ENTSCHEIDUNG",
             "approved": "FREIGEGEBEN" if gate.authorized else "FREIGEGEBEN (kein Schnitt)",
             "rejected": "ABGELEHNT",
+            "selected_cuts_approved": "AUSGEWÄHLTE SCHNITTE FREIGEGEBEN",
+            "all_rejected": "ALLE SCHNITTE ABGELEHNT",
         }
         decision_var.set(f"Status: {labels[gate.decision]} - {gate.reason}")
         view = review_render_view(proposal_path)
@@ -326,6 +531,7 @@ def run_review(proposal_path: Path) -> int:
         output_state = "normal" if view.output_enabled else "disabled"
         open_output_button.configure(state=output_state)
         open_folder_button.configure(state=output_state)
+        refresh_selection()
         refresh_runner_status()
 
     ttk.Label(frame, textvariable=decision_var, font=("Segoe UI", 11, "bold")).pack(
@@ -354,21 +560,87 @@ def run_review(proposal_path: Path) -> int:
             text.insert("end", f"  {rejection.reason}: {rejection.count}\n")
     text.configure(state="disabled")
 
+    selection_box = ttk.LabelFrame(frame, text="Selektive Cut-Auswahl", padding=8)
+    selection_box.pack(fill="x", pady=(8, 0))
+    ttk.Label(selection_box, textvariable=selection_var, justify="left").pack(anchor="w")
+    ttk.Label(selection_box, textvariable=selection_summary_var, justify="left").pack(anchor="w")
+
+    def update_enabled(value: bool | None = None, *, all_cuts: bool = False) -> None:
+        nonlocal selected_index
+        current = current_selection()
+        if current is None:
+            messagebox.showerror("Auswahl", "Auswahl konnte nicht gelesen werden.", parent=root)
+            return
+        enabled = {item.candidate_id: item.enabled for item in current.selection.candidates}
+        if all_cuts:
+            enabled = {candidate_id: bool(value) for candidate_id in enabled}
+        elif proposal.proposed_cuts:
+            candidate_id = proposal.proposed_cuts[selected_index].candidate_id
+            enabled[candidate_id] = not enabled[candidate_id] if value is None else value
+        result = update_selection(
+            proposal_path,
+            enabled,
+            expected_selection_digest=current.selection.selection_digest,
+        )
+        if isinstance(result, SelectionFailed):
+            messagebox.showerror("Auswahl", result.message_de, parent=root)
+            return
+        with suppress(OSError, ValueError):
+            write_review(proposal_path, api_prefix=bridge.api_prefix)
+        refresh_status()
+
+    def navigate(delta: int) -> None:
+        nonlocal selected_index
+        if proposal.proposed_cuts:
+            selected_index = min(max(0, selected_index + delta), len(proposal.proposed_cuts) - 1)
+        refresh_selection()
+
+    selection_buttons = ttk.Frame(selection_box)
+    selection_buttons.pack(fill="x", pady=(5, 0))
+    previous_button = ttk.Button(
+        selection_buttons, text="← Vorheriger Schnitt", command=lambda: navigate(-1)
+    )
+    previous_button.pack(side="left")
+    next_button = ttk.Button(
+        selection_buttons, text="Nächster Schnitt →", command=lambda: navigate(1)
+    )
+    next_button.pack(side="left", padx=5)
+    toggle_button = ttk.Button(
+        selection_buttons, text="Cut aktivieren/deaktivieren", command=update_enabled
+    )
+    toggle_button.pack(side="left")
+    all_enabled_button = ttk.Button(
+        selection_buttons,
+        text="Alle aktivieren",
+        command=lambda: update_enabled(True, all_cuts=True),
+    )
+    all_enabled_button.pack(side="left", padx=5)
+    all_disabled_button = ttk.Button(
+        selection_buttons,
+        text="Alle deaktivieren",
+        command=lambda: update_enabled(False, all_cuts=True),
+    )
+    all_disabled_button.pack(side="left")
+
     buttons = ttk.Frame(frame)
     buttons.pack(fill="x", pady=(12, 0))
 
     def open_html() -> None:
         webbrowser.open(review_path.as_uri(), new=2)
 
-    def decide(value: Literal["approved", "rejected"]) -> None:
-        label = "freigeben" if value == "approved" else "ablehnen"
+    def decide_selected(value: Literal["selected_cuts_approved", "all_rejected"]) -> None:
+        label = (
+            "ausgewählten Schnitte freigeben"
+            if value == "selected_cuts_approved"
+            else "alle Schnitte ablehnen"
+        )
         if not messagebox.askyesno(
             "Entscheidung bestätigen",
             f"Diesen vollständigen, digestgebundenen Vorschlag wirklich {label}?",
             parent=root,
         ):
             return
-        result = record_decision(proposal_path, value)
+        result = record_selected_decision(proposal_path, value)
         if isinstance(result, DecisionFailed):
             messagebox.showerror("Entscheidung fehlgeschlagen", result.message_de, parent=root)
             return
@@ -376,8 +648,8 @@ def run_review(proposal_path: Path) -> int:
         refresh_status()
         messagebox.showinfo(
             "Entscheidung gespeichert",
-            "Freigabe wurde atomar gespeichert."
-            if value == "approved"
+            "Ausgewählte Schnitte wurden atomar gespeichert und freigegeben."
+            if value == "selected_cuts_approved"
             else "Ablehnung wurde atomar gespeichert; sie autorisiert keinen Render.",
             parent=root,
         )
@@ -489,13 +761,13 @@ def run_review(proposal_path: Path) -> int:
     ttk.Button(buttons, text="Protokollordner öffnen", command=open_log_folder).pack(side="left")
     ttk.Button(
         buttons,
-        text="Vorschlag ablehnen",
-        command=lambda: decide("rejected"),
+        text="Alle Schnitte ablehnen",
+        command=lambda: decide_selected("all_rejected"),
     ).pack(side="right")
     ttk.Button(
         buttons,
-        text="Vorschlag freigeben",
-        command=lambda: decide("approved"),
+        text="Ausgewählte Schnitte freigeben",
+        command=lambda: decide_selected("selected_cuts_approved"),
     ).pack(side="right", padx=8)
     render_controls = ttk.Frame(frame)
     render_controls.pack(fill="x", pady=(10, 0))
@@ -523,6 +795,7 @@ def run_review(proposal_path: Path) -> int:
     refresh_status()
     root.after(750, poll_render)
     root.mainloop()
+    bridge.close()
     return 0
 
 

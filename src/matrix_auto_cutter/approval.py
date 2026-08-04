@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -11,7 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
-from pydantic import AwareDatetime, Field, ValidationError
+from pydantic import AwareDatetime, Field, ValidationError, model_validator
 
 from matrix_auto_cutter.cut_proposal import (
     CutProposal,
@@ -20,12 +21,20 @@ from matrix_auto_cutter.cut_proposal import (
     load_proposal,
 )
 from matrix_auto_cutter.models import CanonicalModel, Sha256
+from matrix_auto_cutter.selection import (
+    CutSelection,
+    SelectionFailed,
+    SelectionReady,
+    active_candidate_ids,
+    ensure_selection,
+    load_selection,
+)
 
 APPROVAL_FILE_NAME = "approval.json"
 APPROVAL_SCHEMA_VERSION: Literal["1.0"] = "1.0"
 MAX_APPROVAL_BYTES = 64 * 1024
 
-Decision = Literal["pending", "approved", "rejected"]
+Decision = Literal["pending", "approved", "rejected", "selected_cuts_approved", "all_rejected"]
 
 
 class ProposalApproval(CanonicalModel):
@@ -43,6 +52,48 @@ class ProposalApproval(CanonicalModel):
     decided_at: AwareDatetime
 
 
+class SelectiveProposalApproval(CanonicalModel):
+    """Approval of a canonical subset; legacy approvals remain separate."""
+
+    artifact_type: Literal["matrix_auto_cutter_selective_cut_approval"]
+    schema_version: Literal["1.0"]
+    proposal_id: str = Field(pattern=r"^proposal-[0-9a-f]{32}$")
+    proposal_sha256: Sha256
+    proposal_digest: Sha256
+    source_identity_digest: Sha256
+    recording_id: str = Field(min_length=1, max_length=100)
+    sidecar_sha256: Sha256
+    selection_sha256: Sha256
+    selection_digest: Sha256
+    active_candidate_ids: tuple[str, ...]
+    active_cut_count: int = Field(ge=0)
+    selected_savings_ms: int = Field(ge=0)
+    decision: Literal["selected_cuts_approved", "all_rejected"]
+    decided_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def selection_consistent(self) -> SelectiveProposalApproval:
+        """Require the complete, ordered active-ID binding to be internally sound."""
+        if (
+            len(self.active_candidate_ids) != len(set(self.active_candidate_ids))
+            or any(
+                not re.fullmatch(r"candidate-[0-9a-f]{24}", item)
+                for item in self.active_candidate_ids
+            )
+        ):
+            raise ValueError("active candidate IDs must be unique stable IDs")
+        if self.active_cut_count != len(self.active_candidate_ids):
+            raise ValueError("active cut count mismatch")
+        if self.decision == "selected_cuts_approved" and not self.active_cut_count:
+            raise ValueError("an empty selection cannot be approved")
+        if self.decision == "all_rejected" and self.active_cut_count:
+            raise ValueError("all rejected requires no active cuts")
+        return self
+
+
+type ApprovalArtifact = ProposalApproval | SelectiveProposalApproval
+
+
 @dataclass(frozen=True, slots=True)
 class ApprovalGateResult:
     """Fail-closed result consumed by every future rendering composition."""
@@ -51,14 +102,15 @@ class ApprovalGateResult:
     decision: Decision
     reason: str
     proposal: CutProposal | None = None
-    approval: ProposalApproval | None = None
+    approval: ApprovalArtifact | None = None
+    selection: CutSelection | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class DecisionWritten:
     """Successful atomic decision update."""
 
-    approval: ProposalApproval
+    approval: ApprovalArtifact
     approval_path: Path
 
 
@@ -80,7 +132,7 @@ def approval_path_for(proposal_path: Path) -> Path:
     return proposal_path.with_name(APPROVAL_FILE_NAME)
 
 
-def _approval_bytes(approval: ProposalApproval) -> bytes:
+def _approval_bytes(approval: ApprovalArtifact) -> bytes:
     return (approval.model_dump_json() + "\n").encode("utf-8")
 
 
@@ -125,12 +177,21 @@ def _atomic_write(path: Path, data: bytes, *, create_only: bool) -> bool:
             temporary.unlink(missing_ok=True)
 
 
-def _read_approval(path: Path) -> ProposalApproval | None:
+def _read_approval(path: Path) -> ApprovalArtifact | None:
     try:
         data = path.read_bytes()
         if not data or len(data) > MAX_APPROVAL_BYTES:
             return None
-        approval = ProposalApproval.model_validate_json(data)
+        import json
+
+        raw = json.loads(data)
+        artifact_type = raw.get("artifact_type") if isinstance(raw, dict) else None
+        if artifact_type == "matrix_auto_cutter_proposal_approval":
+            approval: ApprovalArtifact = ProposalApproval.model_validate_json(data)
+        elif artifact_type == "matrix_auto_cutter_selective_cut_approval":
+            approval = SelectiveProposalApproval.model_validate_json(data)
+        else:
+            return None
         if data != _approval_bytes(approval):
             return None
         return approval
@@ -200,7 +261,60 @@ def record_decision(
     return DecisionWritten(approval, target)
 
 
-def _matches(approval: ProposalApproval, ready: ProposalReady) -> bool:
+def record_selected_decision(
+    proposal_path: Path,
+    decision: Literal["selected_cuts_approved", "all_rejected"],
+    *,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+) -> DecisionResult:
+    """Approve exactly the durable selection, never a transient UI state."""
+    selection = ensure_selection(proposal_path, now=now)
+    if isinstance(selection, SelectionFailed):
+        return DecisionFailed(selection.code, selection.message_de)
+    loaded = load_proposal(proposal_path)
+    if isinstance(loaded, ProposalFailed):
+        return DecisionFailed(loaded.code, loaded.message_de)
+    if decision == "selected_cuts_approved" and selection.selection.enabled_count == 0:
+        return DecisionFailed(
+            "E_SELECTION_EMPTY", "Keine Schnitte ausgewählt; Render bleibt deaktiviert."
+        )
+    if decision == "all_rejected" and selection.selection.enabled_count != 0:
+        return DecisionFailed(
+            "E_SELECTION_NOT_EMPTY", "Alle Schnitte ablehnen erfordert eine leere Auswahl."
+        )
+    proposal = loaded.proposal
+    approval = SelectiveProposalApproval(
+        artifact_type="matrix_auto_cutter_selective_cut_approval",
+        schema_version="1.0",
+        proposal_id=proposal.proposal_id,
+        proposal_sha256=loaded.proposal_sha256,
+        proposal_digest=proposal.proposal_digest,
+        source_identity_digest=proposal.source_identity_digest,
+        recording_id=proposal.recording_id,
+        sidecar_sha256=proposal.sidecar_sha256,
+        selection_sha256=selection.selection_sha256,
+        selection_digest=selection.selection.selection_digest,
+        active_candidate_ids=active_candidate_ids(selection.selection),
+        active_cut_count=selection.selection.enabled_count,
+        selected_savings_ms=selection.selection.selected_savings_ms,
+        decision=decision,
+        decided_at=now(),
+    )
+    target = approval_path_for(proposal_path)
+    try:
+        _atomic_write(target, _approval_bytes(approval), create_only=False)
+    except OSError as exc:
+        return DecisionFailed(
+            "E_APPROVAL_WRITE", f"Approval konnte nicht atomar geschrieben werden: {exc}"
+        )
+    if _read_approval(target) != approval:
+        return DecisionFailed(
+            "E_APPROVAL_VERIFY", "Approval konnte nicht identisch erneut gelesen werden."
+        )
+    return DecisionWritten(approval, target)
+
+
+def _matches(approval: ApprovalArtifact, ready: ProposalReady) -> bool:
     proposal = ready.proposal
     return (
         approval.proposal_id == proposal.proposal_id
@@ -209,6 +323,18 @@ def _matches(approval: ProposalApproval, ready: ProposalReady) -> bool:
         and approval.source_identity_digest == proposal.source_identity_digest
         and approval.recording_id == proposal.recording_id
         and approval.sidecar_sha256 == proposal.sidecar_sha256
+    )
+
+
+def _selective_matches(
+    approval: SelectiveProposalApproval, selection: SelectionReady
+) -> bool:
+    return (
+        approval.selection_sha256 == selection.selection_sha256
+        and approval.selection_digest == selection.selection.selection_digest
+        and approval.active_candidate_ids == active_candidate_ids(selection.selection)
+        and approval.active_cut_count == selection.selection.enabled_count
+        and approval.selected_savings_ms == selection.selection.selected_savings_ms
     )
 
 
@@ -266,6 +392,18 @@ def _check_authorization(proposal_path: Path, *, verify_live_bindings: bool) -> 
             loaded.proposal,
             approval,
         )
+    selection: CutSelection | None = None
+    if isinstance(approval, SelectiveProposalApproval):
+        selected = load_selection(proposal_path)
+        if isinstance(selected, SelectionFailed) or not _selective_matches(approval, selected):
+            return ApprovalGateResult(
+                False,
+                approval.decision,
+                "Auswahl geändert oder ungültig - erneute Freigabe erforderlich.",
+                loaded.proposal,
+                approval,
+            )
+        selection = selected.selection
     if verify_live_bindings:
         live_failure = _live_bindings_match(loaded)
         if live_failure is not None:
@@ -276,7 +414,7 @@ def _check_authorization(proposal_path: Path, *, verify_live_bindings: bool) -> 
                 loaded.proposal,
                 approval,
             )
-    if approval.decision == "rejected":
+    if approval.decision in {"rejected", "all_rejected"}:
         return ApprovalGateResult(
             False,
             "rejected",
@@ -302,10 +440,15 @@ def _check_authorization(proposal_path: Path, *, verify_live_bindings: bool) -> 
         )
     return ApprovalGateResult(
         True,
-        "approved",
-        "Exakt dieses Proposal ist ausdrücklich freigegeben.",
+        approval.decision,
+        (
+            "Exakt diese Auswahl ist ausdrücklich freigegeben."
+            if isinstance(approval, SelectiveProposalApproval)
+            else "Exakt dieses Proposal ist ausdrücklich freigegeben."
+        ),
         loaded.proposal,
         approval,
+        selection,
     )
 
 

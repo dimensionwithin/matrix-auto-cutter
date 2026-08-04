@@ -21,7 +21,11 @@ from uuid import UUID, uuid4
 
 from pydantic import AwareDatetime, Field, ValidationError, model_validator
 
-from matrix_auto_cutter.approval import ProposalApproval, check_render_authorization
+from matrix_auto_cutter.approval import (
+    ApprovalArtifact,
+    SelectiveProposalApproval,
+    check_render_authorization,
+)
 from matrix_auto_cutter.cut_proposal import (
     CutProposal,
     FfmpegIdentity,
@@ -107,6 +111,19 @@ class ApprovalBinding(CanonicalModel):
     decided_at: AwareDatetime
 
 
+class SelectiveApprovalBinding(ApprovalBinding):
+    """Additional immutable binding emitted only for selective approvals."""
+
+    selection_sha256: Sha256
+    selection_digest: Sha256
+    active_candidate_ids: tuple[str, ...]
+    active_cut_count: int = Field(ge=1)
+    selected_savings_ms: int = Field(ge=1)
+
+
+type ApprovalBindingModel = ApprovalBinding | SelectiveApprovalBinding
+
+
 class RenderRequest(CanonicalModel):
     """One deliberate UI request, not itself an authorization."""
 
@@ -123,6 +140,29 @@ class RenderRequest(CanonicalModel):
     approval_decided_at: AwareDatetime
     target_path: str = Field(min_length=1)
     requested_at: AwareDatetime
+
+
+class RenderRequestV11(CanonicalModel):
+    """Selective request evidence; 1.0 requests retain their exact bytes."""
+
+    artifact_type: Literal["matrix_auto_cutter_render_request"]
+    schema_version: Literal["1.1"]
+    attempt_id: str = Field(pattern=r"^render-attempt-[0-9a-f]{32}$")
+    recording_id: str
+    proposal_id: str
+    proposal_digest: Sha256
+    proposal_sha256: Sha256
+    source_identity_digest: Sha256
+    sidecar_sha256: Sha256
+    approval_sha256: Sha256
+    approval_decided_at: AwareDatetime
+    target_path: str = Field(min_length=1)
+    requested_at: AwareDatetime
+    selection_sha256: Sha256
+    selection_digest: Sha256
+    active_candidate_ids: tuple[str, ...]
+    active_cut_count: int = Field(ge=1)
+    selected_savings_ms: int = Field(ge=1)
 
 
 class RenderStatus(CanonicalModel):
@@ -198,7 +238,7 @@ class RenderPlan(CanonicalModel):
     proposal_digest: Sha256
     proposal_sha256: Sha256
     sidecar_sha256: Sha256
-    approval: ApprovalBinding
+    approval: ApprovalBindingModel
     keep_segments: tuple[KeepSegment, ...]
     source_frame_count: int = Field(ge=1)
     cut_frame_count: int = Field(ge=1)
@@ -315,7 +355,7 @@ class RenderResultV11(CanonicalModel):
 class RenderAccepted:
     """A deliberate request was written atomically."""
 
-    request: RenderRequest
+    request: RenderRequestModel
     request_path: Path
 
 
@@ -340,6 +380,7 @@ class RenderSucceeded:
     reused: bool = False
 
 
+type RenderRequestModel = RenderRequest | RenderRequestV11
 type RequestResult = RenderAccepted | RenderFailed
 type RenderExecution = RenderSucceeded | RenderFailed
 type RenderStatusModel = RenderStatus | RenderStatusV11
@@ -691,10 +732,10 @@ def _load_model(path: Path, model_type: type[CanonicalModel]) -> CanonicalModel 
         return None
 
 
-def load_render_request(proposal_path: Path) -> RenderRequest | None:
+def load_render_request(proposal_path: Path) -> RenderRequestModel | None:
     """Strictly load the current deliberate request."""
-    loaded = _load_model(render_request_path(proposal_path), RenderRequest)
-    return loaded if isinstance(loaded, RenderRequest) else None
+    loaded = _load_versioned(render_request_path(proposal_path), RenderRequest, RenderRequestV11)
+    return loaded if isinstance(loaded, RenderRequest | RenderRequestV11) else None
 
 
 def _load_versioned(
@@ -756,21 +797,43 @@ def submit_render_request(
     identifier = uuid_factory()
     if identifier.version != 4:
         return RenderFailed("E_RENDER_ATTEMPT_ID", "Render-Attempt-ID muss UUIDv4 sein.")
-    request = RenderRequest(
-        artifact_type="matrix_auto_cutter_render_request",
-        schema_version=RENDER_SCHEMA_VERSION,
-        attempt_id=f"render-attempt-{identifier.hex}",
-        recording_id=proposal.recording_id,
-        proposal_id=proposal.proposal_id,
-        proposal_digest=proposal.proposal_digest,
-        proposal_sha256=loaded.proposal_sha256,
-        source_identity_digest=proposal.source_identity_digest,
-        sidecar_sha256=proposal.sidecar_sha256,
-        approval_sha256=_sha256(proposal_path.with_name("approval.json")),
-        approval_decided_at=gate.approval.decided_at,
-        target_path=str(target),
-        requested_at=now(),
-    )
+    if isinstance(gate.approval, SelectiveProposalApproval) and gate.selection is not None:
+        request: RenderRequestModel = RenderRequestV11(
+            artifact_type="matrix_auto_cutter_render_request",
+            schema_version="1.1",
+            attempt_id=f"render-attempt-{identifier.hex}",
+            recording_id=proposal.recording_id,
+            proposal_id=proposal.proposal_id,
+            proposal_digest=proposal.proposal_digest,
+            proposal_sha256=loaded.proposal_sha256,
+            source_identity_digest=proposal.source_identity_digest,
+            sidecar_sha256=proposal.sidecar_sha256,
+            approval_sha256=_sha256(proposal_path.with_name("approval.json")),
+            approval_decided_at=gate.approval.decided_at,
+            target_path=str(target),
+            requested_at=now(),
+            selection_sha256=gate.approval.selection_sha256,
+            selection_digest=gate.approval.selection_digest,
+            active_candidate_ids=gate.approval.active_candidate_ids,
+            active_cut_count=gate.approval.active_cut_count,
+            selected_savings_ms=gate.approval.selected_savings_ms,
+        )
+    else:
+        request = RenderRequest(
+            artifact_type="matrix_auto_cutter_render_request",
+            schema_version=RENDER_SCHEMA_VERSION,
+            attempt_id=f"render-attempt-{identifier.hex}",
+            recording_id=proposal.recording_id,
+            proposal_id=proposal.proposal_id,
+            proposal_digest=proposal.proposal_digest,
+            proposal_sha256=loaded.proposal_sha256,
+            source_identity_digest=proposal.source_identity_digest,
+            sidecar_sha256=proposal.sidecar_sha256,
+            approval_sha256=_sha256(proposal_path.with_name("approval.json")),
+            approval_decided_at=gate.approval.decided_at,
+            target_path=str(target),
+            requested_at=now(),
+        )
     path = render_request_path(proposal_path)
     _atomic_write(path, _canonical_bytes(request), replace=True)
     observed = load_render_request(proposal_path)
@@ -781,14 +844,23 @@ def submit_render_request(
     return RenderAccepted(request, path)
 
 
-def build_keep_segments(proposal: CutProposal) -> tuple[KeepSegment, ...]:
+def build_keep_segments(
+    proposal: CutProposal, active_candidate_ids: Sequence[str] | None = None
+) -> tuple[KeepSegment, ...]:
     """Return the exact complement of validated sorted half-open cuts."""
     if proposal.status != "ready" or not proposal.proposed_cuts:
         raise ValueError("approved proposal requires at least one cut")
     keeps: list[KeepSegment] = []
     cursor = 0
     minimum = max(1, (proposal.analysis_parameters.minimum_keep_island_ms * 60 + 999) // 1000)
+    active = set(active_candidate_ids) if active_candidate_ids is not None else None
+    if active is not None and (
+        not active or not active.issubset({cut.candidate_id for cut in proposal.proposed_cuts})
+    ):
+        raise ValueError("active cut selection is empty or contains an unknown candidate")
     for cut in proposal.proposed_cuts:
+        if active is not None and cut.candidate_id not in active:
+            continue
         if cut.start_frame < cursor or cut.end_frame > proposal.source_frame_count:
             raise ValueError("cuts must be sorted, disjoint, and in bounds")
         if cut.start_frame > cursor:
@@ -1109,7 +1181,24 @@ def _select_encoder(
     return None
 
 
-def _approval_binding(approval: ProposalApproval, approval_path: Path) -> ApprovalBinding:
+def _approval_binding(approval: ApprovalArtifact, approval_path: Path) -> ApprovalBindingModel:
+    if isinstance(approval, SelectiveProposalApproval):
+        return SelectiveApprovalBinding(
+            proposal_id=approval.proposal_id,
+            proposal_sha256=approval.proposal_sha256,
+            proposal_digest=approval.proposal_digest,
+            source_identity_digest=approval.source_identity_digest,
+            recording_id=approval.recording_id,
+            sidecar_sha256=approval.sidecar_sha256,
+            decision="approved",
+            approval_sha256=_sha256(approval_path),
+            decided_at=approval.decided_at,
+            selection_sha256=approval.selection_sha256,
+            selection_digest=approval.selection_digest,
+            active_candidate_ids=approval.active_candidate_ids,
+            active_cut_count=approval.active_cut_count,
+            selected_savings_ms=approval.selected_savings_ms,
+        )
     return ApprovalBinding(
         proposal_id=approval.proposal_id,
         proposal_sha256=approval.proposal_sha256,
@@ -1124,13 +1213,13 @@ def _approval_binding(approval: ProposalApproval, approval_path: Path) -> Approv
 
 
 def _request_matches(
-    request: RenderRequest,
+    request: RenderRequestModel,
     proposal: CutProposal,
     proposal_sha256: str,
-    approval: ProposalApproval,
+    approval: ApprovalArtifact,
     approval_path: Path,
 ) -> bool:
-    return (
+    common = (
         request.recording_id == proposal.recording_id
         and request.proposal_id == proposal.proposal_id
         and request.proposal_digest == proposal.proposal_digest
@@ -1140,6 +1229,18 @@ def _request_matches(
         and request.approval_sha256 == _sha256(approval_path)
         and request.approval_decided_at == approval.decided_at
     )
+    if not common:
+        return False
+    if isinstance(approval, SelectiveProposalApproval):
+        return (
+            isinstance(request, RenderRequestV11)
+            and request.selection_sha256 == approval.selection_sha256
+            and request.selection_digest == approval.selection_digest
+            and request.active_candidate_ids == approval.active_candidate_ids
+            and request.active_cut_count == approval.active_cut_count
+            and request.selected_savings_ms == approval.selected_savings_ms
+        )
+    return not isinstance(request, RenderRequestV11)
 
 
 def _render_arguments(
@@ -1215,7 +1316,7 @@ def _status(
     message: str,
     now: Callable[[], datetime],
     *,
-    request: RenderRequest | None = None,
+    request: RenderRequestModel | None = None,
     render_id: str | None = None,
     result_path: Path | None = None,
     error_code: str | None = None,
@@ -1278,7 +1379,7 @@ def _publish_status(
 def _failure_result(
     *,
     render_id: str,
-    request: RenderRequest,
+    request: RenderRequestModel,
     started_at: datetime,
     ended_at: datetime,
     target: Path,
@@ -1332,7 +1433,7 @@ def _persist_failure(
     proposal_path: Path,
     attempt_directory: Path,
     proposal: CutProposal,
-    request: RenderRequest,
+    request: RenderRequestModel,
     result: RenderResult | RenderResultV11,
     now: Callable[[], datetime],
     callback: StatusCallback | None,
@@ -1379,7 +1480,7 @@ def _write_attempt_evidence(
     directory: Path,
     *,
     render_id: str,
-    request: RenderRequest,
+    request: RenderRequestModel,
     preferred: Literal["h264_nvenc", "libx264"],
     attempts: Sequence[EncoderAttempt],
     fallback_reason: str | None = None,
@@ -1408,7 +1509,7 @@ def _format_seconds(value: float | None) -> str:
 
 
 def _find_reusable_success(
-    proposal_path: Path, request: RenderRequest
+    proposal_path: Path, request: RenderRequestModel
 ) -> RenderSucceeded | RenderFailed | None:
     renders = proposal_path.parent / "renders"
     if not renders.is_dir():
@@ -1458,7 +1559,7 @@ def _find_reusable_success(
 
 def execute_approved_render(
     proposal_path: Path,
-    request: RenderRequest,
+    request: RenderRequestModel,
     ffmpeg_path: Path,
     ffprobe_path: Path,
     *,
@@ -1560,7 +1661,14 @@ def execute_approved_render(
         )
 
     try:
-        keep_segments = build_keep_segments(proposal)
+        keep_segments = build_keep_segments(
+            proposal,
+            (
+                initial_gate.approval.active_candidate_ids
+                if isinstance(initial_gate.approval, SelectiveProposalApproval)
+                else None
+            ),
+        )
     except ValueError as exc:
         result = _failure_result(
             render_id=render_id,
@@ -1668,7 +1776,17 @@ def execute_approved_render(
     expected_output_ms = round(output_frames * 1000 / 60)
     expected_cut_ms = round(cut_frames * 1000 / 60)
     gate = check_render_authorization(proposal_path)
-    if not gate.authorized or gate.approval is None:
+    if (
+        not gate.authorized
+        or gate.approval is None
+        or not _request_matches(
+            request,
+            proposal,
+            loaded.proposal_sha256,
+            gate.approval,
+            proposal_path.with_name("approval.json"),
+        )
+    ):
         result = _failure_result(
             render_id=render_id,
             request=request,

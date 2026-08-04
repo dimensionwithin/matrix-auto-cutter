@@ -5,7 +5,9 @@ import json
 from copy import deepcopy
 from datetime import UTC, datetime
 from decimal import Decimal
+from http.client import HTTPConnection
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -15,6 +17,7 @@ from matrix_auto_cutter.approval import (
     check_render_authorization,
     ensure_pending_approval,
     record_decision,
+    record_selected_decision,
 )
 from matrix_auto_cutter.cut_proposal import (
     AnalysisParameters,
@@ -33,6 +36,8 @@ from matrix_auto_cutter.models import (
     SourceIdentity,
 )
 from matrix_auto_cutter.review import write_review
+from matrix_auto_cutter.review_app import ReviewSelectionBridge
+from matrix_auto_cutter.selection import SelectionReady, ensure_selection, update_selection
 
 NOW = datetime(2026, 8, 3, 12, tzinfo=UTC)
 SILENCE_OUTPUT = (
@@ -381,3 +386,190 @@ def test_review_contains_escaped_details_navigation_and_safety(
     assert "recording &amp; review.mp4" in text
 
     assert "recording & review.mp4" not in text
+    assert "async function hydrate()" in text
+    assert "fetch(`${apiPrefix}/selection`)" in text
+
+
+def test_selection_is_canonical_and_invalidates_selective_approval(
+    tmp_path: Path, raw_sidecar: dict[str, object]
+) -> None:
+    ready = _generate(tmp_path, raw_sidecar)
+    selection = ensure_selection(ready.proposal_path, now=lambda: NOW)
+    assert isinstance(selection, SelectionReady)
+    assert selection.selection.enabled_count == ready.proposal.total_proposed_cuts
+    first = selection.selection.candidates[0]
+    changed = update_selection(
+        ready.proposal_path,
+        {first.candidate_id: False},
+        expected_selection_digest=selection.selection.selection_digest,
+        now=lambda: NOW,
+    )
+    assert isinstance(changed, SelectionReady)
+    assert changed.selection.enabled_count == 0
+    assert isinstance(
+        record_selected_decision(ready.proposal_path, "all_rejected", now=lambda: NOW),
+        DecisionWritten,
+    )
+    assert check_render_authorization(ready.proposal_path).authorized is False
+    restored = update_selection(
+        ready.proposal_path,
+        {first.candidate_id: True},
+        expected_selection_digest=changed.selection.selection_digest,
+        now=lambda: NOW,
+    )
+    assert isinstance(restored, SelectionReady)
+    approval = record_selected_decision(
+        ready.proposal_path, "selected_cuts_approved", now=lambda: NOW
+    )
+    assert isinstance(approval, DecisionWritten)
+    assert check_render_authorization(ready.proposal_path).authorized is True
+    changed_again = update_selection(
+        ready.proposal_path,
+        {first.candidate_id: False},
+        expected_selection_digest=restored.selection.selection_digest,
+        now=lambda: NOW,
+    )
+    assert isinstance(changed_again, SelectionReady)
+    assert check_render_authorization(ready.proposal_path).authorized is False
+
+
+def _bridge_request(
+    url: str,
+    *,
+    method: str = "GET",
+    body: bytes | None = None,
+    content_type: str | None = None,
+) -> tuple[int, dict[str, object]]:
+    headers = {"Content-Type": content_type} if content_type is not None else {}
+    parsed = urlsplit(url)
+    connection = HTTPConnection(parsed.hostname, parsed.port, timeout=3)
+    try:
+        connection.request(method, parsed.path, body=body, headers=headers)
+        response = connection.getresponse()
+        data = response.read()
+        payload = (
+            json.loads(data)
+            if response.headers.get_content_type() == "application/json"
+            else {}
+        )
+        return response.status, payload
+    finally:
+        connection.close()
+
+
+def test_review_selection_bridge_rejects_untrusted_requests_and_persists_canonical_state(
+    tmp_path: Path, raw_sidecar: dict[str, object]
+) -> None:
+    ready = _generate(tmp_path, raw_sidecar)
+    bridge = ReviewSelectionBridge(ready.proposal_path)
+    bridge.start()
+    endpoint = f"{bridge.api_prefix}/selection"
+    try:
+        assert bridge._server is not None
+        host, port = bridge._server.server_address[:2]
+        assert host == "127.0.0.1"
+        assert isinstance(port, int) and port > 0
+
+        status, initial = _bridge_request(endpoint)
+        assert status == 200
+        assert bridge.token not in json.dumps(initial)
+        digest = initial["selection_digest"]
+        assert isinstance(digest, str)
+        candidates = initial["candidates"]
+        assert isinstance(candidates, list)
+        enabled = {
+            item["candidate_id"]: item["enabled"]
+            for item in candidates
+            if isinstance(item, dict)
+            and isinstance(item.get("candidate_id"), str)
+            and isinstance(item.get("enabled"), bool)
+        }
+        assert enabled
+
+        assert _bridge_request(f"{bridge.api_prefix}/unknown")[0] == 404
+        assert _bridge_request(endpoint.replace(bridge.token, "wrong-token"))[0] == 404
+        assert _bridge_request(endpoint, method="PUT")[0] == 501
+        assert _bridge_request(
+            endpoint, method="POST", body=b"{}", content_type="text/plain"
+        )[0] == 415
+        assert _bridge_request(
+            endpoint, method="POST", body=b"{", content_type="application/json"
+        )[0] == 400
+        assert _bridge_request(
+            endpoint,
+            method="POST",
+            body=b"x" * (bridge.max_request_bytes + 1),
+            content_type="application/json",
+        )[0] == 413
+
+        missing_expected = json.dumps({"enabled": enabled}).encode()
+        assert _bridge_request(
+            endpoint,
+            method="POST",
+            body=missing_expected,
+            content_type="application/json",
+        )[0] == 400
+        extra_path = json.dumps(
+            {
+                "enabled": enabled,
+                "expected_selection_digest": digest,
+                "path": "C:/untrusted.json",
+            }
+        ).encode()
+        assert _bridge_request(
+            endpoint,
+            method="POST",
+            body=extra_path,
+            content_type="application/json",
+        )[0] == 400
+
+        candidate_id = next(iter(enabled))
+        unknown = enabled | {"candidate-000000000000000000000000": True}
+        invalid_candidate = json.dumps(
+            {"enabled": unknown, "expected_selection_digest": digest}
+        ).encode()
+        status, current = _bridge_request(
+            endpoint,
+            method="POST",
+            body=invalid_candidate,
+            content_type="application/json",
+        )
+        assert status == 409
+        assert current["selection_digest"] == digest
+
+        changed_enabled = enabled | {candidate_id: False}
+        changed_request = json.dumps(
+            {"enabled": changed_enabled, "expected_selection_digest": digest}
+        ).encode()
+        status, persisted = _bridge_request(
+            endpoint,
+            method="POST",
+            body=changed_request,
+            content_type="application/json",
+        )
+        assert status == 200
+        persisted_digest = persisted["selection_digest"]
+        assert isinstance(persisted_digest, str) and persisted_digest != digest
+        assert any(
+            item["candidate_id"] == candidate_id and item["enabled"] is False
+            for item in persisted["candidates"]
+            if isinstance(item, dict)
+        )
+
+        stale_request = json.dumps(
+            {"enabled": enabled, "expected_selection_digest": digest}
+        ).encode()
+        status, stale = _bridge_request(
+            endpoint,
+            method="POST",
+            body=stale_request,
+            content_type="application/json",
+        )
+        assert status == 409
+        assert stale["selection_digest"] == persisted_digest
+        assert ensure_selection(ready.proposal_path).selection.selection_digest == persisted_digest
+    finally:
+        bridge.close()
+
+    with pytest.raises(OSError):
+        _bridge_request(endpoint)

@@ -12,7 +12,12 @@ from uuid import UUID
 
 import pytest
 
-from matrix_auto_cutter.approval import check_render_authorization, record_decision
+from matrix_auto_cutter.approval import (
+    DecisionWritten,
+    check_render_authorization,
+    record_decision,
+    record_selected_decision,
+)
 from matrix_auto_cutter.cut_proposal import (
     FfmpegProcessResult,
     ProposalReady,
@@ -23,6 +28,7 @@ from matrix_auto_cutter.render import (
     ProcessResult,
     RenderAccepted,
     RenderFailed,
+    RenderRequestV11,
     RenderResult,
     RenderResultV11,
     RenderStatus,
@@ -37,6 +43,7 @@ from matrix_auto_cutter.render import (
     write_render_status,
 )
 from matrix_auto_cutter.review_app import review_render_view
+from matrix_auto_cutter.selection import SelectionReady, ensure_selection, update_selection
 
 NOW = datetime(2026, 8, 3, 18, tzinfo=UTC)
 SESSION = "835fc47a-7e8c-4700-9f6f-8f7e23ac740c"
@@ -135,6 +142,103 @@ def _proposal(tmp_path: Path, raw_sidecar: dict[str, object]) -> tuple[Path, Pat
     )
     assert isinstance(result, ProposalReady)
     return source, sidecar, result
+
+
+class ThreeSilenceAnalysis(SilenceAnalysis):
+    """Provide three canonical test cuts while the render itself uses real FFmpeg."""
+
+    def __call__(self, arguments: object, timeout: int) -> FfmpegProcessResult:
+        values = tuple(arguments)  # type: ignore[arg-type]
+        if "-version" in values:
+            return super().__call__(arguments, timeout)
+        return FfmpegProcessResult(
+            0,
+            b"silence_start: 2.0\n"
+            b"silence_end: 4.0 | silence_duration: 2.0\n"
+            b"silence_start: 6.0\n"
+            b"silence_end: 8.0 | silence_duration: 2.0\n"
+            b"silence_start: 10.0\n"
+            b"silence_end: 12.0 | silence_duration: 2.0\n",
+        )
+
+
+def _selective_proposal(
+    tmp_path: Path, raw_sidecar: dict[str, object]
+) -> tuple[Path, ProposalReady]:
+    ffmpeg = _binary("ffmpeg")
+    source = tmp_path / "selective-signals.mp4"
+    colors = ("red", "green", "blue", "yellow", "magenta", "cyan", "white")
+    arguments = [str(ffmpeg), "-hide_banner", "-loglevel", "error"]
+    for color in colors[:-1]:
+        arguments.extend(
+            ["-f", "lavfi", "-i", f"color=c={color}:size=160x90:rate=60:duration=2"]
+        )
+    arguments.extend(
+        [
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=white:size=160x90:rate=60:duration=4",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=880:sample_rate=48000:duration=16",
+            "-filter_complex",
+            "[0:v][1:v][2:v][3:v][4:v][5:v][6:v]concat=n=7:v=1:a=0[vout]",
+            "-map",
+            "[vout]",
+            "-map",
+            "7:a:0",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(source),
+        ]
+    )
+    subprocess.run(arguments, check=True, shell=False, timeout=60)
+    raw = deepcopy(raw_sidecar)
+    source_data = raw["source"]
+    assert isinstance(source_data, dict)
+    source_data.update(
+        {
+            "file_name": source.name,
+            "size_bytes": source.stat().st_size,
+            "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            "duration_ms": 16_000,
+            "video_frame_count": 960,
+        }
+    )
+    clock = raw["clock"]
+    assert isinstance(clock, dict)
+    clock["counter_end"] = 960
+    events = raw["events"]
+    assert isinstance(events, list)
+    stop = events[-1]
+    assert isinstance(stop, dict)
+    stop["mapped_source_frame"] = 960
+    sample = stop["clock_sample"]
+    assert isinstance(sample, dict)
+    sample["output_frame_count"] = 960
+    sample["monotonic_ns"] = 960 * 16_666_667
+    raw["recording_session_id"] = SESSION
+    sidecar = source.with_suffix(".obs-events.json")
+    sidecar.write_text(json.dumps(raw), encoding="utf-8")
+    result = generate_proposal(
+        source,
+        sidecar,
+        SESSION,
+        tmp_path / "artifacts",
+        ffmpeg,
+        process_runner=ThreeSilenceAnalysis(),
+        now=lambda: NOW,
+    )
+    assert isinstance(result, ProposalReady)
+    assert result.proposal.total_proposed_cuts == 3
+    return source, result
 
 
 def test_gate_rechecks_source_sidecar_and_separate_request_action(
@@ -263,6 +367,79 @@ def test_real_render_verifies_publishes_once_and_preserves_source(
     )
     assert isinstance(reused, RenderSucceeded) and reused.reused is True
     assert len(list((ready.proposal_path.parent / "renders").glob("*/render-plan.json"))) == 1
+
+
+def test_real_selective_render_retains_disabled_candidate_signal(
+    tmp_path: Path, raw_sidecar: dict[str, object]
+) -> None:
+    source, ready = _selective_proposal(tmp_path, raw_sidecar)
+    source_digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    selected = ensure_selection(ready.proposal_path, now=lambda: NOW)
+    assert isinstance(selected, SelectionReady)
+    candidate_ids = tuple(item.candidate_id for item in selected.selection.candidates)
+    enabled = {candidate_id: candidate_id != candidate_ids[1] for candidate_id in candidate_ids}
+    changed = update_selection(
+        ready.proposal_path,
+        enabled,
+        expected_selection_digest=selected.selection.selection_digest,
+        now=lambda: NOW,
+    )
+    assert isinstance(changed, SelectionReady)
+    approval = record_selected_decision(
+        ready.proposal_path, "selected_cuts_approved", now=lambda: NOW
+    )
+    assert isinstance(approval, DecisionWritten)
+    accepted = submit_render_request(
+        ready.proposal_path,
+        tmp_path / "rendered",
+        now=lambda: NOW,
+        uuid_factory=lambda: ATTEMPT_UUID,
+    )
+    assert isinstance(accepted, RenderAccepted)
+    assert isinstance(accepted.request, RenderRequestV11)
+    outcome = execute_approved_render(
+        ready.proposal_path,
+        accepted.request,
+        _binary("ffmpeg"),
+        _binary("ffprobe"),
+        now=lambda: NOW,
+        uuid_factory=lambda: RENDER_UUID,
+    )
+    assert isinstance(outcome, RenderSucceeded)
+    assert accepted.request.active_candidate_ids == (candidate_ids[0], candidate_ids[2])
+    assert outcome.plan.cut_frame_count == 156
+    assert outcome.plan.expected_output_duration_ms == 13_400
+    assert outcome.result.actual_duration_ms == pytest.approx(13_400, abs=80)
+    target = Path(outcome.result.target_path)
+    assert target.is_file() and target.stat().st_size > 0
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == source_digest
+
+    sample = subprocess.run(
+        [
+            str(_binary("ffmpeg")),
+            "-v",
+            "error",
+            "-ss",
+            "5.0",
+            "-i",
+            str(target),
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale=1:1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-",
+        ],
+        check=True,
+        capture_output=True,
+        shell=False,
+        timeout=60,
+    ).stdout
+    red, green, blue = sample[:3]
+    assert red > 180 and green > 180 and blue < 80
 
 
 def test_cancelled_process_cannot_publish(tmp_path: Path, raw_sidecar: dict[str, object]) -> None:
