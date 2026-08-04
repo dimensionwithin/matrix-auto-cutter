@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
@@ -34,6 +35,8 @@ RENDER_REQUEST_FILE_NAME = "render-request.json"
 RENDER_STATUS_FILE_NAME = "render-status.json"
 RENDER_PLAN_FILE_NAME = "render-plan.json"
 RENDER_RESULT_FILE_NAME = "render-result.json"
+RENDER_ATTEMPTS_FILE_NAME = "render-attempts.json"
+NVENC_CAPABILITY_FILE_NAME = "nvenc-capability.json"
 RENDER_SCHEMA_VERSION: Literal["1.0"] = "1.0"
 DEFAULT_RENDER_DIRECTORY = Path(r"F:\MatrixMarketAutoEdit\Rendered")
 MAX_JSON_BYTES = 16 * 1024 * 1024
@@ -139,6 +142,48 @@ class RenderStatus(CanonicalModel):
     error_code: str | None = None
 
 
+class RenderStatusV11(CanonicalModel):
+    """Extended polling status; kept separate so canonical 1.0 bytes remain valid."""
+
+    artifact_type: Literal["matrix_auto_cutter_render_status"]
+    schema_version: Literal["1.1"]
+    proposal_id: str
+    state: RenderState
+    message_de: str = Field(min_length=1, max_length=2000)
+    updated_at: AwareDatetime
+    attempt_id: str | None = None
+    render_id: str | None = None
+    target_path: str | None = None
+    result_path: str | None = None
+    progress_percent: int | None = Field(default=None, ge=0, le=100)
+    error_code: str | None = None
+    phase: RenderState
+    preferred_encoder: Literal["h264_nvenc", "libx264"] | None = None
+    active_encoder: Literal["h264_nvenc", "libx264"] | None = None
+    final_encoder: Literal["h264_nvenc", "libx264"] | None = None
+    encoder_attempt: int | None = Field(default=None, ge=1, le=2)
+    max_encoder_attempts: Literal[2] = 2
+    fallback_used: bool = False
+    fallback_reason: str | None = Field(default=None, max_length=4000)
+    ffmpeg_output_time_us: int | None = Field(default=None, ge=0)
+    elapsed_total_ms: int | None = Field(default=None, ge=0)
+    elapsed_attempt_ms: int | None = Field(default=None, ge=0)
+    eta_ms: int | None = Field(default=None, ge=0)
+    speed_x: float | None = Field(default=None, ge=0)
+    frame: int | None = Field(default=None, ge=0)
+    total_size_bytes: int | None = Field(default=None, ge=0)
+    verification_status: Literal["not_run", "running", "failed", "passed"] = "not_run"
+
+    @model_validator(mode="after")
+    def progress_consistent(self) -> RenderStatusV11:
+        """Keep final completion distinct from an in-progress FFmpeg measurement."""
+        if self.state == "render_running" and self.progress_percent == 100:
+            raise ValueError("encoding progress may not be 100")
+        if self.fallback_used != (self.fallback_reason is not None):
+            raise ValueError("fallback reason must match fallback flag")
+        return self
+
+
 class RenderPlan(CanonicalModel):
     """Immutable, exact composition inputs and FFmpeg invocation."""
 
@@ -213,6 +258,59 @@ class RenderResult(CanonicalModel):
     message_de: str = Field(min_length=1, max_length=2000)
 
 
+class RenderResultV11(CanonicalModel):
+    """Terminal result with direct, canonical encoder-attempt evidence."""
+
+    artifact_type: Literal["matrix_auto_cutter_render_result"]
+    schema_version: Literal["1.1"]
+    render_id: str
+    attempt_id: str
+    plan_sha256: Sha256 | None = None
+    status: Literal["succeeded", "failed", "interrupted"]
+    started_at: AwareDatetime
+    ended_at: AwareDatetime
+    exit_code: int | None = None
+    target_path: str
+    output_sha256: Sha256 | None = None
+    output_size_bytes: int | None = Field(default=None, ge=1)
+    output_media_profile: OutputMediaProfile | None = None
+    actual_duration_ms: int | None = Field(default=None, ge=1)
+    expected_duration_ms: int | None = Field(default=None, ge=1)
+    verification_status: Literal["not_run", "failed", "passed"]
+    error_phase: (
+        Literal["authorization", "planning", "render", "verification", "publication", "recovery"]
+        | None
+    ) = None
+    error_code: str | None = None
+    message_de: str = Field(min_length=1, max_length=2000)
+    preferred_encoder: Literal["h264_nvenc", "libx264"] | None = None
+    final_encoder: Literal["h264_nvenc", "libx264"] | None = None
+    fallback_used: bool = False
+    fallback_reason: str | None = Field(default=None, max_length=4000)
+    encoder_attempts: tuple[EncoderAttempt, ...] = ()
+    encoder_attempts_sha256: Sha256 | None = None
+
+    @model_validator(mode="after")
+    def encoder_evidence_consistent(self) -> RenderResultV11:
+        """Bind the ordered attempts directly into the final terminal artifact."""
+        if self.fallback_used != (self.fallback_reason is not None):
+            raise ValueError("fallback reason must match fallback flag")
+        if self.encoder_attempts:
+            digest = _text_digest(
+                "\n".join(item.model_dump_json() for item in self.encoder_attempts)
+            )
+            if self.encoder_attempts_sha256 != digest:
+                raise ValueError("encoder attempts digest mismatch")
+            if (
+                self.final_encoder is not None
+                and self.encoder_attempts[-1].encoder != self.final_encoder
+            ):
+                raise ValueError("final encoder must match final attempt")
+        elif self.encoder_attempts_sha256 is not None:
+            raise ValueError("attempts digest requires attempts")
+        return self
+
+
 @dataclass(frozen=True, slots=True)
 class RenderAccepted:
     """A deliberate request was written atomically."""
@@ -227,7 +325,7 @@ class RenderFailed:
 
     code: str
     message_de: str
-    result: RenderResult | None = None
+    result: RenderResult | RenderResultV11 | None = None
     result_path: Path | None = None
 
 
@@ -236,7 +334,7 @@ class RenderSucceeded:
     """Verified final output and its persistent evidence."""
 
     plan: RenderPlan
-    result: RenderResult
+    result: RenderResult | RenderResultV11
     plan_path: Path
     result_path: Path
     reused: bool = False
@@ -244,7 +342,147 @@ class RenderSucceeded:
 
 type RequestResult = RenderAccepted | RenderFailed
 type RenderExecution = RenderSucceeded | RenderFailed
-type StatusCallback = Callable[[RenderStatus], None]
+type RenderStatusModel = RenderStatus | RenderStatusV11
+type StatusCallback = Callable[[RenderStatusModel], None]
+
+
+@dataclass(frozen=True, slots=True)
+class ProgressSnapshot:
+    """One bounded FFmpeg progress observation, emitted while the process is alive."""
+
+    frame: int | None = None
+    fps: float | None = None
+    out_time_us: int | None = None
+    speed: float | None = None
+    total_size: int | None = None
+    ended: bool = False
+
+
+ProgressCallback = Callable[[ProgressSnapshot], None]
+
+
+class _ProgressParser:
+    """Tolerate partial/unknown FFmpeg progress keys and emit complete blocks only."""
+
+    def __init__(self) -> None:
+        self.values: dict[str, str] = {}
+
+    def feed(self, line: bytes) -> ProgressSnapshot | None:
+        try:
+            key, value = line.decode("utf-8", errors="replace").strip().split("=", 1)
+        except ValueError:
+            return None
+        self.values[key] = value
+        if key != "progress":
+            return None
+
+        def integer(name: str) -> int | None:
+            try:
+                return int(self.values[name])
+            except (KeyError, ValueError):
+                return None
+
+        def number(name: str) -> float | None:
+            try:
+                value = self.values[name].rstrip("x")
+                parsed = float(value)
+                return parsed if parsed >= 0 else None
+            except (KeyError, ValueError):
+                return None
+
+        output_us = integer("out_time_us")
+        if output_us is None:
+            milliseconds = integer("out_time_ms")
+            output_us = milliseconds * 1000 if milliseconds is not None else None
+        snapshot = ProgressSnapshot(
+            frame=integer("frame"),
+            fps=number("fps"),
+            out_time_us=output_us,
+            speed=number("speed"),
+            total_size=integer("total_size"),
+            ended=value == "end",
+        )
+        self.values = {}
+        return snapshot
+
+
+class EncoderAttempt(CanonicalModel):
+    """Immutable evidence for one actual encoder process invocation."""
+
+    sequence: Literal[1, 2]
+    encoder: Literal["h264_nvenc", "libx264"]
+    started_at: AwareDatetime
+    ended_at: AwareDatetime
+    arguments_sha256: Sha256
+    partial_path: str
+    exit_code: int | None = None
+    outcome: Literal["succeeded", "failed", "cancelled", "timed_out"]
+    timed_out: bool = False
+    cancelled: bool = False
+    error_code: str | None = None
+    diagnostic: str = Field(max_length=4000)
+
+    @model_validator(mode="after")
+    def terminal_consistent(self) -> EncoderAttempt:
+        """Make timeout/cancellation explicit and non-contradictory."""
+        if self.timed_out != (self.outcome == "timed_out"):
+            raise ValueError("timeout flag does not match attempt outcome")
+        if self.cancelled != (self.outcome == "cancelled"):
+            raise ValueError("cancellation flag does not match attempt outcome")
+        return self
+
+
+class RenderAttempts(CanonicalModel):
+    """Additive 1.0 side artifact; it never changes existing plan/result bytes."""
+
+    artifact_type: Literal["matrix_auto_cutter_render_attempts"]
+    schema_version: Literal["1.0"]
+    render_id: str
+    attempt_id: str
+    preferred_encoder: Literal["h264_nvenc", "libx264"]
+    attempts: tuple[EncoderAttempt, ...]
+    fallback_reason: str | None = Field(default=None, max_length=4000)
+    final_encoder: Literal["h264_nvenc", "libx264"] | None = None
+
+    @model_validator(mode="after")
+    def consistent(self) -> RenderAttempts:
+        """Keep the bounded policy and final evidence tamper-evident."""
+        if not self.attempts or len(self.attempts) > 2:
+            raise ValueError("render attempts require one or two entries")
+        if tuple(item.sequence for item in self.attempts) != tuple(
+            range(1, len(self.attempts) + 1)
+        ):
+            raise ValueError("attempt sequences must be canonical")
+        if self.attempts[0].encoder != self.preferred_encoder:
+            raise ValueError("first attempt must use preferred encoder")
+        if len(self.attempts) == 2 and (
+            self.preferred_encoder != "h264_nvenc" or self.attempts[1].encoder != "libx264"
+        ):
+            raise ValueError("only one NVENC to libx264 fallback is allowed")
+        if self.final_encoder is not None and self.attempts[-1].encoder != self.final_encoder:
+            raise ValueError("final encoder must be the final attempted encoder")
+        return self
+
+
+class EncoderCapability(CanonicalModel):
+    """Structured, product-binary-bound NVENC capability evidence."""
+
+    artifact_type: Literal["matrix_auto_cutter_nvenc_capability"]
+    schema_version: Literal["1.0"]
+    encoder: Literal["h264_nvenc"]
+    ffmpeg_path: str
+    ffmpeg_sha256: Sha256
+    tested_at: AwareDatetime
+    arguments_sha256: Sha256
+    output_path: str
+    exit_code: int | None = None
+    timed_out: bool = False
+    cancelled: bool = False
+    output_created: bool = False
+    ffprobe_verified: bool = False
+    decode_verified: bool = False
+    reason: str = Field(min_length=1, max_length=4000)
+    diagnostic: str = Field(max_length=4000)
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,6 +511,16 @@ class NativeProcessRunner:
         cancellation: threading.Event,
     ) -> ProcessResult:
         """Execute an argument list without a shell and bound captured output."""
+        return self.run(arguments, timeout_seconds, cancellation)
+
+    def run(
+        self,
+        arguments: Sequence[str],
+        timeout_seconds: int,
+        cancellation: threading.Event,
+        progress_callback: ProgressCallback | None = None,
+    ) -> ProcessResult:
+        """Drain both pipes incrementally, avoiding FFmpeg pipe deadlocks on Windows."""
         creation_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         process = subprocess.Popen(
             list(arguments),
@@ -285,27 +533,77 @@ class NativeProcessRunner:
         )
         with self._lock:
             self._process = process
+        stdout = bytearray()
+        stderr = bytearray()
+        completed = threading.Event()
+        parser = _ProgressParser()
+
+        def append_bounded(target: bytearray, data: bytes) -> None:
+            target.extend(data)
+            overflow = len(target) - MAX_PROCESS_OUTPUT_BYTES
+            if overflow > 0:
+                del target[:overflow]
+
+        def drain(stream: object, target: bytearray, parse_progress: bool) -> None:
+            assert hasattr(stream, "readline")
+            while True:
+                line = stream.readline()
+                if not line:
+                    break
+                append_bounded(target, line)
+                if parse_progress and progress_callback is not None:
+                    snapshot = parser.feed(line)
+                    if snapshot is not None:
+                        progress_callback(snapshot)
+            completed.set()
+
+        assert process.stdout is not None and process.stderr is not None
+        stdout_thread = threading.Thread(
+            target=drain,
+            args=(process.stdout, stdout, True),
+            name="matrix-ffmpeg-stdout",
+            daemon=True,
+        )
+        stderr_thread = threading.Thread(
+            target=drain,
+            args=(process.stderr, stderr, False),
+            name="matrix-ffmpeg-stderr",
+            daemon=True,
+        )
+        stdout_thread.start()
+        stderr_thread.start()
+        deadline = time.monotonic() + timeout_seconds
+        timed_out = False
+        cancelled = False
         try:
-            if cancellation.is_set():
-                process.kill()
-            try:
-                stdout, stderr = process.communicate(timeout=timeout_seconds)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                stdout, stderr = process.communicate(timeout=10)
-                return ProcessResult(
-                    process.returncode,
-                    stdout[-MAX_PROCESS_OUTPUT_BYTES:],
-                    stderr[-MAX_PROCESS_OUTPUT_BYTES:],
-                    timed_out=True,
-                )
+            while process.poll() is None:
+                if cancellation.is_set():
+                    cancelled = True
+                    process.kill()
+                    break
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    process.kill()
+                    break
+                completed.wait(0.05)
+            process.wait(timeout=10)
+            stdout_thread.join(timeout=10)
+            stderr_thread.join(timeout=10)
             return ProcessResult(
                 process.returncode,
-                stdout[-MAX_PROCESS_OUTPUT_BYTES:],
-                stderr[-MAX_PROCESS_OUTPUT_BYTES:],
-                cancelled=cancellation.is_set(),
+                bytes(stdout),
+                bytes(stderr),
+                timed_out=timed_out,
+                cancelled=cancelled or cancellation.is_set(),
             )
         finally:
+            if process.poll() is None:
+                with suppress(OSError):
+                    process.kill()
+            with suppress(subprocess.SubprocessError):
+                process.wait(timeout=10)
+            stdout_thread.join(timeout=10)
+            stderr_thread.join(timeout=10)
             with self._lock:
                 if self._process is process:
                     self._process = None
@@ -399,13 +697,29 @@ def load_render_request(proposal_path: Path) -> RenderRequest | None:
     return loaded if isinstance(loaded, RenderRequest) else None
 
 
-def load_render_status(proposal_path: Path) -> RenderStatus | None:
+def _load_versioned(
+    path: Path, legacy: type[CanonicalModel], current: type[CanonicalModel]
+) -> CanonicalModel | None:
+    """Select a strict canonical reader from the explicit schema marker only."""
+    try:
+        document = json.loads(path.read_bytes())
+        version = document.get("schema_version") if isinstance(document, dict) else None
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if version == "1.0":
+        return _load_model(path, legacy)
+    if version == "1.1":
+        return _load_model(path, current)
+    return None
+
+
+def load_render_status(proposal_path: Path) -> RenderStatusModel | None:
     """Strictly load the current UI status."""
-    loaded = _load_model(render_status_path(proposal_path), RenderStatus)
-    return loaded if isinstance(loaded, RenderStatus) else None
+    loaded = _load_versioned(render_status_path(proposal_path), RenderStatus, RenderStatusV11)
+    return loaded if isinstance(loaded, RenderStatus | RenderStatusV11) else None
 
 
-def write_render_status(proposal_path: Path, status: RenderStatus) -> None:
+def write_render_status(proposal_path: Path, status: RenderStatusModel) -> None:
     """Atomically replace the UI status only on a material transition."""
     existing = load_render_status(proposal_path)
     if existing is not None and existing.model_dump(exclude={"updated_at"}) == status.model_dump(
@@ -630,13 +944,166 @@ def _encoder_available(
     return result.exit_code == 0 and not result.timed_out and not result.cancelled
 
 
+def _bounded_diagnostic(result: ProcessResult) -> str:
+    """Return a short human-readable tail without retaining FFmpeg's full output."""
+    return result.stderr[-4000:].decode("utf-8", errors="replace").strip()
+
+
+def _owned_capability_output(path: Path, directory: Path) -> bool:
+    """Only delete the UUID-named test MP4 created below this render attempt directory."""
+    try:
+        return (
+            path.parent.resolve(strict=True) == directory.resolve(strict=True)
+            and path.name.startswith("nvenc-capability-")
+            and path.suffix == ".mp4"
+        )
+    except OSError:
+        return False
+
+
+def run_nvenc_capability_test(
+    ffmpeg: FfmpegIdentity,
+    ffprobe_path: Path,
+    directory: Path,
+    process_runner: ProcessRunner,
+    cancellation: threading.Event,
+    *,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    uuid_factory: Callable[[], UUID] = uuid4,
+) -> EncoderCapability:
+    """Encode, probe and fully decode a short real NVENC MP4 with the product binary."""
+    directory.mkdir(parents=True, exist_ok=True)
+    token = uuid_factory()
+    output = directory / f"nvenc-capability-{token.hex}.mp4"
+    arguments = (
+        ffmpeg.absolute_path,
+        "-hide_banner",
+        "-nostdin",
+        "-n",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=640x360:rate=60:duration=3",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=1000:sample_rate=48000:duration=3",
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-c:v",
+        "h264_nvenc",
+        "-preset",
+        "p5",
+        "-rc",
+        "vbr",
+        "-cq",
+        "19",
+        "-b:v",
+        "0",
+        "-profile:v",
+        "high",
+        "-pix_fmt",
+        "yuv420p",
+        "-r",
+        "60",
+        "-c:a",
+        "aac",
+        "-ar",
+        "48000",
+        "-movflags",
+        "+faststart",
+        str(output),
+    )
+    rendered = process_runner(arguments, 90, cancellation)
+    created = output.is_file() and output.stat().st_size > 0
+    profile = _probe(ffprobe_path, output, process_runner, cancellation) if created else None
+    probed = (
+        profile is not None
+        and (profile.width, profile.height) == (640, 360)
+        and (profile.fps_num, profile.fps_den, profile.audio_sample_rate) == (60, 1, 48_000)
+    )
+    decode = ProcessResult(None)
+    if probed:
+        decode = process_runner(
+            (
+                ffmpeg.absolute_path,
+                "-v",
+                "error",
+                "-nostdin",
+                "-i",
+                str(output),
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a:0",
+                "-f",
+                "null",
+                "-",
+            ),
+            VERIFY_TIMEOUT_SECONDS,
+            cancellation,
+        )
+    success = (
+        rendered.exit_code == 0
+        and not rendered.timed_out
+        and not rendered.cancelled
+        and created
+        and probed
+        and decode.exit_code == 0
+        and not decode.timed_out
+        and not decode.cancelled
+    )
+    reason = (
+        "ok"
+        if success
+        else (
+            "cancelled"
+            if rendered.cancelled
+            else "timeout"
+            if rendered.timed_out
+            else "encode_failed"
+            if rendered.exit_code != 0
+            else "probe_failed"
+            if not probed
+            else "decode_failed"
+        )
+    )
+    capability = EncoderCapability(
+        artifact_type="matrix_auto_cutter_nvenc_capability",
+        schema_version="1.0",
+        encoder="h264_nvenc",
+        ffmpeg_path=ffmpeg.absolute_path,
+        ffmpeg_sha256=ffmpeg.sha256,
+        tested_at=now(),
+        arguments_sha256=_arguments_digest(arguments),
+        output_path=str(output),
+        exit_code=rendered.exit_code,
+        timed_out=rendered.timed_out,
+        cancelled=rendered.cancelled,
+        output_created=created,
+        ffprobe_verified=probed,
+        decode_verified=decode.exit_code == 0 and not decode.timed_out and not decode.cancelled,
+        reason=reason,
+        diagnostic=_bounded_diagnostic(rendered),
+    )
+    _atomic_write(
+        directory / NVENC_CAPABILITY_FILE_NAME, _canonical_bytes(capability), replace=True
+    )
+    if _owned_capability_output(output, directory):
+        with suppress(OSError):
+            output.unlink()
+    return capability
+
+
 def _select_encoder(
     ffmpeg_path: Path,
     process_runner: ProcessRunner,
     cancellation: threading.Event,
 ) -> Literal["h264_nvenc", "libx264"] | None:
-    if _encoder_available(ffmpeg_path, "h264_nvenc", process_runner, cancellation):
-        return "h264_nvenc"
     if _encoder_available(ffmpeg_path, "libx264", process_runner, cancellation):
         return "libx264"
     return None
@@ -683,7 +1150,7 @@ def _render_arguments(
     encoder: Literal["h264_nvenc", "libx264"],
     partial: Path,
 ) -> tuple[str, ...]:
-    return (
+    common = (
         str(ffmpeg_path),
         "-hide_banner",
         "-nostdin",
@@ -702,19 +1169,43 @@ def _render_arguments(
         "[aout]",
         "-c:v",
         encoder,
-        "-c:a",
-        "aac",
-        "-ar",
-        "48000",
-        "-movflags",
-        "+faststart",
-        "-map_metadata",
-        "-1",
-        "-sn",
-        "-dn",
-        "-fps_mode",
-        "passthrough",
-        str(partial),
+    )
+    video = (
+        (
+            "-preset",
+            "p5",
+            "-rc",
+            "vbr",
+            "-cq",
+            "19",
+            "-b:v",
+            "0",
+            "-profile:v",
+            "high",
+            "-pix_fmt",
+            "yuv420p",
+        )
+        if encoder == "h264_nvenc"
+        else ("-preset", "slow", "-crf", "18", "-profile:v", "high", "-pix_fmt", "yuv420p")
+    )
+    return (
+        common
+        + video
+        + (
+            "-c:a",
+            "aac",
+            "-ar",
+            "48000",
+            "-movflags",
+            "+faststart",
+            "-map_metadata",
+            "-1",
+            "-sn",
+            "-dn",
+            "-fps_mode",
+            "passthrough",
+            str(partial),
+        )
     )
 
 
@@ -728,10 +1219,24 @@ def _status(
     render_id: str | None = None,
     result_path: Path | None = None,
     error_code: str | None = None,
-) -> RenderStatus:
-    return RenderStatus(
+    preferred_encoder: Literal["h264_nvenc", "libx264"] | None = None,
+    active_encoder: Literal["h264_nvenc", "libx264"] | None = None,
+    final_encoder: Literal["h264_nvenc", "libx264"] | None = None,
+    encoder_attempt: int | None = None,
+    fallback_reason: str | None = None,
+    progress_percent: int | None = None,
+    ffmpeg_output_time_us: int | None = None,
+    elapsed_total_ms: int | None = None,
+    elapsed_attempt_ms: int | None = None,
+    eta_ms: int | None = None,
+    speed_x: float | None = None,
+    frame: int | None = None,
+    total_size_bytes: int | None = None,
+    verification_status: Literal["not_run", "running", "failed", "passed"] = "not_run",
+) -> RenderStatusV11:
+    return RenderStatusV11(
         artifact_type="matrix_auto_cutter_render_status",
-        schema_version=RENDER_SCHEMA_VERSION,
+        schema_version="1.1",
         proposal_id=proposal.proposal_id,
         state=state,
         message_de=message,
@@ -741,12 +1246,28 @@ def _status(
         target_path=request.target_path if request is not None else None,
         result_path=str(result_path) if result_path is not None else None,
         error_code=error_code,
+        phase=state,
+        preferred_encoder=preferred_encoder,
+        active_encoder=active_encoder,
+        final_encoder=final_encoder,
+        encoder_attempt=encoder_attempt,
+        fallback_used=fallback_reason is not None,
+        fallback_reason=fallback_reason,
+        progress_percent=progress_percent,
+        ffmpeg_output_time_us=ffmpeg_output_time_us,
+        elapsed_total_ms=elapsed_total_ms,
+        elapsed_attempt_ms=elapsed_attempt_ms,
+        eta_ms=eta_ms,
+        speed_x=speed_x,
+        frame=frame,
+        total_size_bytes=total_size_bytes,
+        verification_status=verification_status,
     )
 
 
 def _publish_status(
     proposal_path: Path,
-    status: RenderStatus,
+    status: RenderStatusModel,
     callback: StatusCallback | None,
 ) -> None:
     write_render_status(proposal_path, status)
@@ -770,10 +1291,15 @@ def _failure_result(
     plan_sha256: str | None = None,
     expected_duration_ms: int | None = None,
     interrupted: bool = False,
-) -> RenderResult:
-    return RenderResult(
+    preferred_encoder: Literal["h264_nvenc", "libx264"] | None = None,
+    final_encoder: Literal["h264_nvenc", "libx264"] | None = None,
+    fallback_reason: str | None = None,
+    encoder_attempts: Sequence[EncoderAttempt] = (),
+) -> RenderResultV11:
+    attempts = tuple(encoder_attempts)
+    return RenderResultV11(
         artifact_type="matrix_auto_cutter_render_result",
-        schema_version=RENDER_SCHEMA_VERSION,
+        schema_version="1.1",
         render_id=render_id,
         attempt_id=request.attempt_id,
         plan_sha256=plan_sha256,
@@ -789,6 +1315,16 @@ def _failure_result(
         error_phase=phase,
         error_code=code,
         message_de=message,
+        preferred_encoder=preferred_encoder,
+        final_encoder=final_encoder,
+        fallback_used=fallback_reason is not None,
+        fallback_reason=fallback_reason,
+        encoder_attempts=attempts,
+        encoder_attempts_sha256=(
+            _text_digest("\n".join(item.model_dump_json() for item in attempts))
+            if attempts
+            else None
+        ),
     )
 
 
@@ -797,7 +1333,7 @@ def _persist_failure(
     attempt_directory: Path,
     proposal: CutProposal,
     request: RenderRequest,
-    result: RenderResult,
+    result: RenderResult | RenderResultV11,
     now: Callable[[], datetime],
     callback: StatusCallback | None,
 ) -> RenderFailed:
@@ -814,12 +1350,61 @@ def _persist_failure(
             render_id=result.render_id,
             result_path=result_path,
             error_code=result.error_code,
+            preferred_encoder=(
+                result.preferred_encoder if isinstance(result, RenderResultV11) else None
+            ),
+            active_encoder=(result.final_encoder if isinstance(result, RenderResultV11) else None),
+            final_encoder=(result.final_encoder if isinstance(result, RenderResultV11) else None),
+            encoder_attempt=(
+                len(result.encoder_attempts)
+                if isinstance(result, RenderResultV11) and result.encoder_attempts
+                else None
+            ),
+            fallback_reason=(
+                result.fallback_reason if isinstance(result, RenderResultV11) else None
+            ),
+            progress_percent=(99 if result.error_phase in {"render", "verification"} else None),
+            verification_status=(
+                "failed" if result.error_phase in {"verification", "publication"} else "not_run"
+            ),
         ),
         callback,
     )
     return RenderFailed(
         result.error_code or "E_RENDER_FAILED", result.message_de, result, result_path
     )
+
+
+def _write_attempt_evidence(
+    directory: Path,
+    *,
+    render_id: str,
+    request: RenderRequest,
+    preferred: Literal["h264_nvenc", "libx264"],
+    attempts: Sequence[EncoderAttempt],
+    fallback_reason: str | None = None,
+    final_encoder: Literal["h264_nvenc", "libx264"] | None = None,
+) -> None:
+    """Persist additive evidence without changing historical plan/result schemas."""
+    evidence = RenderAttempts(
+        artifact_type="matrix_auto_cutter_render_attempts",
+        schema_version="1.0",
+        render_id=render_id,
+        attempt_id=request.attempt_id,
+        preferred_encoder=preferred,
+        attempts=tuple(attempts),
+        fallback_reason=fallback_reason,
+        final_encoder=final_encoder,
+    )
+    _atomic_write(directory / RENDER_ATTEMPTS_FILE_NAME, _canonical_bytes(evidence), replace=True)
+
+
+def _format_seconds(value: float | None) -> str:
+    """Render a neutral duration only when it is finite and non-negative."""
+    if value is None or value < 0 or value == float("inf"):
+        return "-"
+    total = round(value)
+    return f"{total // 60:02d}:{total % 60:02d}"
 
 
 def _find_reusable_success(
@@ -829,8 +1414,11 @@ def _find_reusable_success(
     if not renders.is_dir():
         return None
     for result_path in sorted(renders.glob(f"*/{RENDER_RESULT_FILE_NAME}")):
-        loaded_result = _load_model(result_path, RenderResult)
-        if not isinstance(loaded_result, RenderResult) or loaded_result.status != "succeeded":
+        loaded_result = _load_versioned(result_path, RenderResult, RenderResultV11)
+        if (
+            not isinstance(loaded_result, RenderResult | RenderResultV11)
+            or loaded_result.status != "succeeded"
+        ):
             continue
         plan_path = result_path.with_name(RENDER_PLAN_FILE_NAME)
         loaded_plan = _load_model(plan_path, RenderPlan)
@@ -1006,7 +1594,33 @@ def execute_approved_render(
         return _persist_failure(
             proposal_path, attempt_directory, proposal, request, result, now, status_callback
         )
-    encoder = _select_encoder(ffmpeg_path, runner, stopped)
+    capability = run_nvenc_capability_test(
+        ffmpeg, ffprobe_path, attempt_directory, runner, stopped, now=now
+    )
+    if capability.cancelled or stopped.is_set():
+        result = _failure_result(
+            render_id=render_id,
+            request=request,
+            started_at=started_at,
+            ended_at=now(),
+            target=target,
+            phase="render",
+            code="E_RENDER_CANCELLED",
+            message="NVENC-Capability wurde abgebrochen.",
+            interrupted=True,
+        )
+        return _persist_failure(
+            proposal_path, attempt_directory, proposal, request, result, now, status_callback
+        )
+    if capability.ffmpeg_path != ffmpeg.absolute_path or capability.ffmpeg_sha256 != ffmpeg.sha256:
+        return RenderFailed(
+            "E_RENDER_CAPABILITY_BINDING", "NVENC-Capability ist nicht an FFmpeg gebunden."
+        )
+    encoder: Literal["h264_nvenc", "libx264"] | None = (
+        "h264_nvenc" if capability.reason == "ok" else None
+    )
+    if encoder is None and _encoder_available(ffmpeg_path, "libx264", runner, stopped):
+        encoder = "libx264"
     if encoder is None:
         result = _failure_result(
             render_id=render_id,
@@ -1016,14 +1630,14 @@ def execute_approved_render(
             target=target,
             phase="planning",
             code="E_RENDER_ENCODER",
-            message="Weder h264_nvenc noch libx264 konnte real gestartet werden.",
+            message="NVENC-Capability und libx264-Verfügbarkeit sind fehlgeschlagen.",
         )
         return _persist_failure(
             proposal_path, attempt_directory, proposal, request, result, now, status_callback
         )
 
     target.parent.mkdir(parents=True, exist_ok=True)
-    partial = target.with_name(f"{target.stem}.{request.attempt_id}.partial.mp4")
+    partial = target.with_name(f"{target.stem}.{request.attempt_id}.{encoder}.partial.mp4")
     if partial.exists():
         result = _failure_result(
             render_id=render_id,
@@ -1044,6 +1658,11 @@ def execute_approved_render(
         audio_index=streams.audio_index,
     )
     arguments = _render_arguments(ffmpeg_path, proposal, streams, filtergraph, encoder, partial)
+    preferred_encoder = encoder
+    encoder_attempts: list[EncoderAttempt] = []
+    fallback_reason: str | None = (
+        None if capability.reason == "ok" else f"NVENC-Capability: {capability.reason}"
+    )
     output_frames = sum(item.end_frame - item.start_frame for item in keep_segments)
     cut_frames = proposal.source_frame_count - output_frames
     expected_output_ms = round(output_frames * 1000 / 60)
@@ -1107,6 +1726,10 @@ def execute_approved_render(
             now,
             request=request,
             render_id=render_id,
+            preferred_encoder=preferred_encoder,
+            active_encoder=encoder,
+            encoder_attempt=1,
+            progress_percent=0,
         ),
         status_callback,
     )
@@ -1124,11 +1747,114 @@ def execute_approved_render(
             message=immediate_gate.reason,
             plan_sha256=plan_sha256,
             expected_duration_ms=expected_output_ms,
+            preferred_encoder=preferred_encoder,
+            final_encoder=encoder,
+            fallback_reason=fallback_reason,
+            encoder_attempts=encoder_attempts,
         )
         return _persist_failure(
             proposal_path, attempt_directory, proposal, request, result, now, status_callback
         )
-    rendered = runner(arguments, RENDER_TIMEOUT_SECONDS, stopped)
+    attempt_started = now()
+    total_progress_started = time.monotonic()
+    progress_started = time.monotonic()
+    last_progress_percent = 0
+    last_progress_write = 0.0
+
+    def publish_progress(snapshot: ProgressSnapshot) -> None:
+        nonlocal last_progress_percent, last_progress_write
+        if snapshot.out_time_us is None or expected_output_ms <= 0:
+            return
+        percent = min(
+            99, max(last_progress_percent, int(snapshot.out_time_us / (expected_output_ms * 10)))
+        )
+        elapsed = max(0.0, time.monotonic() - progress_started)
+        elapsed_total = max(0.0, time.monotonic() - total_progress_started)
+        eta: float | None = None
+        if snapshot.speed is not None and snapshot.speed > 0 and snapshot.out_time_us > 0:
+            eta = max(
+                0.0,
+                (expected_output_ms * 1_000 - snapshot.out_time_us) / 1_000_000 / snapshot.speed,
+            )
+        current = time.monotonic()
+        if (
+            percent == last_progress_percent
+            and current - last_progress_write < 0.5
+            and not snapshot.ended
+        ):
+            return
+        last_progress_percent, last_progress_write = percent, current
+        speed = (
+            f"{snapshot.speed:.2f}x" if snapshot.speed is not None and snapshot.speed > 0 else "-"
+        )
+        _publish_status(
+            proposal_path,
+            _status(
+                proposal,
+                "render_running",
+                f"Encoder: {'NVIDIA NVENC' if encoder == 'h264_nvenc' else 'CPU / libx264'} · "
+                f"Fallback: {'nein' if fallback_reason is None else fallback_reason} · "
+                f"Versuch {len(encoder_attempts) + 1} · {percent}% · vergangen "
+                f"{_format_seconds(elapsed)} · ETA {_format_seconds(eta)} · "
+                f"Geschwindigkeit {speed}",
+                now,
+                request=request,
+                render_id=render_id,
+                preferred_encoder=preferred_encoder,
+                active_encoder=encoder,
+                encoder_attempt=len(encoder_attempts) + 1,
+                fallback_reason=fallback_reason,
+                progress_percent=percent,
+                ffmpeg_output_time_us=snapshot.out_time_us,
+                elapsed_total_ms=round(elapsed_total * 1000),
+                elapsed_attempt_ms=round(elapsed * 1000),
+                eta_ms=round(eta * 1000) if eta is not None else None,
+                speed_x=snapshot.speed,
+                frame=snapshot.frame,
+                total_size_bytes=snapshot.total_size,
+            ),
+            status_callback,
+        )
+
+    rendered = (
+        runner.run(arguments, RENDER_TIMEOUT_SECONDS, stopped, publish_progress)
+        if isinstance(runner, NativeProcessRunner)
+        else runner(arguments, RENDER_TIMEOUT_SECONDS, stopped)
+    )
+    attempt_ended = now()
+    first_outcome: Literal["succeeded", "failed", "cancelled", "timed_out"] = (
+        "cancelled"
+        if rendered.cancelled
+        else "timed_out"
+        if rendered.timed_out
+        else "succeeded"
+        if rendered.exit_code == 0
+        else "failed"
+    )
+    encoder_attempts.append(
+        EncoderAttempt(
+            sequence=1,
+            encoder=encoder,
+            started_at=attempt_started,
+            ended_at=attempt_ended,
+            arguments_sha256=_arguments_digest(arguments),
+            partial_path=str(partial),
+            exit_code=rendered.exit_code,
+            outcome=first_outcome,
+            timed_out=rendered.timed_out,
+            cancelled=rendered.cancelled,
+            error_code=(
+                "E_RENDER_TIMEOUT"
+                if rendered.timed_out
+                else "E_RENDER_CANCELLED"
+                if rendered.cancelled
+                else "E_RENDER_FFMPEG"
+                if rendered.exit_code != 0
+                else None
+            ),
+            diagnostic=_bounded_diagnostic(rendered),
+        )
+    )
     _atomic_write(
         attempt_directory / "ffmpeg-progress.log",
         rendered.stdout[-MAX_PROCESS_OUTPUT_BYTES:],
@@ -1140,30 +1866,151 @@ def execute_approved_render(
         replace=True,
     )
     if rendered.exit_code != 0 or rendered.timed_out or rendered.cancelled:
-        code = (
-            "E_RENDER_TIMEOUT"
-            if rendered.timed_out
-            else "E_RENDER_CANCELLED"
-            if rendered.cancelled
-            else "E_RENDER_FFMPEG"
+        # A single CPU retry is allowed only for a real NVENC render failure, never for
+        # cancellation, timeout, or any authorization/binding/target/verification phase.
+        can_fallback = (
+            encoder == "h264_nvenc"
+            and not rendered.timed_out
+            and not rendered.cancelled
+            and rendered.exit_code != 0
+            and capability.reason == "ok"
         )
-        result = _failure_result(
-            render_id=render_id,
-            request=request,
-            started_at=started_at,
-            ended_at=now(),
-            target=target,
-            phase="render",
-            code=code,
-            message="FFmpeg-Render wurde abgebrochen oder ist fehlgeschlagen.",
-            exit_code=rendered.exit_code,
-            plan_sha256=plan_sha256,
-            expected_duration_ms=expected_output_ms,
-            interrupted=rendered.cancelled,
-        )
-        return _persist_failure(
-            proposal_path, attempt_directory, proposal, request, result, now, status_callback
-        )
+        if can_fallback:
+            retry_gate = check_render_authorization(proposal_path)
+            retry_loaded = load_proposal(proposal_path)
+            retry_allowed = (
+                retry_gate.authorized
+                and retry_gate.approval is not None
+                and isinstance(retry_loaded, type(loaded))
+                and not isinstance(retry_loaded, ProposalFailed)
+                and _request_matches(
+                    request,
+                    retry_loaded.proposal,
+                    retry_loaded.proposal_sha256,
+                    retry_gate.approval,
+                    proposal_path.with_name("approval.json"),
+                )
+                and not target.exists()
+            )
+            if retry_allowed:
+                fallback_reason = (
+                    f"NVENC-Vollrender fehlgeschlagen (Exitcode {rendered.exit_code})."
+                )
+                fallback_partial = target.with_name(
+                    f"{target.stem}.{request.attempt_id}.libx264.partial.mp4"
+                )
+                if not fallback_partial.exists():
+                    fallback_arguments = _render_arguments(
+                        ffmpeg_path, proposal, streams, filtergraph, "libx264", fallback_partial
+                    )
+                    _publish_status(
+                        proposal_path,
+                        _status(
+                            proposal,
+                            "render_running",
+                            "NVENC fehlgeschlagen; kontrollierter CPU-Fallback startet.",
+                            now,
+                            request=request,
+                            render_id=render_id,
+                        ),
+                        status_callback,
+                    )
+                    immediate_retry_gate = check_render_authorization(proposal_path)
+                    immediate_retry_loaded = load_proposal(proposal_path)
+                    if (
+                        immediate_retry_gate.authorized
+                        and immediate_retry_gate.approval is not None
+                        and not isinstance(immediate_retry_loaded, ProposalFailed)
+                        and _request_matches(
+                            request,
+                            immediate_retry_loaded.proposal,
+                            immediate_retry_loaded.proposal_sha256,
+                            immediate_retry_gate.approval,
+                            proposal_path.with_name("approval.json"),
+                        )
+                    ):
+                        encoder = "libx264"
+                        partial = fallback_partial
+                        arguments = fallback_arguments
+                        progress_started = time.monotonic()
+                        last_progress_percent = 0
+                        retry_started = now()
+                        rendered = (
+                            runner.run(arguments, RENDER_TIMEOUT_SECONDS, stopped, publish_progress)
+                            if isinstance(runner, NativeProcessRunner)
+                            else runner(arguments, RENDER_TIMEOUT_SECONDS, stopped)
+                        )
+                        retry_ended = now()
+                        retry_outcome: Literal["succeeded", "failed", "cancelled", "timed_out"] = (
+                            "cancelled"
+                            if rendered.cancelled
+                            else "timed_out"
+                            if rendered.timed_out
+                            else "succeeded"
+                            if rendered.exit_code == 0
+                            else "failed"
+                        )
+                        encoder_attempts.append(
+                            EncoderAttempt(
+                                sequence=2,
+                                encoder="libx264",
+                                started_at=retry_started,
+                                ended_at=retry_ended,
+                                arguments_sha256=_arguments_digest(arguments),
+                                partial_path=str(partial),
+                                exit_code=rendered.exit_code,
+                                outcome=retry_outcome,
+                                timed_out=rendered.timed_out,
+                                cancelled=rendered.cancelled,
+                                error_code=(
+                                    "E_RENDER_TIMEOUT"
+                                    if rendered.timed_out
+                                    else "E_RENDER_CANCELLED"
+                                    if rendered.cancelled
+                                    else "E_RENDER_FFMPEG"
+                                    if rendered.exit_code != 0
+                                    else None
+                                ),
+                                diagnostic=_bounded_diagnostic(rendered),
+                            )
+                        )
+        if rendered.exit_code != 0 or rendered.timed_out or rendered.cancelled:
+            _write_attempt_evidence(
+                attempt_directory,
+                render_id=render_id,
+                request=request,
+                preferred=preferred_encoder,
+                attempts=encoder_attempts,
+                fallback_reason=fallback_reason,
+            )
+            code = (
+                "E_RENDER_TIMEOUT"
+                if rendered.timed_out
+                else "E_RENDER_CANCELLED"
+                if rendered.cancelled
+                else "E_RENDER_FFMPEG"
+            )
+            result = _failure_result(
+                render_id=render_id,
+                request=request,
+                started_at=started_at,
+                ended_at=now(),
+                target=target,
+                phase="render",
+                code=code,
+                message="FFmpeg-Render wurde abgebrochen oder ist fehlgeschlagen.",
+                exit_code=rendered.exit_code,
+                plan_sha256=plan_sha256,
+                expected_duration_ms=expected_output_ms,
+                interrupted=rendered.cancelled,
+                preferred_encoder=preferred_encoder,
+                final_encoder=encoder,
+                fallback_reason=fallback_reason,
+                encoder_attempts=encoder_attempts,
+            )
+            return _persist_failure(
+                proposal_path, attempt_directory, proposal, request, result, now, status_callback
+            )
     _publish_status(
         proposal_path,
         _status(
@@ -1173,6 +2020,14 @@ def execute_approved_render(
             now,
             request=request,
             render_id=render_id,
+            preferred_encoder=preferred_encoder,
+            active_encoder=encoder,
+            encoder_attempt=len(encoder_attempts),
+            fallback_reason=fallback_reason,
+            progress_percent=99,
+            elapsed_total_ms=round((time.monotonic() - total_progress_started) * 1000),
+            elapsed_attempt_ms=round((time.monotonic() - progress_started) * 1000),
+            verification_status="running",
         ),
         status_callback,
     )
@@ -1212,6 +2067,14 @@ def execute_approved_render(
             stopped,
         )
     if not profile_ok or decode.exit_code != 0 or decode.timed_out or decode.cancelled:
+        _write_attempt_evidence(
+            attempt_directory,
+            render_id=render_id,
+            request=request,
+            preferred=preferred_encoder,
+            attempts=encoder_attempts,
+            fallback_reason=fallback_reason,
+        )
         result = _failure_result(
             render_id=render_id,
             request=request,
@@ -1226,6 +2089,10 @@ def execute_approved_render(
             exit_code=rendered.exit_code,
             plan_sha256=plan_sha256,
             expected_duration_ms=expected_output_ms,
+            preferred_encoder=preferred_encoder,
+            final_encoder=encoder,
+            fallback_reason=fallback_reason,
+            encoder_attempts=encoder_attempts,
         )
         return _persist_failure(
             proposal_path, attempt_directory, proposal, request, result, now, status_callback
@@ -1233,6 +2100,14 @@ def execute_approved_render(
     assert profile is not None
     final_gate = check_render_authorization(proposal_path)
     if not final_gate.authorized:
+        _write_attempt_evidence(
+            attempt_directory,
+            render_id=render_id,
+            request=request,
+            preferred=preferred_encoder,
+            attempts=encoder_attempts,
+            fallback_reason=fallback_reason,
+        )
         result = _failure_result(
             render_id=render_id,
             request=request,
@@ -1245,12 +2120,24 @@ def execute_approved_render(
             exit_code=rendered.exit_code,
             plan_sha256=plan_sha256,
             expected_duration_ms=expected_output_ms,
+            preferred_encoder=preferred_encoder,
+            final_encoder=encoder,
+            fallback_reason=fallback_reason,
+            encoder_attempts=encoder_attempts,
         )
         return _persist_failure(
             proposal_path, attempt_directory, proposal, request, result, now, status_callback
         )
     output_sha256 = _sha256(partial)
     if output_sha256 == proposal.source_identity.sha256:
+        _write_attempt_evidence(
+            attempt_directory,
+            render_id=render_id,
+            request=request,
+            preferred=preferred_encoder,
+            attempts=encoder_attempts,
+            fallback_reason=fallback_reason,
+        )
         result = _failure_result(
             render_id=render_id,
             request=request,
@@ -1263,6 +2150,10 @@ def execute_approved_render(
             exit_code=rendered.exit_code,
             plan_sha256=plan_sha256,
             expected_duration_ms=expected_output_ms,
+            preferred_encoder=preferred_encoder,
+            final_encoder=encoder,
+            fallback_reason=fallback_reason,
+            encoder_attempts=encoder_attempts,
         )
         return _persist_failure(
             proposal_path, attempt_directory, proposal, request, result, now, status_callback
@@ -1271,6 +2162,14 @@ def execute_approved_render(
         os.link(partial, target)
         partial.unlink()
     except OSError as exc:
+        _write_attempt_evidence(
+            attempt_directory,
+            render_id=render_id,
+            request=request,
+            preferred=preferred_encoder,
+            attempts=encoder_attempts,
+            fallback_reason=fallback_reason,
+        )
         with suppress(OSError):
             if target.is_file() and _sha256(target) == output_sha256:
                 target.unlink()
@@ -1286,13 +2185,26 @@ def execute_approved_render(
             exit_code=rendered.exit_code,
             plan_sha256=plan_sha256,
             expected_duration_ms=expected_output_ms,
+            preferred_encoder=preferred_encoder,
+            final_encoder=encoder,
+            fallback_reason=fallback_reason,
+            encoder_attempts=encoder_attempts,
         )
         return _persist_failure(
             proposal_path, attempt_directory, proposal, request, result, now, status_callback
         )
-    result = RenderResult(
+    _write_attempt_evidence(
+        attempt_directory,
+        render_id=render_id,
+        request=request,
+        preferred=preferred_encoder,
+        attempts=encoder_attempts,
+        fallback_reason=fallback_reason,
+        final_encoder=encoder,
+    )
+    result = RenderResultV11(
         artifact_type="matrix_auto_cutter_render_result",
-        schema_version=RENDER_SCHEMA_VERSION,
+        schema_version="1.1",
         render_id=render_id,
         attempt_id=request.attempt_id,
         plan_sha256=plan_sha256,
@@ -1308,6 +2220,14 @@ def execute_approved_render(
         expected_duration_ms=expected_output_ms,
         verification_status="passed",
         message_de="Finale MP4 wurde verifiziert und create-only veröffentlicht.",
+        preferred_encoder=preferred_encoder,
+        final_encoder=encoder,
+        fallback_used=fallback_reason is not None,
+        fallback_reason=fallback_reason,
+        encoder_attempts=tuple(encoder_attempts),
+        encoder_attempts_sha256=_text_digest(
+            "\n".join(item.model_dump_json() for item in encoder_attempts)
+        ),
     )
     result_path = attempt_directory / RENDER_RESULT_FILE_NAME
     if not _atomic_write(result_path, _canonical_bytes(result), replace=False):
@@ -1323,11 +2243,22 @@ def execute_approved_render(
         _status(
             proposal,
             "render_succeeded",
-            result.message_de,
+            f"Encoder: {'NVIDIA NVENC' if encoder == 'h264_nvenc' else 'CPU / libx264'} · "
+            f"Fallback: {'nein' if fallback_reason is None else fallback_reason} · "
+            f"100% · {result.message_de}",
             now,
             request=request,
             render_id=render_id,
             result_path=result_path,
+            preferred_encoder=preferred_encoder,
+            active_encoder=encoder,
+            final_encoder=encoder,
+            encoder_attempt=len(encoder_attempts),
+            fallback_reason=fallback_reason,
+            progress_percent=100,
+            elapsed_total_ms=round((time.monotonic() - total_progress_started) * 1000),
+            elapsed_attempt_ms=round((time.monotonic() - progress_started) * 1000),
+            verification_status="passed",
         ),
         status_callback,
     )

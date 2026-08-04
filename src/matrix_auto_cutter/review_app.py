@@ -43,6 +43,23 @@ class ReviewRenderView:
     target_path: Path
     render_enabled: bool
     output_enabled: bool
+    phase: str | None = None
+    encoder_de: str | None = None
+    fallback_de: str | None = None
+    progress_percent: int | None = None
+    elapsed_de: str | None = None
+    eta_de: str | None = None
+    speed_de: str | None = None
+    attempt_de: str | None = None
+    verification_de: str | None = None
+
+
+def _format_milliseconds(value: int | None) -> str:
+    """Use a stable neutral marker for legacy or not-yet-measurable values."""
+    if value is None:
+        return "-"
+    seconds = max(0, value // 1000)
+    return f"{seconds // 60:02d}:{seconds % 60:02d}"
 
 
 def review_render_view(
@@ -69,12 +86,38 @@ def review_render_view(
         message = gate.reason
     running = state in {"render_running", "render_verifying"}
     succeeded = state == "render_succeeded"
+    active_encoder = getattr(status, "active_encoder", None) if status is not None else None
+    final_encoder = getattr(status, "final_encoder", None) if status is not None else None
+    encoder = final_encoder or active_encoder
+    encoder_de = "NVIDIA NVENC" if encoder == "h264_nvenc" else "CPU / libx264" if encoder else None
+    fallback_reason = getattr(status, "fallback_reason", None) if status is not None else None
+    fallback_de = "nein" if status is not None and not fallback_reason else fallback_reason
+    attempt = getattr(status, "encoder_attempt", None) if status is not None else None
+    maximum = getattr(status, "max_encoder_attempts", 2) if status is not None else 2
+    speed_x = getattr(status, "speed_x", None) if status is not None else None
     return ReviewRenderView(
-        state,
-        message,
-        Path(status.target_path) if status is not None and status.target_path else target,
-        gate.authorized and not running and not succeeded,
-        succeeded,
+        state=state,
+        message_de=message,
+        target_path=Path(status.target_path)
+        if status is not None and status.target_path
+        else target,
+        render_enabled=gate.authorized and not running and not succeeded,
+        output_enabled=succeeded,
+        phase=getattr(status, "phase", state) if status is not None else state,
+        encoder_de=encoder_de,
+        fallback_de=fallback_de,
+        progress_percent=getattr(status, "progress_percent", None) if status is not None else None,
+        elapsed_de=_format_milliseconds(
+            getattr(status, "elapsed_total_ms", None) if status is not None else None
+        ),
+        eta_de=_format_milliseconds(
+            getattr(status, "eta_ms", None) if status is not None else None
+        ),
+        speed_de=f"{speed_x:.2f}x" if speed_x is not None else "-",
+        attempt_de=f"{attempt} von {maximum}" if attempt is not None else "-",
+        verification_de=(
+            getattr(status, "verification_status", "not_run") if status is not None else "not_run"
+        ),
     )
 
 
@@ -267,7 +310,19 @@ def run_review(proposal_path: Path) -> int:
         decision_var.set(f"Status: {labels[gate.decision]} - {gate.reason}")
         view = review_render_view(proposal_path)
         render_button.configure(state="normal" if view.render_enabled else "disabled")
-        render_var.set(f"Render: {view.state} - {view.message_de}\nZiel: {view.target_path}")
+        render_var.set(
+            f"Phase: {view.phase}\n"
+            f"Encoder: {view.encoder_de or '-'}\n"
+            f"Versuch: {view.attempt_de}\n"
+            f"Fallback: {view.fallback_de or '-'}\n"
+            f"Fortschritt: "
+            f"{str(view.progress_percent) + ' %' if view.progress_percent is not None else '-'}\n"
+            f"Vergangen: {view.elapsed_de}\n"
+            f"Restzeit: {view.eta_de}\n"
+            f"Geschwindigkeit: {view.speed_de}\n"
+            f"Verifikation: {view.verification_de}\n"
+            f"Render: {view.state} - {view.message_de}\nZiel: {view.target_path}"
+        )
         output_state = "normal" if view.output_enabled else "disabled"
         open_output_button.configure(state=output_state)
         open_folder_button.configure(state=output_state)

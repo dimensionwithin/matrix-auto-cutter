@@ -73,6 +73,7 @@ from matrix_auto_cutter.render import (
     RenderFailed,
     RenderRequest,
     RenderStatus,
+    RenderStatusV11,
     RenderSucceeded,
     StatusCallback,
     discover_ffprobe,
@@ -948,7 +949,9 @@ class ProductRunner:
         except OSError:
             return False
 
-    def _on_render_status(self, state: SessionState, status: RenderStatus) -> None:
+    def _on_render_status(
+        self, state: SessionState, status: RenderStatus | RenderStatusV11
+    ) -> None:
         """Publish only actual renderer transitions to the shared runner status."""
         self._publish_status(
             RunnerStatusCode(status.state),

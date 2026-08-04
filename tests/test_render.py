@@ -23,7 +23,12 @@ from matrix_auto_cutter.render import (
     ProcessResult,
     RenderAccepted,
     RenderFailed,
+    RenderResult,
+    RenderResultV11,
+    RenderStatus,
+    RenderStatusV11,
     RenderSucceeded,
+    StreamSelection,
     build_filtergraph,
     build_keep_segments,
     execute_approved_render,
@@ -458,7 +463,7 @@ def test_target_partial_and_request_conflicts_fail_before_render(
     assert target.read_bytes() == b"foreign"
     target.unlink()
 
-    partial = target.with_name(f"{target.stem}.{accepted.request.attempt_id}.partial.mp4")
+    partial = target.with_name(f"{target.stem}.{accepted.request.attempt_id}.libx264.partial.mp4")
     partial.write_bytes(b"foreign-partial")
     partial_conflict = execute_approved_render(
         ready.proposal_path,
@@ -516,3 +521,125 @@ def test_gate_is_rechecked_immediately_before_process_start(
     assert isinstance(outcome, RenderSucceeded)
     assert calls >= 3
     assert process.render_calls == 1
+
+
+def test_progress_parser_emits_complete_blocks_and_neutral_invalid_values() -> None:
+    from matrix_auto_cutter.render import _ProgressParser
+
+    parser = _ProgressParser()
+    assert parser.feed(b"frame=120\n") is None
+    assert parser.feed(b"out_time_us=2000000\n") is None
+    assert parser.feed(b"speed=N/A\n") is None
+    snapshot = parser.feed(b"progress=continue\n")
+    assert snapshot is not None
+    assert snapshot.frame == 120 and snapshot.out_time_us == 2_000_000
+    assert snapshot.speed is None and snapshot.ended is False
+    assert parser.feed(b"unexpected data\n") is None
+    assert parser.feed(b"speed=0x\n") is None
+    assert parser.feed(b"progress=end\n") is not None
+
+
+def test_encoder_arguments_are_explicit_and_attempt_specific(
+    tmp_path: Path, raw_sidecar: dict[str, object]
+) -> None:
+    from matrix_auto_cutter.render import _render_arguments
+
+    _source, _sidecar, ready = _proposal(tmp_path, raw_sidecar)
+    streams = StreamSelection(
+        video_index=0,
+        audio_index=1,
+        width=160,
+        height=90,
+        fps_num=60,
+        fps_den=1,
+        audio_sample_rate=48_000,
+    )
+    graph = build_filtergraph((KeepSegment(start_frame=0, end_frame=60),))
+    nvenc = _render_arguments(
+        _binary("ffmpeg"),
+        ready.proposal,
+        streams,
+        graph,
+        "h264_nvenc",
+        tmp_path / "nvenc.partial.mp4",
+    )
+    x264 = _render_arguments(
+        _binary("ffmpeg"),
+        ready.proposal,
+        streams,
+        graph,
+        "libx264",
+        tmp_path / "x264.partial.mp4",
+    )
+    assert "-nostdin" in nvenc and "-progress" in nvenc and "pipe:1" in nvenc
+    assert "-cq" in nvenc and "-rc" in nvenc and "-crf" not in nvenc
+    assert "-crf" in x264 and "-preset" in x264 and "-cq" not in x264
+    assert nvenc[-1] != x264[-1] and "-ar" in nvenc and "48000" in nvenc
+
+
+def test_status_v11_is_canonical_and_review_projects_dedicated_fields(
+    tmp_path: Path, raw_sidecar: dict[str, object]
+) -> None:
+    _source, _sidecar, ready = _proposal(tmp_path, raw_sidecar)
+    record_decision(ready.proposal_path, "approved", now=lambda: NOW)
+    status = RenderStatusV11(
+        artifact_type="matrix_auto_cutter_render_status",
+        schema_version="1.1",
+        proposal_id=ready.proposal.proposal_id,
+        state="render_running",
+        phase="render_running",
+        message_de="NVENC rendert.",
+        updated_at=NOW,
+        active_encoder="h264_nvenc",
+        preferred_encoder="h264_nvenc",
+        encoder_attempt=1,
+        progress_percent=42,
+        elapsed_total_ms=134_000,
+        elapsed_attempt_ms=120_000,
+        eta_ms=181_000,
+        speed_x=1.8,
+        frame=8040,
+        total_size_bytes=1234,
+        verification_status="not_run",
+    )
+    write_render_status(ready.proposal_path, status)
+    loaded = load_render_status(ready.proposal_path)
+    assert loaded == status
+    view = review_render_view(ready.proposal_path, tmp_path / "rendered")
+    assert view.encoder_de == "NVIDIA NVENC"
+    assert view.progress_percent == 42 and view.elapsed_de == "02:14"
+    assert view.eta_de == "03:01" and view.speed_de == "1.80x"
+    assert view.attempt_de == "1 von 2" and view.fallback_de == "nein"
+
+
+def test_legacy_status_and_result_v10_remain_strictly_readable(
+    tmp_path: Path, raw_sidecar: dict[str, object]
+) -> None:
+    _source, _sidecar, ready = _proposal(tmp_path, raw_sidecar)
+    legacy = RenderStatus(
+        artifact_type="matrix_auto_cutter_render_status",
+        schema_version="1.0",
+        proposal_id=ready.proposal.proposal_id,
+        state="render_running",
+        message_de="Altbestand.",
+        updated_at=NOW,
+    )
+    write_render_status(ready.proposal_path, legacy)
+    assert load_render_status(ready.proposal_path) == legacy
+    result = RenderResult(
+        artifact_type="matrix_auto_cutter_render_result",
+        schema_version="1.0",
+        render_id="render-" + "a" * 32,
+        attempt_id="render-attempt-" + "b" * 32,
+        status="failed",
+        started_at=NOW,
+        ended_at=NOW,
+        target_path=str(tmp_path / "target.mp4"),
+        verification_status="not_run",
+        message_de="Altbestand.",
+    )
+    path = tmp_path / "render-result.json"
+    path.write_bytes((result.model_dump_json() + "\n").encode())
+    from matrix_auto_cutter.render import _load_versioned
+
+    assert _load_versioned(path, RenderResult, RenderResultV11) == result
