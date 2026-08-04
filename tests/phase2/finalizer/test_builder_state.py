@@ -32,7 +32,7 @@ from matrix_auto_cutter.phase2.finalizer.state_machine import (
     FinalizerStateInvariantError,
     FinalizerStateMachine,
 )
-from matrix_auto_cutter.sidecar import ObsEventSidecar
+from matrix_auto_cutter.sidecar import ObsEventSidecarV12
 
 
 def _loaded(port, records: tuple[dict[str, object], ...]) -> LoadedJournal:
@@ -133,7 +133,8 @@ def test_builder_reuses_phase1_clock_pause_pairing_and_protection(fake_port) -> 
     intent = make_intent(journal)
     first = build_sidecar(journal, intent)
     second = build_sidecar(journal, intent)
-    assert isinstance(first, ObsEventSidecar)
+    assert isinstance(first, ObsEventSidecarV12)
+    assert first.schema_version == "1.2"
     assert second == first
     assert first.model_dump_json() == second.model_dump_json()
     assert first.recording_session_id == UUID(SESSION_ID)
@@ -172,12 +173,42 @@ def test_builder_stop_while_paused_and_automatic_buffers(fake_port) -> None:
     journal = _loaded(fake_port, tuple(records))
     source = source_identity().model_copy(update={"duration_ms": 500, "video_frame_count": 30})
     sidecar = build_sidecar(journal, make_intent(journal, source=source))
-    assert isinstance(sidecar, ObsEventSidecar)
+    assert isinstance(sidecar, ObsEventSidecarV12)
     assert sidecar.pause_intervals[0].end_reason == "recording_stopped_while_paused"
     assert _automatic_policy("recording_started").buffer_after_ms == 1000
     assert _automatic_policy("outro_started").buffer_after_ms == 250
     assert _automatic_policy("outro_ended").buffer_before_ms == 250
     assert _automatic_policy("recording_stopped").buffer_before_ms == 1000
+
+
+def test_builder_preserves_scene_uuid_and_exact_name_from_journal(fake_port) -> None:
+    records = list(journal_records())
+    records.insert(
+        2,
+        {
+            "artifact_type": "recording_event_journal",
+            "journal_schema_version": "1.0",
+            "record_type": "event",
+            "sequence": 2,
+            "event_id": "77777777-7777-4777-8777-777777777777",
+            "event_type": "scene_changed",
+            "monotonic_ns": 500_000_000,
+            "output_frame_count": 30,
+            "recording_paused": False,
+            "source_uuid": "444eb885-e589-4338-832c-8f5fd7eaaf41",
+            "label": "Outro",
+        },
+    )
+    records[-1] = {**records[-1], "sequence": 3}
+    journal = _loaded(fake_port, tuple(records))
+    result = build_sidecar(journal, make_intent(journal))
+    assert isinstance(result, ObsEventSidecarV12)
+    assert result.schema_version == "1.2"
+    scenes = [item for item in result.events if item.type == "scene_changed"]
+    assert len(scenes) == 1
+    assert str(scenes[0].scene_uuid) == "444eb885-e589-4338-832c-8f5fd7eaaf41"
+    assert scenes[0].scene_name == "Outro"
+    assert not isinstance(scenes[0].label, str)
 
 
 def test_builder_structured_failures(fake_port, monkeypatch) -> None:
@@ -243,7 +274,7 @@ def test_builder_consumes_phase1_calibration_sample(fake_port) -> None:
     )
     journal = _loaded(fake_port, tuple(records))
     sidecar = build_sidecar(journal, make_intent(journal))
-    assert isinstance(sidecar, ObsEventSidecar)
+    assert isinstance(sidecar, ObsEventSidecarV12)
     assert sidecar.clock.calibration_sample_count == 3
 
 

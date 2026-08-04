@@ -306,7 +306,17 @@ def test_atomic_deterministic_utf8_output(tmp_path: Path) -> None:
     assert first.status == "written" and first.error is None
     first_bytes = target.read_bytes()
     assert not first_bytes.startswith(b"\xef\xbb\xbf")
-    assert json.loads(first_bytes)["schema_version"] == "1.0"
+    parsed = json.loads(first_bytes)
+    assert parsed["schema_version"] == "1.0"
+    assert parsed["sidecar_schema_version"] == "1.2"
+    legacy_document = ProtectionRangesDocument(
+        source_sha256=document.source_sha256,
+        input_hash=document.input_hash,
+        configuration_hash=document.configuration_hash,
+        sidecar_schema_version="1.1",
+        ranges=document.ranges,
+    )
+    assert legacy_document.sidecar_schema_version == "1.1"
     second = write_protection_ranges(target, document)
     assert second.status == "written"
     assert target.read_bytes() == first_bytes

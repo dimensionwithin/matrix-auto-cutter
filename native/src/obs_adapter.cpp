@@ -13,6 +13,51 @@ namespace {
 constexpr std::uint64_t nominal_video_fps = 60;
 constexpr std::uint64_t nanoseconds_per_second = 1'000'000'000ULL;
 
+bool is_utf8_continuation(const unsigned char value) noexcept {
+    return (value & 0xc0U) == 0x80U;
+}
+
+bool valid_utf8(const std::string_view value) noexcept {
+    for (std::size_t index = 0; index < value.size();) {
+        const auto first = static_cast<unsigned char>(value[index]);
+        if (first <= 0x7fU) {
+            ++index;
+            continue;
+        }
+        std::size_t count = 0;
+        std::uint32_t code = 0;
+        if ((first & 0xe0U) == 0xc0U) {
+            count = 2;
+            code = first & 0x1fU;
+        } else if ((first & 0xf0U) == 0xe0U) {
+            count = 3;
+            code = first & 0x0fU;
+        } else if ((first & 0xf8U) == 0xf0U) {
+            count = 4;
+            code = first & 0x07U;
+        } else {
+            return false;
+        }
+        if (index + count > value.size()) {
+            return false;
+        }
+        for (std::size_t offset = 1; offset < count; ++offset) {
+            const auto next = static_cast<unsigned char>(value[index + offset]);
+            if (!is_utf8_continuation(next)) {
+                return false;
+            }
+            code = (code << 6U) | (next & 0x3fU);
+        }
+        if ((count == 2 && code < 0x80U) || (count == 3 && code < 0x800U) ||
+            (count == 4 && code < 0x10000U) || code > 0x10ffffU ||
+            (code >= 0xd800U && code <= 0xdfffU)) {
+            return false;
+        }
+        index += count;
+    }
+    return true;
+}
+
 std::optional<std::uint64_t> frame_span_ns(const std::uint64_t frames) noexcept {
     constexpr auto whole_frame_limit = UINT64_MAX / nanoseconds_per_second;
     const auto whole_seconds = frames / nominal_video_fps;
@@ -126,6 +171,42 @@ bool BoundedPath::assign(const std::string_view value) noexcept {
 std::string_view BoundedPath::view() const noexcept {
     return size <= max_recording_path_utf8 ? std::string_view(bytes.data(), size)
                                            : std::string_view{};
+}
+
+bool SceneSignal::assign_uuid(const std::string_view value) noexcept {
+    if (value.empty() || value.size() > max_scene_uuid_utf8 ||
+        value.find('\0') != std::string_view::npos) {
+        uuid_size = 0;
+        uuid[0] = '\0';
+        return false;
+    }
+    std::copy(value.begin(), value.end(), uuid.begin());
+    uuid_size = value.size();
+    uuid[uuid_size] = '\0';
+    return true;
+}
+
+bool SceneSignal::assign_label(const std::string_view value) noexcept {
+    if (value.empty() || value.size() > max_scene_label_utf8 ||
+        value.find('\0') != std::string_view::npos || !valid_utf8(value)) {
+        label_size = 0;
+        label[0] = '\0';
+        return false;
+    }
+    std::copy(value.begin(), value.end(), label.begin());
+    label_size = value.size();
+    label[label_size] = '\0';
+    return true;
+}
+
+std::string_view SceneSignal::uuid_view() const noexcept {
+    return uuid_size <= max_scene_uuid_utf8 ? std::string_view(uuid.data(), uuid_size)
+                                            : std::string_view{};
+}
+
+std::string_view SceneSignal::label_view() const noexcept {
+    return label_size <= max_scene_label_utf8 ? std::string_view(label.data(), label_size)
+                                              : std::string_view{};
 }
 
 ObsJournalAdapter::ObsJournalAdapter(
@@ -258,6 +339,15 @@ unsigned ObsJournalAdapter::pending_pause_resume_commands() const noexcept {
     return pause_resume_commands_pending_.load(std::memory_order_acquire);
 }
 
+std::size_t ObsJournalAdapter::pending_scene_change_commands() const noexcept {
+    try {
+        std::lock_guard lock(command_mutex_);
+        return scene_size_;
+    } catch (...) {
+        return 0;
+    }
+}
+
 std::optional<RunReport> ObsJournalAdapter::last_report() const {
     std::lock_guard lock(report_mutex_);
     return last_report_;
@@ -303,10 +393,15 @@ void ObsJournalAdapter::frontend_boundary(const FrontendEvent event, void* priva
     if (self == nullptr || !self->enter_callback()) {
         return;
     }
+    const bool bound_access = event == FrontendEvent::scene_changed;
+    if (bound_access) {
+        self->bound_callbacks_in_flight_.fetch_add(1, std::memory_order_acq_rel);
+    }
     struct Guard final {
         ObsJournalAdapter* self;
-        ~Guard() { self->leave_callback(false); }
-    } guard{self};
+        bool bound_access;
+        ~Guard() { self->leave_callback(bound_access); }
+    } guard{self, bound_access};
     try {
         self->probe_callback(CallbackKind::frontend);
         self->on_frontend(event);
@@ -359,6 +454,10 @@ void ObsJournalAdapter::output_boundary(
 }
 
 void ObsJournalAdapter::on_frontend(const FrontendEvent event) noexcept {
+    if (event == FrontendEvent::scene_changed) {
+        on_scene_changed();
+        return;
+    }
     if (event == FrontendEvent::recording_started) {
         host_.log(LogLevel::info, "frontend RECORDING_STARTED observed (diagnostic only)");
         return;
@@ -409,11 +508,149 @@ void ObsJournalAdapter::on_frontend(const FrontendEvent event) noexcept {
         "recording output bound; official output start/pause/unpause/stop signals connected");
 }
 
+void ObsJournalAdapter::on_scene_changed() noexcept {
+    const auto current = state_.load(std::memory_order_acquire);
+    if (current != AdapterState::active ||
+        !accepting_snapshots_.load(std::memory_order_acquire)) {
+        host_.log(LogLevel::warning, "program scene change ignored: recording is not active");
+        return;
+    }
+    if (!recording_started_accepted_.load(std::memory_order_acquire)) {
+        host_.log(
+            LogLevel::warning,
+            "program scene change ignored: recording_started is not yet accepted");
+        return;
+    }
+    if (observed_pause_state_.load(std::memory_order_acquire) != 0U) {
+        host_.log(LogLevel::warning, "program scene change ignored: recording is paused");
+        return;
+    }
+    if (pause_resume_commands_pending_.load(std::memory_order_acquire) != 0U) {
+        host_.log(
+            LogLevel::warning,
+            "program scene change ignored: pause/resume control transition is open");
+        return;
+    }
+
+    SceneHandle scene = host_.acquire_current_program_scene();
+    if (scene == nullptr) {
+        host_.log(LogLevel::warning, "program scene change ignored: current scene is null");
+        return;
+    }
+    struct SceneGuard final {
+        AdapterHost& host;
+        SceneHandle scene;
+        ~SceneGuard() { host.release_scene(scene); }
+    } scene_guard{host_, scene};
+
+    SceneCommand command;
+    const auto uuid = host_.scene_uuid(scene);
+    if (!command.signal.assign_uuid(uuid) || !valid_uuid_v4(command.signal.uuid_view())) {
+        host_.log(
+            LogLevel::warning,
+            "program scene change ignored: scene UUID is missing, invalid or unbounded");
+        return;
+    }
+    if (!command.signal.assign_label(host_.scene_name(scene))) {
+        host_.log(
+            LogLevel::warning,
+            "program scene change ignored: exact scene name is missing, invalid or unbounded");
+        return;
+    }
+    if (!host_.capture_clock(
+            command.signal.absolute_monotonic_ns, command.signal.output_frame_count)) {
+        host_.log(LogLevel::warning, "program scene change ignored: clock capture failed");
+        return;
+    }
+
+    const auto origin = origin_ns_.load(std::memory_order_acquire);
+    const auto started_ns = recording_started_ns_.load(std::memory_order_acquire);
+    const auto started_frames = recording_started_frame_count_.load(std::memory_order_acquire);
+    if (command.signal.absolute_monotonic_ns < origin ||
+        command.signal.absolute_monotonic_ns < started_ns ||
+        command.signal.output_frame_count < started_frames) {
+        host_.log(
+            LogLevel::warning,
+            "program scene change ignored: captured clock is incomplete or non-monotone");
+        return;
+    }
+
+    std::unique_lock lock(command_mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        host_.log(LogLevel::warning, "program scene change ignored: bounded command path is busy");
+        return;
+    }
+    if (state_.load(std::memory_order_acquire) != AdapterState::active ||
+        !accepting_snapshots_.load(std::memory_order_acquire) ||
+        !recording_started_accepted_.load(std::memory_order_acquire) ||
+        observed_pause_state_.load(std::memory_order_acquire) != 0U ||
+        pause_resume_commands_pending_.load(std::memory_order_acquire) != 0U) {
+        lock.unlock();
+        host_.log(
+            LogLevel::warning,
+            "program scene change ignored: recording/control state changed during capture");
+        return;
+    }
+    if (scene_size_ == scene_change_command_capacity) {
+        lock.unlock();
+        host_.log(
+            LogLevel::warning,
+            "program scene change ignored: bounded scene command queue is full");
+        return;
+    }
+    if (!command_clock_is_monotone_locked(
+            command.signal.absolute_monotonic_ns, command.signal.output_frame_count)) {
+        lock.unlock();
+        host_.log(
+            LogLevel::warning,
+            "program scene change ignored: clock regressed at adapter linearization");
+        return;
+    }
+    if (!assign_command_order_locked(command.order)) {
+        lock.unlock();
+        host_.log(
+            LogLevel::warning,
+            "program scene change ignored: global adapter order is exhausted");
+        return;
+    }
+    remember_command_clock_locked(
+        command.signal.absolute_monotonic_ns, command.signal.output_frame_count);
+    scene_commands_[scene_write_] = command;
+    scene_write_ = (scene_write_ + 1) % scene_change_command_capacity;
+    ++scene_size_;
+    lock.unlock();
+    command_changed_.notify_one();
+    host_.log(LogLevel::info, "program scene change value snapshot queued for adapter worker");
+}
+
 bool ObsJournalAdapter::queue_forced_failure() noexcept {
     accepting_snapshots_.store(false, std::memory_order_release);
     forced_shutdown_.store(true, std::memory_order_release);
     command_changed_.notify_one();
     return false;
+}
+
+bool ObsJournalAdapter::assign_command_order_locked(std::uint64_t& order) noexcept {
+    if (next_command_order_ == UINT64_MAX) {
+        return false;
+    }
+    order = next_command_order_++;
+    return true;
+}
+
+bool ObsJournalAdapter::command_clock_is_monotone_locked(
+    const std::uint64_t absolute_monotonic_ns,
+    const std::uint64_t output_frame_count) const noexcept {
+    return !last_linearized_command_clock_.has_value() ||
+           (absolute_monotonic_ns >= last_linearized_command_clock_->monotonic_ns &&
+            output_frame_count >= last_linearized_command_clock_->output_frame_count);
+}
+
+void ObsJournalAdapter::remember_command_clock_locked(
+    const std::uint64_t absolute_monotonic_ns,
+    const std::uint64_t output_frame_count) noexcept {
+    last_linearized_command_clock_ =
+        ClockSnapshot{absolute_monotonic_ns, output_frame_count, false};
 }
 
 void ObsJournalAdapter::on_output(const OutputEvent event, const int code) noexcept {
@@ -442,8 +679,16 @@ void ObsJournalAdapter::on_output(const OutputEvent event, const int code) noexc
             static_cast<void>(queue_forced_failure());
             return;
         }
-        control_commands_[control_write_] = ControlCommand{
-            ControlKind::start, signal, 0, 0, 0, true};
+        ControlCommand command{ControlKind::start, signal, 0, 0, 0, true};
+        if (!assign_command_order_locked(command.order)) {
+            lock.unlock();
+            host_.log(LogLevel::error, "global adapter command order exhausted on output start");
+            static_cast<void>(queue_forced_failure());
+            return;
+        }
+        last_linearized_command_clock_.reset();
+        remember_command_clock_locked(signal.absolute_monotonic_ns, signal.output_frame_count);
+        control_commands_[control_write_] = command;
         control_write_ = (control_write_ + 1) % control_command_capacity;
         ++control_size_;
         lock.unlock();
@@ -500,8 +745,25 @@ void ObsJournalAdapter::on_output(const OutputEvent event, const int code) noexc
         }
         const auto kind = event == OutputEvent::paused ? ControlKind::pause : ControlKind::resume;
         const bool paused = event == OutputEvent::paused;
-        control_commands_[control_write_] =
-            ControlCommand{kind, {}, absolute, frames, 0, true, paused};
+        ControlCommand command{kind, {}, absolute, frames, 0, true, paused};
+        if (!command_clock_is_monotone_locked(absolute, frames)) {
+            lock.unlock();
+            host_.log(
+                LogLevel::error,
+                "pause/resume clock regressed at adapter linearization");
+            static_cast<void>(queue_forced_failure());
+            return;
+        }
+        if (!assign_command_order_locked(command.order)) {
+            lock.unlock();
+            host_.log(
+                LogLevel::error,
+                "global adapter command order exhausted on pause/resume");
+            static_cast<void>(queue_forced_failure());
+            return;
+        }
+        remember_command_clock_locked(absolute, frames);
+        control_commands_[control_write_] = command;
         control_write_ = (control_write_ + 1) % control_command_capacity;
         ++control_size_;
         pause_resume_commands_pending_.fetch_add(1, std::memory_order_release);
@@ -540,8 +802,25 @@ void ObsJournalAdapter::on_output(const OutputEvent event, const int code) noexc
         return;
     }
     const bool paused = observed_pause_state_.load(std::memory_order_acquire) == 1U;
-    control_commands_[control_write_] =
-        ControlCommand{ControlKind::stop, signal, 0, 0, code, captured, paused};
+    ControlCommand command{ControlKind::stop, signal, 0, 0, code, captured, paused};
+    if (captured && !command_clock_is_monotone_locked(
+                        signal.absolute_monotonic_ns, signal.output_frame_count)) {
+        lock.unlock();
+        host_.log(LogLevel::error, "output stop clock regressed at adapter linearization");
+        static_cast<void>(queue_forced_failure());
+        return;
+    }
+    if (!assign_command_order_locked(command.order)) {
+        lock.unlock();
+        host_.log(LogLevel::error, "global adapter command order exhausted on output stop");
+        static_cast<void>(queue_forced_failure());
+        return;
+    }
+    if (captured) {
+        remember_command_clock_locked(
+            signal.absolute_monotonic_ns, signal.output_frame_count);
+    }
+    control_commands_[control_write_] = command;
     control_write_ = (control_write_ + 1) % control_command_capacity;
     ++control_size_;
     accepting_snapshots_.store(false, std::memory_order_release);
@@ -633,6 +912,27 @@ void ObsJournalAdapter::on_tick() noexcept {
         static_cast<void>(queue_forced_failure());
         return;
     }
+    if (!command_clock_is_monotone_locked(absolute, frames)) {
+        lock.unlock();
+        if (command.recording_start_anchor) {
+            host_.log(
+                LogLevel::error,
+                "recording start clock regressed at adapter linearization");
+            static_cast<void>(queue_forced_failure());
+        } else {
+            host_.log(
+                LogLevel::warning,
+                "calibration ignored: clock regressed at adapter linearization");
+        }
+        return;
+    }
+    if (!assign_command_order_locked(command.order)) {
+        lock.unlock();
+        host_.log(LogLevel::error, "global adapter command order exhausted on clock snapshot");
+        static_cast<void>(queue_forced_failure());
+        return;
+    }
+    remember_command_clock_locked(absolute, frames);
     pending_clock_ = command;
     lock.unlock();
     command_changed_.notify_one();
@@ -640,6 +940,7 @@ void ObsJournalAdapter::on_tick() noexcept {
 
 void ObsJournalAdapter::process_start(const RecordingSignal& signal) noexcept {
     try {
+        last_worker_clock_.reset();
         const std::string recording(signal.path.view());
         const std::string session =
             options_.session_uuid_factory ? options_.session_uuid_factory() : std::string{};
@@ -736,8 +1037,11 @@ void ObsJournalAdapter::process_start(const RecordingSignal& signal) noexcept {
 
 void ObsJournalAdapter::process_clock(const ClockCommand& command) noexcept {
     try {
-        if (!producer_ || state_.load(std::memory_order_acquire) != AdapterState::active ||
-            !accepting_snapshots_.load(std::memory_order_acquire)) {
+        if (!producer_) {
+            return;
+        }
+        if (!command.recording_start_anchor &&
+            !recording_started_accepted_.load(std::memory_order_acquire)) {
             return;
         }
         const auto origin = origin_ns_.load(std::memory_order_acquire);
@@ -775,6 +1079,7 @@ void ObsJournalAdapter::process_clock(const ClockCommand& command) noexcept {
             recording_started_frame_count_.store(
                 snapshot.output_frame_count, std::memory_order_release);
             recording_started_accepted_.store(true, std::memory_order_release);
+            last_worker_clock_ = snapshot;
             next_calibration_ns_.store(
                 snapshot.monotonic_ns +
                     static_cast<std::uint64_t>(calibration_interval.count()) *
@@ -785,9 +1090,10 @@ void ObsJournalAdapter::process_clock(const ClockCommand& command) noexcept {
                 "recording_started captured after actual output start; clock epoch anchored");
             return;
         }
-        const auto outcome = producer_->submit(CalibrationSnapshot{
-            ClockSnapshot{relative, command.output_frame_count, false}});
+        const ClockSnapshot snapshot{relative, command.output_frame_count, false};
+        const auto outcome = producer_->submit(CalibrationSnapshot{snapshot});
         if (outcome == CallbackResult::accepted) {
+            last_worker_clock_ = snapshot;
             calibration_count_.fetch_add(1, std::memory_order_relaxed);
             host_.log(LogLevel::info, "calibration snapshot accepted");
             return;
@@ -799,6 +1105,71 @@ void ObsJournalAdapter::process_clock(const ClockCommand& command) noexcept {
                 producer_status_text(producer_->status()));
     } catch (...) {
         fail_current_run(ProducerResult::producer_internal_error, "clock processing threw");
+    }
+}
+
+void ObsJournalAdapter::process_scene_changed(const SceneCommand& command) noexcept {
+    try {
+        // Callback admission and command.order are the linearization point. Later
+        // pause/stop callbacks may already have updated their observable atomics,
+        // but cannot revoke or overtake this earlier authorized value snapshot.
+        if (!producer_ ||
+            !recording_started_accepted_.load(std::memory_order_acquire)) {
+            host_.log(
+                LogLevel::warning,
+                "queued program scene change discarded: its admitted run is unavailable");
+            return;
+        }
+        const auto origin = origin_ns_.load(std::memory_order_acquire);
+        const auto& signal = command.signal;
+        if (signal.absolute_monotonic_ns < origin || signal.uuid_view().empty() ||
+            !valid_uuid_v4(signal.uuid_view()) || signal.label_view().empty() ||
+            !valid_utf8(signal.label_view())) {
+            host_.log(
+                LogLevel::warning,
+                "queued program scene change discarded: value snapshot is invalid");
+            return;
+        }
+        const ClockSnapshot clock{
+            signal.absolute_monotonic_ns - origin, signal.output_frame_count, false};
+        if (last_worker_clock_.has_value() &&
+            (clock.monotonic_ns < last_worker_clock_->monotonic_ns ||
+             clock.output_frame_count < last_worker_clock_->output_frame_count)) {
+            host_.log(
+                LogLevel::warning,
+                "queued program scene change discarded: worker clock order is ambiguous");
+            return;
+        }
+        const std::string event_id =
+            options_.event_uuid_factory ? options_.event_uuid_factory() : std::string{};
+        if (!valid_uuid_v4(event_id)) {
+            host_.log(
+                LogLevel::error,
+                "queued program scene change discarded: worker UUIDv4 generation failed");
+            return;
+        }
+        EventSnapshot snapshot{
+            event_id,
+            EventType::scene_changed,
+            clock,
+            std::string(signal.uuid_view()),
+            std::nullopt,
+            std::string(signal.label_view()),
+        };
+        const auto outcome = producer_->submit(std::move(snapshot));
+        if (outcome != CallbackResult::accepted) {
+            fail_current_run(
+                outcome == CallbackResult::full ? ProducerResult::producer_failed_queue_overflow
+                                                : ProducerResult::producer_internal_error,
+                "producer rejected scene_changed snapshot; run cannot be successful");
+            return;
+        }
+        last_worker_clock_ = clock;
+        host_.log(LogLevel::info, "canonical scene_changed snapshot accepted by producer queue");
+    } catch (...) {
+        fail_current_run(
+            ProducerResult::producer_internal_error,
+            "scene_changed worker processing threw");
     }
 }
 
@@ -848,6 +1219,7 @@ void ObsJournalAdapter::process_pause_or_resume(const ControlCommand& command) n
                 "producer rejected pause/resume snapshot; run cannot be successful");
             return;
         }
+        last_worker_clock_ = clock;
         host_.log(
             LogLevel::info,
             std::string(command.kind == ControlKind::pause ? "pause" : "resume") +
@@ -929,8 +1301,16 @@ void ObsJournalAdapter::wait_for_bound_callbacks_to_drain() noexcept {
 }
 
 void ObsJournalAdapter::reset_run() noexcept {
+    {
+        std::lock_guard lock(command_mutex_);
+        scene_read_ = 0;
+        scene_write_ = 0;
+        scene_size_ = 0;
+        last_linearized_command_clock_.reset();
+    }
     producer_.reset();
     pending_recording_started_.reset();
+    last_worker_clock_.reset();
     recording_path_.clear();
     journal_path_.clear();
     accepting_snapshots_.store(false, std::memory_order_release);
@@ -1107,12 +1487,15 @@ void ObsJournalAdapter::worker_main() noexcept {
         for (;;) {
             std::optional<ControlCommand> control;
             std::optional<ClockCommand> clock;
+            std::optional<SceneCommand> scene;
+            enum class SelectedCommand { none, control, clock, scene };
+            SelectedCommand selected{SelectedCommand::none};
             bool forced = false;
             bool unload = false;
             {
                 std::unique_lock lock(command_mutex_);
                 command_changed_.wait(lock, [&] {
-                    return control_size_ != 0 || pending_clock_.has_value() ||
+                    return control_size_ != 0 || pending_clock_.has_value() || scene_size_ != 0 ||
                            forced_shutdown_.load(std::memory_order_acquire) || unload_requested_;
                 });
                 forced = forced_shutdown_.exchange(false, std::memory_order_acq_rel);
@@ -1122,14 +1505,39 @@ void ObsJournalAdapter::worker_main() noexcept {
                     control_write_ = 0;
                     control_size_ = 0;
                     pending_clock_.reset();
+                    scene_read_ = 0;
+                    scene_write_ = 0;
+                    scene_size_ = 0;
                 } else {
-                    if (control_size_ != 0) {
+                    // Every accepted recording command receives a unique order while holding
+                    // command_mutex_. Each bounded container preserves that order internally,
+                    // so the smallest front order is the single global worker order. QPC/frame
+                    // equality is therefore resolved by callback linearization, never by type.
+                    std::uint64_t earliest = UINT64_MAX;
+                    if (control_size_ != 0 &&
+                        control_commands_[control_read_].order < earliest) {
+                        earliest = control_commands_[control_read_].order;
+                        selected = SelectedCommand::control;
+                    }
+                    if (pending_clock_.has_value() && pending_clock_->order < earliest) {
+                        earliest = pending_clock_->order;
+                        selected = SelectedCommand::clock;
+                    }
+                    if (scene_size_ != 0 && scene_commands_[scene_read_].order < earliest) {
+                        selected = SelectedCommand::scene;
+                    }
+                    if (selected == SelectedCommand::control) {
                         control.emplace(std::move(control_commands_[control_read_]));
                         control_read_ = (control_read_ + 1) % control_command_capacity;
                         --control_size_;
+                    } else if (selected == SelectedCommand::clock) {
+                        clock = std::move(pending_clock_);
+                        pending_clock_.reset();
+                    } else if (selected == SelectedCommand::scene) {
+                        scene.emplace(std::move(scene_commands_[scene_read_]));
+                        scene_read_ = (scene_read_ + 1) % scene_change_command_capacity;
+                        --scene_size_;
                     }
-                    clock = std::move(pending_clock_);
-                    pending_clock_.reset();
                 }
             }
             if (unload) {
@@ -1152,25 +1560,19 @@ void ObsJournalAdapter::worker_main() noexcept {
                     "adapter command/callback failure forced fail-closed cleanup");
                 continue;
             }
-            if (control.has_value() && control->kind == ControlKind::start) {
-                process_start(control->signal);
-                if (clock.has_value()) {
-                    process_clock(*clock);
+            if (control.has_value()) {
+                if (control->kind == ControlKind::start) {
+                    process_start(control->signal);
+                } else if (control->kind == ControlKind::pause ||
+                           control->kind == ControlKind::resume) {
+                    process_pause_or_resume(*control);
+                } else {
+                    process_stop(*control);
                 }
-            } else {
-                // A calibration captured before a pause/stop must be drained
-                // before that control command; calibration remains coalesced.
-                if (clock.has_value()) {
-                    process_clock(*clock);
-                }
-                if (control.has_value()) {
-                    if (control->kind == ControlKind::pause ||
-                        control->kind == ControlKind::resume) {
-                        process_pause_or_resume(*control);
-                    } else {
-                        process_stop(*control);
-                    }
-                }
+            } else if (clock.has_value()) {
+                process_clock(*clock);
+            } else if (scene.has_value()) {
+                process_scene_changed(*scene);
             }
         }
     } catch (...) {

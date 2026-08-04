@@ -543,14 +543,19 @@ def run_review(proposal_path: Path) -> int:
     text.pack(fill="both", expand=True)
     if proposal.proposed_cuts:
         for index, item in enumerate(proposal.proposed_cuts, start=1):
+            evidence = (
+                f"Konservative Stille; Evidence "
+                f"{item.audio_evidence.raw_silence_start_ms / 1000:.3f} bis "
+                f"{item.audio_evidence.raw_silence_end_ms / 1000:.3f} s bei "
+                f"{item.audio_evidence.threshold_db} dB; Protection frei."
+                if item.audio_evidence is not None
+                else "Exakter Outro-Tail nach 900 geschützten Sourceframes."
+            )
             text.insert(
                 "end",
                 f"{index}. {item.start_timecode} bis {item.end_timecode} "
                 f"({item.duration_ms / 1000:.3f} s)\n"
-                f"   Konservative Stille; Evidence "
-                f"{item.audio_evidence.raw_silence_start_ms / 1000:.3f} bis "
-                f"{item.audio_evidence.raw_silence_end_ms / 1000:.3f} s bei "
-                f"{item.audio_evidence.threshold_db} dB; Protection frei.\n\n",
+                f"   {evidence}\n\n",
             )
     else:
         text.insert("end", "Keine zeitentfernenden Schnitte vorgeschlagen.\n")

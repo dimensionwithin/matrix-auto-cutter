@@ -1,4 +1,4 @@
-"""Finalisiertes Sidecar 1.1 und exception-freier Consumer-Validator."""
+"""Versionierte finale Sidecars und exception-freier Consumer-Validator."""
 
 from __future__ import annotations
 
@@ -103,6 +103,10 @@ _OptionalSceneName = Annotated[
     Annotated[str, Field(max_length=200)] | _MissingEventValue,
     WithJsonSchema({"type": "string", "maxLength": 200}),
 ]
+_OptionalSceneUuid = Annotated[
+    CanonicalUuid4 | _MissingEventValue,
+    WithJsonSchema({"type": "string", "format": "uuid"}),
+]
 _OptionalLabel = Annotated[
     Annotated[str, Field(max_length=500)] | _MissingEventValue,
     WithJsonSchema({"type": "string", "maxLength": 500}),
@@ -114,7 +118,7 @@ def _missing_optional_event_value() -> _MissingEventValue:
 
 
 class SidecarEvent(CanonicalModel):
-    """Kanonisches, auf Sourceframes kalibriertes Sidecar-Ereignis."""
+    """Kanonisches Sidecar-1.1-Ereignis ohne stabile Szenen-UUID."""
 
     event_id: CanonicalUuid4
     type: EventType
@@ -163,6 +167,46 @@ class SidecarEvent(CanonicalModel):
         return serialized
 
 
+class SidecarEventV12(SidecarEvent):
+    """Sidecar-1.2-Ereignis mit optionaler stabiler OBS-Szenen-UUID."""
+
+    scene_uuid: _OptionalSceneUuid = Field(default_factory=_missing_optional_event_value)
+
+    @field_validator("scene_uuid", mode="before")
+    @classmethod
+    def reject_explicit_null_scene_uuid(cls, value: object) -> object:
+        """Reject JSON null; absence is the only optional representation."""
+        if value is None:
+            msg = "Optionale Eventfelder dürfen nicht null sein."
+            raise ValueError(msg)
+        return value
+
+    @model_validator(mode="after")
+    def reject_injected_scene_uuid_missing_marker(self) -> SidecarEventV12:
+        """Reject attempts to inject the internal missing-value marker."""
+        if "scene_uuid" in self.model_fields_set and isinstance(
+            self.scene_uuid, _MissingEventValue
+        ):
+            msg = "Der interne Missing-Marker ist kein öffentlicher Eventfeldwert."
+            raise ValueError(msg)
+        return self
+
+    @model_serializer(mode="wrap")
+    def omit_missing_optional_fields_v12(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> object:
+        """Omit an absent 1.2 scene UUID from canonical JSON."""
+        serialized: dict[str, object] = handler(self)
+        for name in (*_OPTIONAL_EVENT_FIELDS, "scene_uuid"):
+            value = getattr(self, name)
+            if name in self.model_fields_set and value is None:
+                msg = f"Explizites null in optionalem Eventfeld {name} ist nicht serialisierbar."
+                raise ValueError(msg)
+            if isinstance(value, _MissingEventValue):
+                serialized.pop(name, None)
+        return serialized
+
+
 class ObsEventSidecar(CanonicalModel):
     """Vollständiger kanonischer Sidecar-1.1-Vertrag."""
 
@@ -186,11 +230,39 @@ class ObsEventSidecar(CanonicalModel):
     finalization: FinalizationEvidence
 
 
+class ObsEventSidecarV12(CanonicalModel):
+    """Vollständiger kanonischer Sidecar-1.2-Vertrag."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://dimensionwithin.local/schemas/obs-events-1.2.json",
+        }
+    )
+
+    artifact_type: Literal["obs_event_sidecar"]
+    schema_version: Literal["1.2"]
+    producer: Producer
+    lifecycle: Lifecycle
+    recording_session_id: CanonicalUuid4
+    source: SourceIdentity
+    clock: ClockCalibration
+    capabilities: SidecarCapabilities
+    pause_intervals: tuple[PauseInterval, ...]
+    events: tuple[SidecarEventV12, ...]
+    finalization: FinalizationEvidence
+
+
+type ValidatedObsEventSidecar = ObsEventSidecar | ObsEventSidecarV12
+
+
 class SidecarValidationResult(CanonicalModel):
     """Auto-Cut-Modus und alle strukturierten Safe-Mode-Gründe."""
 
-    mode: Literal["validated_sidecar_1_1", "no_sidecar_safe_mode"]
-    sidecar: ObsEventSidecar | None = None
+    mode: Literal[
+        "validated_sidecar_1_1", "validated_sidecar_1_2", "no_sidecar_safe_mode"
+    ]
+    sidecar: ValidatedObsEventSidecar | None = None
     reasons: tuple[CoreError, ...]
 
 
@@ -258,7 +330,7 @@ def _identity_matches(actual: SourceIdentity, expected: SourceIdentity) -> bool:
     return exact and duration_within_one_frame
 
 
-def _clock_errors(sidecar: ObsEventSidecar) -> list[CoreError]:
+def _clock_errors(sidecar: ValidatedObsEventSidecar) -> list[CoreError]:
     clock = sidecar.clock
     source = sidecar.source
     span = clock.counter_end - clock.counter_start
@@ -342,7 +414,7 @@ def _clock_errors(sidecar: ObsEventSidecar) -> list[CoreError]:
     )
 
 
-def _policy_errors(sidecar: ObsEventSidecar) -> list[CoreError]:
+def _policy_errors(sidecar: ValidatedObsEventSidecar) -> list[CoreError]:
     failures: list[str] = []
     for event in sidecar.events:
         policy = event.protection.policy
@@ -360,7 +432,7 @@ def _policy_errors(sidecar: ObsEventSidecar) -> list[CoreError]:
     return [core_error(ErrorCode.SIDECAR_POLICY, {"event_ids": failures})] if failures else []
 
 
-def _event_errors(sidecar: ObsEventSidecar) -> list[CoreError]:
+def _event_errors(sidecar: ValidatedObsEventSidecar) -> list[CoreError]:
     failures: list[str] = []
     event_id_counts = Counter(event.event_id for event in sidecar.events)
     duplicate_ids = sorted(str(key) for key, count in event_id_counts.items() if count > 1)
@@ -386,6 +458,12 @@ def _event_errors(sidecar: ObsEventSidecar) -> list[CoreError]:
             failures.append("end_frame_on_non_manual")
         if isinstance(event.scene_name, str) and event.type != "scene_changed":
             failures.append("scene_name_on_wrong_event_type")
+        if (
+            isinstance(event, SidecarEventV12)
+            and isinstance(event.scene_uuid, UUID)
+            and event.type != "scene_changed"
+        ):
+            failures.append("scene_uuid_on_wrong_event_type")
         if isinstance(event.label, str) and event.type != "manual_protection":
             failures.append("label_on_wrong_event_type")
     pair_failures = _pair_structure_failures(sidecar.events)
@@ -480,7 +558,8 @@ def validate_sidecar(
         preliminary.append(
             core_error(ErrorCode.SIDECAR_ARTIFACT_TYPE, {"reason": "wrong_artifact_type"})
         )
-    if raw.get("schema_version") != "1.1":
+    schema_version = raw.get("schema_version")
+    if schema_version not in {"1.1", "1.2"}:
         preliminary.append(
             core_error(ErrorCode.SIDECAR_VERSION, {"reason": "unsupported_schema_version"})
         )
@@ -496,7 +575,11 @@ def validate_sidecar(
     except _JsonInputError as exc:
         return _safe_mode(ErrorCode.SIDECAR_POLICY, "schema_validation", detail=str(exc))
     try:
-        sidecar = ObsEventSidecar.model_validate_json(payload)
+        sidecar = (
+            ObsEventSidecar.model_validate_json(payload)
+            if schema_version == "1.1"
+            else ObsEventSidecarV12.model_validate_json(payload)
+        )
     except ValidationError as exc:
         groups: set[ErrorCode] = set()
         for issue in exc.errors():
@@ -545,7 +628,7 @@ def validate_sidecar(
     if reasons:
         return SidecarValidationResult(mode="no_sidecar_safe_mode", reasons=tuple(reasons))
     return SidecarValidationResult(
-        mode="validated_sidecar_1_1",
+        mode=("validated_sidecar_1_1" if schema_version == "1.1" else "validated_sidecar_1_2"),
         sidecar=sidecar,
         reasons=(),
     )

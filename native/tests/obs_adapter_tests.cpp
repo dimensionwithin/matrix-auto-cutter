@@ -30,6 +30,13 @@ constexpr std::string_view session_id = "11111111-1111-4111-8111-111111111111";
 constexpr std::string_view event_id = "22222222-2222-4222-8222-222222222222";
 constexpr std::string_view recording_path = R"(P:\smoke\real-obs.mp4)";
 
+std::string indexed_event_uuid(const unsigned index) {
+    std::string value = "22222222-2222-4222-8222-222222222220";
+    constexpr char hex[] = "0123456789abcdef";
+    value.back() = hex[index % 16U];
+    return value;
+}
+
 struct TestFailure final : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
@@ -86,6 +93,11 @@ struct BlockingPoint final {
     }
 };
 
+struct AcceptedSnapshot final {
+    std::string kind;
+    ClockSnapshot clock;
+};
+
 struct ProducerState final {
     std::mutex mutex;
     std::condition_variable changed;
@@ -93,6 +105,7 @@ struct ProducerState final {
     ProducerResult stop_result{ProducerResult::producer_ok};
     ProducerResult shutdown_result{ProducerResult::producer_ok};
     ProducerResult durable_result{ProducerResult::producer_ok};
+    unsigned fail_durable_confirm_call{};
     CallbackResult calibration_result{CallbackResult::accepted};
     unsigned starts{};
     unsigned events{};
@@ -104,8 +117,15 @@ struct ProducerState final {
     unsigned durable_confirms{};
     RecordingStart start{};
     RecordingStop stop{};
+    std::vector<EventSnapshot> event_snapshots;
+    std::vector<AcceptedSnapshot> accepted_snapshots;
+    std::optional<ClockSnapshot> simulated_previous_clock;
+    WriterFailure simulated_writer_failure{WriterFailure::none};
+    bool simulated_paused{};
+    bool enforce_writer_order{};
     BlockingPoint shutdown_block;
     BlockingPoint pause_submit_block;
+    BlockingPoint scene_submit_block;
     BlockingPoint durable_confirm_block;
 };
 
@@ -129,15 +149,59 @@ class FakeProducer final : public ProducerPort {
         if (std::holds_alternative<PauseSnapshot>(snapshot)) {
             state_->pause_submit_block.enter_if_enabled();
         }
+        if (const auto* event = std::get_if<EventSnapshot>(&snapshot);
+            event != nullptr && event->event_type == EventType::scene_changed) {
+            state_->scene_submit_block.enter_if_enabled();
+        }
         std::lock_guard lock(state_->mutex);
-        if (std::holds_alternative<EventSnapshot>(snapshot)) {
+        const auto clock = std::visit([](const auto& value) { return value.clock; }, snapshot);
+        const bool is_pause = std::holds_alternative<PauseSnapshot>(snapshot);
+        const bool is_resume = std::holds_alternative<ResumeSnapshot>(snapshot);
+        const bool requires_active = std::holds_alternative<EventSnapshot>(snapshot) ||
+                                     std::holds_alternative<CalibrationSnapshot>(snapshot);
+        std::string kind;
+        if (const auto* event = std::get_if<EventSnapshot>(&snapshot)) {
             ++state_->events;
+            state_->event_snapshots.push_back(*event);
+            kind = event->event_type == EventType::recording_started ? "recording_started"
+                                                                     : "scene_changed";
         } else if (std::holds_alternative<CalibrationSnapshot>(snapshot)) {
             ++state_->calibrations;
+            kind = "calibration";
         } else if (std::holds_alternative<PauseSnapshot>(snapshot)) {
             ++state_->pauses;
+            kind = "pause";
         } else {
             ++state_->resumes;
+            kind = "resume";
+        }
+        if (state_->enforce_writer_order &&
+            state_->calibration_result == CallbackResult::accepted) {
+            if (state_->simulated_previous_clock.has_value() &&
+                clock.monotonic_ns < state_->simulated_previous_clock->monotonic_ns) {
+                state_->simulated_writer_failure = WriterFailure::qpc_regression;
+            } else if (state_->simulated_previous_clock.has_value() &&
+                       clock.output_frame_count <
+                           state_->simulated_previous_clock->output_frame_count) {
+                state_->simulated_writer_failure = WriterFailure::counter_regression;
+            } else if (requires_active && state_->simulated_paused) {
+                state_->simulated_writer_failure = WriterFailure::active_snapshot_while_paused;
+            } else if (is_pause && state_->simulated_paused) {
+                state_->simulated_writer_failure = WriterFailure::pause_while_paused;
+            } else if (is_resume && !state_->simulated_paused) {
+                state_->simulated_writer_failure = WriterFailure::resume_while_active;
+            }
+            if (state_->simulated_writer_failure != WriterFailure::none) {
+                state_->changed.notify_all();
+                return CallbackResult::terminal;
+            }
+            state_->accepted_snapshots.push_back(AcceptedSnapshot{kind, clock});
+            state_->simulated_previous_clock = clock;
+            if (is_pause) {
+                state_->simulated_paused = true;
+            } else if (is_resume) {
+                state_->simulated_paused = false;
+            }
         }
         state_->changed.notify_all();
         return state_->calibration_result;
@@ -147,6 +211,22 @@ class FakeProducer final : public ProducerPort {
         std::lock_guard lock(state_->mutex);
         ++state_->stops;
         state_->stop = stop;
+        if (state_->enforce_writer_order) {
+            if (state_->simulated_previous_clock.has_value() &&
+                stop.clock.monotonic_ns < state_->simulated_previous_clock->monotonic_ns) {
+                state_->simulated_writer_failure = WriterFailure::qpc_regression;
+            } else if (state_->simulated_previous_clock.has_value() &&
+                       stop.clock.output_frame_count <
+                           state_->simulated_previous_clock->output_frame_count) {
+                state_->simulated_writer_failure = WriterFailure::counter_regression;
+            }
+            if (state_->simulated_writer_failure != WriterFailure::none) {
+                state_->changed.notify_all();
+                return ProducerResult::producer_internal_error;
+            }
+            state_->accepted_snapshots.push_back(AcceptedSnapshot{"stop", stop.clock});
+            state_->simulated_previous_clock = stop.clock;
+        }
         state_->changed.notify_all();
         return state_->stop_result;
     }
@@ -156,7 +236,10 @@ class FakeProducer final : public ProducerPort {
         std::lock_guard lock(state_->mutex);
         ++state_->durable_confirms;
         state_->changed.notify_all();
-        return state_->durable_result;
+        return state_->fail_durable_confirm_call == 0 ||
+                       state_->durable_confirms == state_->fail_durable_confirm_call
+                   ? state_->durable_result
+                   : ProducerResult::producer_ok;
     }
 
     ProducerResult shutdown() noexcept override {
@@ -174,10 +257,11 @@ class FakeProducer final : public ProducerPort {
 
     matrix_auto_cutter::ProducerStatus status() const noexcept override {
         std::lock_guard lock(state_->mutex);
-        return matrix_auto_cutter::ProducerStatus{
-            matrix_auto_cutter::ProducerState::recording_active,
-            state_->shutdown_result,
-        };
+        matrix_auto_cutter::ProducerStatus status;
+        status.state = matrix_auto_cutter::ProducerState::recording_active;
+        status.result = state_->shutdown_result;
+        status.writer_failure = state_->simulated_writer_failure;
+        return status;
     }
 
     std::string recording_session_id() const noexcept override {
@@ -212,8 +296,10 @@ class FakeHost final : public AdapterHost {
         void* private_data) noexcept override {
         std::lock_guard lock(mutex_);
         frontend_ = frontend;
+        stale_frontend_ = frontend;
         tick_ = tick;
         private_data_ = private_data;
+        stale_private_data_ = private_data;
         installed = true;
         ++install_calls;
         return install_result;
@@ -273,11 +359,58 @@ class FakeHost final : public AdapterHost {
         return true;
     }
 
+    SceneHandle acquire_current_program_scene() noexcept override {
+        ++scene_acquire_calls;
+        if (!scene_available.load(std::memory_order_acquire)) {
+            return nullptr;
+        }
+        scene_references.fetch_add(1, std::memory_order_acq_rel);
+        scene_acquire_block.enter_if_enabled();
+        return &scene_token_;
+    }
+
+    std::string_view scene_uuid(const SceneHandle scene) noexcept override {
+        ++scene_uuid_calls;
+        if (scene != &scene_token_ || scene_references.load(std::memory_order_acquire) == 0) {
+            return {};
+        }
+        std::lock_guard lock(mutex_);
+        return scene_uuid_;
+    }
+
+    std::string_view scene_name(const SceneHandle scene) noexcept override {
+        ++scene_name_calls;
+        if (scene != &scene_token_ || scene_references.load(std::memory_order_acquire) == 0) {
+            return {};
+        }
+        std::lock_guard lock(mutex_);
+        return scene_name_;
+    }
+
+    void release_scene(const SceneHandle scene) noexcept override {
+        ++scene_release_calls;
+        if (scene != &scene_token_) {
+            ++scene_release_errors;
+            return;
+        }
+        unsigned current = scene_references.load(std::memory_order_acquire);
+        while (current > 0 && !scene_references.compare_exchange_weak(
+                                  current,
+                                  current - 1,
+                                  std::memory_order_acq_rel,
+                                  std::memory_order_acquire)) {
+        }
+        if (current == 0) {
+            ++scene_release_errors;
+        }
+    }
+
     bool capture_clock(
         std::uint64_t& absolute_monotonic_ns,
         std::uint64_t& output_frame_count) noexcept override {
         capture_clock_block.enter_if_enabled();
-        if (!capture_result || references.load(std::memory_order_acquire) == 0) {
+        if (!capture_result || !capture_clock_result ||
+            references.load(std::memory_order_acquire) == 0) {
             return false;
         }
         std::lock_guard lock(mutex_);
@@ -325,11 +458,27 @@ class FakeHost final : public AdapterHost {
         next_signal_.fragmented_mp4 = fragmented;
     }
 
+    void set_scene(const std::string_view uuid, const std::string_view name) {
+        std::lock_guard lock(mutex_);
+        scene_uuid_.assign(uuid);
+        scene_name_.assign(name);
+    }
+
     bool has_log(const std::string_view text) const {
         std::lock_guard lock(mutex_);
         return std::any_of(logs.begin(), logs.end(), [&](const auto& line) {
             return line.find(text) != std::string::npos;
         });
+    }
+
+    std::string joined_logs() const {
+        std::lock_guard lock(mutex_);
+        std::string result;
+        for (const auto& line : logs) {
+            result += line;
+            result.push_back('\n');
+        }
+        return result;
     }
 
     void fire_frontend(const FrontendEvent event) noexcept {
@@ -342,6 +491,12 @@ class FakeHost final : public AdapterHost {
         }
         if (callback != nullptr) {
             callback(event, data);
+        }
+    }
+
+    void fire_stale_frontend(const FrontendEvent event) noexcept {
+        if (stale_frontend_ != nullptr) {
+            stale_frontend_(event, stale_private_data_);
         }
     }
 
@@ -375,6 +530,8 @@ class FakeHost final : public AdapterHost {
     bool acquire_result{true};
     bool connect_result{true};
     std::atomic<bool> capture_result{true};
+    std::atomic<bool> capture_clock_result{true};
+    std::atomic<bool> scene_available{true};
     bool installed{};
     bool output_connected{};
     std::atomic<unsigned> install_calls{};
@@ -384,19 +541,31 @@ class FakeHost final : public AdapterHost {
     std::atomic<unsigned> disconnect_calls{};
     std::atomic<unsigned> release_calls{};
     std::atomic<unsigned> references{};
+    std::atomic<unsigned> scene_acquire_calls{};
+    std::atomic<unsigned> scene_uuid_calls{};
+    std::atomic<unsigned> scene_name_calls{};
+    std::atomic<unsigned> scene_release_calls{};
+    std::atomic<unsigned> scene_release_errors{};
+    std::atomic<unsigned> scene_references{};
     BlockingPoint acquire_block;
     BlockingPoint capture_output_block;
     BlockingPoint capture_clock_block;
+    BlockingPoint scene_acquire_block;
     std::vector<std::string> cleanup_order;
     std::vector<std::string> logs;
 
   private:
     mutable std::mutex mutex_;
     RecordingSignal next_signal_{};
+    int scene_token_{};
+    std::string scene_uuid_{"444eb885-e589-4338-832c-8f5fd7eaaf41"};
+    std::string scene_name_{"Outro"};
     FrontendCallback frontend_{};
+    FrontendCallback stale_frontend_{};
     TickCallback tick_{};
     OutputCallback output_{};
     void* private_data_{};
+    void* stale_private_data_{};
     void* output_private_data_{};
 };
 
@@ -473,6 +642,17 @@ AdapterOptions test_options(
     return options;
 }
 
+AdapterOptions ordered_test_options(
+    const std::filesystem::path& local_app_data,
+    const std::shared_ptr<ModuleCounters>& module = {}) {
+    auto options = test_options(local_app_data, module);
+    auto uuid_index = std::make_shared<std::atomic<unsigned>>(0);
+    options.event_uuid_factory = [uuid_index] {
+        return indexed_event_uuid(uuid_index->fetch_add(1, std::memory_order_relaxed));
+    };
+    return options;
+}
+
 void wait_for_producer_count(
     const std::shared_ptr<ProducerState>& state,
     const std::function<bool(const ProducerState&)>& ready,
@@ -512,12 +692,567 @@ void anchor_recording(
 void stop_output_successfully(
     FakeHost& host,
     ObsJournalAdapter& adapter,
-    const std::shared_ptr<ProducerState>& producer) {
-    host.set_signal(recording_path, 14'000'000'000ULL, 248);
+    const std::shared_ptr<ProducerState>& producer,
+    const std::uint64_t absolute_monotonic_ns = 14'000'000'000ULL,
+    const std::uint64_t output_frame_count = 248) {
+    host.set_signal(recording_path, absolute_monotonic_ns, output_frame_count);
     host.fire_output(OutputEvent::stopped, 0);
     wait_for_producer_count(producer, [](const auto& value) { return value.shutdowns == 1; },
                             "successful output stop did not shut down producer");
     wait_for([&] { return adapter.state() == AdapterState::idle; }, "normal stop did not return idle");
+}
+
+std::vector<EventSnapshot> scene_snapshots(const std::shared_ptr<ProducerState>& producer) {
+    std::lock_guard lock(producer->mutex);
+    std::vector<EventSnapshot> result;
+    for (const auto& event : producer->event_snapshots) {
+        if (event.event_type == EventType::scene_changed) {
+            result.push_back(event);
+        }
+    }
+    return result;
+}
+
+std::string rapid_scene_uuid(unsigned index);
+
+std::vector<std::string> accepted_kinds(const std::shared_ptr<ProducerState>& producer) {
+    std::lock_guard lock(producer->mutex);
+    std::vector<std::string> result;
+    for (const auto& snapshot : producer->accepted_snapshots) {
+        if (snapshot.kind != "recording_started") {
+            result.push_back(snapshot.kind);
+        }
+    }
+    return result;
+}
+
+void check_no_simulated_writer_failure(
+    const std::shared_ptr<ProducerState>& producer,
+    const std::string_view message) {
+    std::lock_guard lock(producer->mutex);
+    check(producer->simulated_writer_failure == WriterFailure::none, message);
+}
+
+void run_scene_before_pause_order_test(const bool same_clock) {
+    TempRoot root;
+    auto producer = std::make_shared<ProducerState>();
+    producer->enforce_writer_order = true;
+    producer->scene_submit_block.enabled = true;
+    producer->scene_submit_block.one_shot = true;
+    FakeFactory factory(producer);
+    FakeHost host;
+    ObsJournalAdapter adapter(host, factory, ordered_test_options(root.path));
+    check(adapter.load(), "scene-before-pause load failed");
+    start_output(host, adapter, producer);
+    anchor_recording(host, producer);
+
+    host.set_scene(rapid_scene_uuid(0), "Worker blocker");
+    host.set_signal(recording_path, 10'200'000'000ULL, 20);
+    host.fire_frontend(FrontendEvent::scene_changed);
+    producer->scene_submit_block.wait_until_entered();
+
+    host.set_scene(rapid_scene_uuid(1), "Scene before pause");
+    host.set_signal(recording_path, 11'000'000'000ULL, 60);
+    host.fire_frontend(FrontendEvent::scene_changed);
+    host.set_signal(
+        recording_path,
+        same_clock ? 11'000'000'000ULL : 11'016'666'667ULL,
+        same_clock ? 60 : 61);
+    host.fire_output(OutputEvent::paused);
+    check(adapter.pending_scene_change_commands() == 1,
+          "target scene was not waiting ahead of pause");
+    check(adapter.pending_pause_resume_commands() == 1,
+          "pause was not waiting behind target scene");
+
+    producer->scene_submit_block.release();
+    wait_for_producer_count(producer, [](const auto& value) { return value.pauses == 1; },
+                            "ordered pause was not submitted");
+    wait_for([&] { return adapter.pending_pause_resume_commands() == 0; },
+             "ordered pause did not become durable");
+    check(scene_snapshots(producer).size() == 2,
+          "scene accepted before pause was discarded or overtaken");
+    check_no_simulated_writer_failure(
+        producer,
+        "scene-before-pause caused QPC/counter/paused writer failure");
+
+    host.set_signal(recording_path, 14'000'000'000ULL, 248);
+    host.fire_output(OutputEvent::stopped, 0);
+    wait_for([&] { return adapter.state() == AdapterState::idle; },
+             "scene-before-pause run did not stop successfully");
+    check(accepted_kinds(producer) ==
+              std::vector<std::string>({"scene_changed", "scene_changed", "pause", "stop"}),
+          "global order did not preserve scene before pause/stop");
+    check_no_simulated_writer_failure(producer, "scene-before-pause run failed writer order");
+    const auto report = adapter.last_report();
+    check(report.has_value() && report->successful,
+          "scene-before-pause caused an unnecessary run abort");
+    adapter.unload();
+}
+
+void test_scene_before_pause_global_order() {
+    run_scene_before_pause_order_test(false);
+    run_scene_before_pause_order_test(true);
+}
+
+void test_scene_before_resume_global_order() {
+    TempRoot root;
+    auto producer = std::make_shared<ProducerState>();
+    producer->enforce_writer_order = true;
+    producer->scene_submit_block.enabled = true;
+    producer->scene_submit_block.one_shot = true;
+    FakeFactory factory(producer);
+    FakeHost host;
+    ObsJournalAdapter adapter(host, factory, ordered_test_options(root.path));
+    check(adapter.load(), "scene-before-resume load failed");
+    start_output(host, adapter, producer);
+    anchor_recording(host, producer);
+
+    host.set_scene(rapid_scene_uuid(0), "Worker blocker");
+    host.set_signal(recording_path, 10'200'000'000ULL, 20);
+    host.fire_frontend(FrontendEvent::scene_changed);
+    producer->scene_submit_block.wait_until_entered();
+    host.set_scene(rapid_scene_uuid(1), "Scene before pause and resume");
+    host.set_signal(recording_path, 11'000'000'000ULL, 60);
+    host.fire_frontend(FrontendEvent::scene_changed);
+    host.set_signal(recording_path, 11'016'666'667ULL, 61);
+    host.fire_output(OutputEvent::paused);
+    host.set_signal(recording_path, 11'033'333'334ULL, 62);
+    host.fire_output(OutputEvent::resumed);
+    check(adapter.pending_pause_resume_commands() == 2,
+          "pause/resume pair was not queued behind scene");
+
+    producer->scene_submit_block.release();
+    wait_for([&] {
+        return adapter.state() == AdapterState::active &&
+               adapter.pending_pause_resume_commands() == 0;
+    }, "ordered pause/resume pair did not drain");
+    check(scene_snapshots(producer).size() == 2,
+          "scene before resume path was lost");
+    check_no_simulated_writer_failure(
+        producer,
+        "scene-before-resume caused QPC/counter/paused writer failure");
+    host.set_signal(recording_path, 14'000'000'000ULL, 248);
+    host.fire_output(OutputEvent::stopped, 0);
+    wait_for([&] { return adapter.state() == AdapterState::idle; },
+             "scene-before-resume run did not stop successfully");
+    check(accepted_kinds(producer) == std::vector<std::string>({
+              "scene_changed", "scene_changed", "pause", "resume", "stop"}),
+          "global order did not preserve scene/pause/resume sequence");
+    check_no_simulated_writer_failure(producer, "scene-before-resume run failed writer order");
+    adapter.unload();
+}
+
+void test_resume_before_scene_is_the_only_allowed_paused_order() {
+    TempRoot root;
+    auto producer = std::make_shared<ProducerState>();
+    producer->enforce_writer_order = true;
+    producer->scene_submit_block.enabled = true;
+    producer->scene_submit_block.one_shot = true;
+    FakeFactory factory(producer);
+    FakeHost host;
+    ObsJournalAdapter adapter(host, factory, ordered_test_options(root.path));
+    check(adapter.load(), "resume-before-scene load failed");
+    start_output(host, adapter, producer);
+    anchor_recording(host, producer);
+
+    host.set_signal(recording_path, 11'000'000'000ULL, 68);
+    host.fire_output(OutputEvent::paused);
+    wait_for([&] { return adapter.pending_pause_resume_commands() == 0; },
+             "resume-before-scene pause did not become durable");
+    host.set_scene(rapid_scene_uuid(0), "Rejected while paused");
+    host.set_signal(recording_path, 11'100'000'000ULL, 74);
+    host.fire_frontend(FrontendEvent::scene_changed);
+
+    host.set_signal(recording_path, 12'000'000'000ULL, 128);
+    host.fire_output(OutputEvent::resumed);
+    wait_for([&] { return adapter.pending_pause_resume_commands() == 0; },
+             "resume did not become durable before allowed scene");
+    wait_for([&] { return adapter.state() == AdapterState::active; },
+             "durable resume did not reactivate scene admission");
+    host.set_scene(rapid_scene_uuid(1), "Allowed after resume");
+    bool scene_admitted = false;
+    for (std::uint64_t attempt = 0; attempt != 100 && !scene_admitted; ++attempt) {
+        host.set_signal(
+            recording_path, 12'100'000'000ULL + attempt * 1'000'000ULL, 134 + attempt);
+        host.fire_frontend(FrontendEvent::scene_changed);
+        scene_admitted = host.has_log(
+            "program scene change value snapshot queued for adapter worker");
+        if (!scene_admitted) {
+            std::this_thread::yield();
+        }
+    }
+    check(scene_admitted, "post-resume scene could not be admitted on bounded callback path");
+    {
+        std::unique_lock lock(producer->scene_submit_block.mutex);
+        if (!producer->scene_submit_block.changed.wait_for(
+                lock, 2s, [&] { return producer->scene_submit_block.entered; })) {
+            throw TestFailure(
+                "post-resume scene did not reach worker blocking point; logs:\n" +
+                host.joined_logs());
+        }
+    }
+    host.set_signal(recording_path, 13'000'000'000ULL, 240);
+    host.fire_output(OutputEvent::stopped, 0);
+    producer->scene_submit_block.release();
+
+    wait_for([&] { return adapter.state() == AdapterState::idle; },
+             "resume/scene/stop sequence did not return idle");
+    check(accepted_kinds(producer) ==
+              std::vector<std::string>({"pause", "resume", "scene_changed", "stop"}),
+          "paused/resume scene admission violated the allowed global order");
+    check(scene_snapshots(producer).size() == 1 &&
+              scene_snapshots(producer)[0].label == "Allowed after resume",
+          "paused scene was invented or post-resume scene was lost");
+    check_no_simulated_writer_failure(
+        producer,
+        "resume-before-scene caused QPC/counter/paused writer failure");
+    adapter.unload();
+}
+
+void test_calibration_scene_control_global_order() {
+    TempRoot root;
+    auto producer = std::make_shared<ProducerState>();
+    producer->enforce_writer_order = true;
+    producer->scene_submit_block.enabled = true;
+    producer->scene_submit_block.one_shot = true;
+    FakeFactory factory(producer);
+    FakeHost host;
+    ObsJournalAdapter adapter(host, factory, ordered_test_options(root.path));
+    check(adapter.load(), "calibration-scene-control load failed");
+    start_output(host, adapter, producer);
+    anchor_recording(host, producer);
+
+    host.set_scene(rapid_scene_uuid(0), "Worker blocker");
+    host.set_signal(recording_path, 10'200'000'000ULL, 20);
+    host.fire_frontend(FrontendEvent::scene_changed);
+    producer->scene_submit_block.wait_until_entered();
+    host.set_signal(recording_path, 12'100'000'000ULL, 134);
+    host.fire_tick();
+    host.set_scene(rapid_scene_uuid(1), "After calibration");
+    host.set_signal(recording_path, 12'200'000'000ULL, 140);
+    host.fire_frontend(FrontendEvent::scene_changed);
+    host.set_signal(recording_path, 12'300'000'000ULL, 146);
+    host.fire_output(OutputEvent::paused);
+
+    producer->scene_submit_block.release();
+    wait_for_producer_count(producer, [](const auto& value) { return value.pauses == 1; },
+                            "calibration/scene/pause commands did not drain");
+    wait_for([&] { return adapter.pending_pause_resume_commands() == 0; },
+             "calibration/scene pause did not become durable");
+    check(accepted_kinds(producer) == std::vector<std::string>({
+              "scene_changed", "calibration", "scene_changed", "pause"}),
+          "calibration coalescing damaged global command order");
+    check_no_simulated_writer_failure(
+        producer,
+        "calibration/scene/control caused QPC/counter/paused writer failure");
+    host.set_signal(recording_path, 14'000'000'000ULL, 248);
+    host.fire_output(OutputEvent::stopped, 0);
+    wait_for([&] { return adapter.state() == AdapterState::idle; },
+             "calibration-scene-control run did not stop successfully");
+    check(accepted_kinds(producer) == std::vector<std::string>({
+              "scene_changed", "calibration", "scene_changed", "pause", "stop"}),
+          "stop overtook calibration/scene/control sequence");
+    check_no_simulated_writer_failure(producer, "calibration global order failed");
+    adapter.unload();
+}
+
+void test_scene_change_gates_and_active_value_snapshot() {
+    TempRoot root;
+    auto producer = std::make_shared<ProducerState>();
+    FakeFactory factory(producer);
+    FakeHost host;
+    std::mutex uuid_mutex;
+    std::vector<std::thread::id> uuid_threads;
+    unsigned uuid_index = 0;
+    auto options = test_options(root.path);
+    options.event_uuid_factory = [&] {
+        std::lock_guard lock(uuid_mutex);
+        uuid_threads.push_back(std::this_thread::get_id());
+        return indexed_event_uuid(uuid_index++);
+    };
+    ObsJournalAdapter adapter(host, factory, std::move(options));
+    check(adapter.load(), "scene-change load failed");
+
+    host.fire_frontend(FrontendEvent::scene_changed);
+    check(host.scene_acquire_calls.load(std::memory_order_acquire) == 0,
+          "scene outside recording touched OBS scene state");
+
+    start_output(host, adapter, producer);
+    host.fire_frontend(FrontendEvent::scene_changed);
+    check(host.scene_acquire_calls.load(std::memory_order_acquire) == 0,
+          "scene before accepted recording_started touched OBS scene state");
+    check(scene_snapshots(producer).empty(),
+          "scene before accepted recording_started was journaled");
+
+    anchor_recording(host, producer);
+    host.fire_frontend(FrontendEvent::other);
+    check(host.scene_acquire_calls.load(std::memory_order_acquire) == 0,
+          "non-program frontend event entered the scene change path");
+    constexpr std::string_view source_uuid = "444eb885-e589-4338-832c-8f5fd7eaaf41";
+    constexpr std::string_view exact_name = "Outro – Exakt";
+    host.set_scene(source_uuid, exact_name);
+    host.set_signal(recording_path, 10'500'000'000ULL, 38);
+    const auto callback_thread = std::this_thread::get_id();
+    host.fire_frontend(FrontendEvent::scene_changed);
+    const auto scene_deadline = std::chrono::steady_clock::now() + 2s;
+    while (scene_snapshots(producer).size() != 1 &&
+           std::chrono::steady_clock::now() < scene_deadline) {
+        std::this_thread::yield();
+    }
+    if (scene_snapshots(producer).size() != 1) {
+        throw TestFailure("active scene_changed was not accepted exactly once; logs:\n" +
+                          host.joined_logs());
+    }
+
+    const auto scenes = scene_snapshots(producer);
+    check(scenes.size() == 1, "active scene change emitted more than one event");
+    check(scenes[0].source_uuid == source_uuid, "stable scene UUID was not preserved");
+    check(scenes[0].label == exact_name, "exact scene name was not preserved as label");
+    check(!scenes[0].pair_id.has_value(), "scene_changed unexpectedly received pair_id");
+    check(scenes[0].clock.monotonic_ns == 500'000'000ULL,
+          "scene_changed relative QPC time changed");
+    check(scenes[0].clock.output_frame_count == 38,
+          "scene_changed output frame counter changed");
+    check(!scenes[0].clock.recording_paused, "active scene_changed was marked paused");
+    check(host.scene_acquire_calls.load(std::memory_order_acquire) == 1 &&
+              host.scene_release_calls.load(std::memory_order_acquire) == 1 &&
+              host.scene_references.load(std::memory_order_acquire) == 0 &&
+              host.scene_release_errors.load(std::memory_order_acquire) == 0,
+          "successful scene reference was not released exactly once");
+    {
+        std::lock_guard lock(uuid_mutex);
+        check(uuid_threads.size() == 2,
+              "event UUID factory was not called once per recording/scene event");
+        check(std::all_of(uuid_threads.begin(), uuid_threads.end(), [&](const auto id) {
+                  return id != callback_thread;
+              }),
+              "event UUID was generated on the frontend callback thread");
+    }
+
+    stop_output_successfully(host, adapter, producer);
+    adapter.unload();
+}
+
+void test_scene_change_fail_closed_capture_and_control_paths() {
+    TempRoot root;
+    auto producer = std::make_shared<ProducerState>();
+    FakeFactory factory(producer);
+    FakeHost host;
+    ObsJournalAdapter adapter(host, factory, test_options(root.path));
+    check(adapter.load(), "scene-failure load failed");
+    start_output(host, adapter, producer);
+    anchor_recording(host, producer);
+
+    host.set_signal(recording_path, 10'500'000'000ULL, 38);
+    host.scene_available.store(false, std::memory_order_release);
+    host.fire_frontend(FrontendEvent::scene_changed);
+    check(host.scene_release_calls.load(std::memory_order_acquire) == 0,
+          "null scene attempted to release a nonexistent reference");
+    host.scene_available.store(true, std::memory_order_release);
+
+    host.set_scene("", "Missing UUID");
+    host.fire_frontend(FrontendEvent::scene_changed);
+    host.set_scene("not-a-uuid", "Invalid UUID");
+    host.fire_frontend(FrontendEvent::scene_changed);
+    host.set_scene("444eb885-e589-4338-832c-8f5fd7eaaf41", "");
+    host.fire_frontend(FrontendEvent::scene_changed);
+    host.set_scene("444eb885-e589-4338-832c-8f5fd7eaaf41", "Clock failure");
+    host.capture_clock_result.store(false, std::memory_order_release);
+    host.fire_frontend(FrontendEvent::scene_changed);
+    host.capture_clock_result.store(true, std::memory_order_release);
+    host.set_scene("444eb885-e589-4338-832c-8f5fd7eaaf41", "Regressed clock");
+    host.set_signal(recording_path, 9'999'999'999ULL, 6);
+    host.fire_frontend(FrontendEvent::scene_changed);
+    check(scene_snapshots(producer).empty(),
+          "invalid scene identity or clock produced a scene_changed event");
+    check(host.scene_acquire_calls.load(std::memory_order_acquire) == 6 &&
+              host.scene_release_calls.load(std::memory_order_acquire) == 5 &&
+              host.scene_references.load(std::memory_order_acquire) == 0 &&
+              host.scene_release_errors.load(std::memory_order_acquire) == 0,
+          "scene failure paths did not release every acquired reference exactly once");
+
+    host.set_scene("444eb885-e589-4338-832c-8f5fd7eaaf41", "Paused");
+    host.set_signal(recording_path, 12'000'000'000ULL, 120);
+    host.fire_output(OutputEvent::paused);
+    wait_for([&] { return adapter.pending_pause_resume_commands() == 0; },
+             "pause command did not become durable");
+    const auto acquired_before_pause_scene =
+        host.scene_acquire_calls.load(std::memory_order_acquire);
+    host.fire_frontend(FrontendEvent::scene_changed);
+    check(host.scene_acquire_calls.load(std::memory_order_acquire) == acquired_before_pause_scene,
+          "paused scene change touched OBS scene state");
+
+    producer->durable_confirm_block.enabled = true;
+    producer->durable_confirm_block.released = false;
+    producer->durable_confirm_block.entered = false;
+    host.set_signal(recording_path, 15'000'000'000ULL, 121);
+    host.fire_output(OutputEvent::resumed);
+    producer->durable_confirm_block.wait_until_entered();
+    check(adapter.pending_pause_resume_commands() == 1,
+          "resume transition was not visibly open");
+    host.fire_frontend(FrontendEvent::scene_changed);
+    check(host.scene_acquire_calls.load(std::memory_order_acquire) == acquired_before_pause_scene,
+          "scene change during open resume touched OBS scene state");
+    producer->durable_confirm_block.release();
+    wait_for([&] { return adapter.state() == AdapterState::active; },
+             "resume did not reactivate after scene gate test");
+    check(scene_snapshots(producer).empty(),
+          "pause/open-control scene change produced an active event");
+
+    stop_output_successfully(host, adapter, producer, 16'000'000'000ULL, 180);
+    adapter.unload();
+}
+
+std::string rapid_scene_uuid(const unsigned index) {
+    std::string value = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa0";
+    constexpr char hex[] = "0123456789abcdef";
+    value.back() = hex[index % 16U];
+    return value;
+}
+
+void test_rapid_scene_changes_are_bounded_and_ordered() {
+    TempRoot root;
+    auto producer = std::make_shared<ProducerState>();
+    producer->enforce_writer_order = true;
+    producer->scene_submit_block.enabled = true;
+    producer->scene_submit_block.one_shot = true;
+    FakeFactory factory(producer);
+    FakeHost host;
+    ObsJournalAdapter adapter(host, factory, ordered_test_options(root.path));
+    check(adapter.load(), "rapid-scene load failed");
+    start_output(host, adapter, producer);
+    anchor_recording(host, producer);
+
+    host.set_scene(rapid_scene_uuid(0), "Rapid-0");
+    host.set_signal(recording_path, 10'100'000'000ULL, 14);
+    host.fire_frontend(FrontendEvent::scene_changed);
+    producer->scene_submit_block.wait_until_entered();
+    for (unsigned index = 1; index <= scene_change_command_capacity + 3; ++index) {
+        host.set_scene(rapid_scene_uuid(index), "Rapid-" + std::to_string(index));
+        host.set_signal(recording_path, 10'100'000'000ULL + index * 1'000'000ULL, 14 + index);
+        host.fire_frontend(FrontendEvent::scene_changed);
+    }
+    check(adapter.pending_scene_change_commands() == scene_change_command_capacity,
+          "rapid scene queue was not capped at its declared capacity");
+    check(host.has_log("bounded scene command queue is full"),
+          "rapid scene overflow was not logged fail closed");
+    check(host.scene_references.load(std::memory_order_acquire) == 0 &&
+              host.scene_release_calls.load(std::memory_order_acquire) ==
+                  scene_change_command_capacity + 4,
+          "rapid scene callbacks retained an OBS scene reference");
+
+    producer->scene_submit_block.release();
+    wait_for([&] {
+        return scene_snapshots(producer).size() == scene_change_command_capacity + 1;
+    }, "bounded rapid scene queue did not drain");
+    const auto scenes = scene_snapshots(producer);
+    for (std::size_t index = 0; index < scenes.size(); ++index) {
+        check(scenes[index].label == "Rapid-" + std::to_string(index),
+              "rapid scene commands lost FIFO order");
+        check(scenes[index].source_uuid == rapid_scene_uuid(static_cast<unsigned>(index)),
+              "rapid scene UUID snapshot changed before worker processing");
+    }
+    check_no_simulated_writer_failure(producer, "rapid scene queue changed accepted order");
+    stop_output_successfully(host, adapter, producer);
+    check_no_simulated_writer_failure(producer, "rapid scene queue failed at stop");
+    adapter.unload();
+}
+
+void test_stop_closes_queued_scene_change_path() {
+    TempRoot root;
+    auto producer = std::make_shared<ProducerState>();
+    producer->enforce_writer_order = true;
+    producer->scene_submit_block.enabled = true;
+    producer->scene_submit_block.one_shot = true;
+    FakeFactory factory(producer);
+    FakeHost host;
+    ObsJournalAdapter adapter(host, factory, ordered_test_options(root.path));
+    check(adapter.load(), "scene-stop load failed");
+    start_output(host, adapter, producer);
+    anchor_recording(host, producer);
+
+    host.set_scene(rapid_scene_uuid(0), "Before stop");
+    host.set_signal(recording_path, 10'500'000'000ULL, 38);
+    host.fire_frontend(FrontendEvent::scene_changed);
+    producer->scene_submit_block.wait_until_entered();
+    host.set_scene(rapid_scene_uuid(1), "Also before stop");
+    host.set_signal(recording_path, 10'600'000'000ULL, 44);
+    host.fire_frontend(FrontendEvent::scene_changed);
+    check(adapter.pending_scene_change_commands() == 1,
+          "second scene was not queued before stop");
+    host.set_signal(recording_path, 14'000'000'000ULL, 248);
+    host.fire_output(OutputEvent::stopped, 0);
+    const auto acquired_before_late_scene =
+        host.scene_acquire_calls.load(std::memory_order_acquire);
+    host.set_scene(rapid_scene_uuid(2), "Late after stop");
+    host.fire_frontend(FrontendEvent::scene_changed);
+    check(host.scene_acquire_calls.load(std::memory_order_acquire) == acquired_before_late_scene,
+          "scene callback linearized after stop touched OBS scene state");
+    producer->scene_submit_block.release();
+    wait_for_producer_count(producer, [](const auto& value) { return value.shutdowns == 1; },
+                            "stop did not drain/close queued scene path");
+    wait_for([&] { return adapter.state() == AdapterState::idle; },
+             "scene-path stop did not return idle");
+    const auto scenes = scene_snapshots(producer);
+    check(scenes.size() == 2 && scenes[0].label == "Before stop" &&
+              scenes[1].label == "Also before stop",
+          "stop overtook a scene command linearized before its boundary");
+    check(accepted_kinds(producer) ==
+              std::vector<std::string>({"scene_changed", "scene_changed", "stop"}),
+          "scene/stop global order was not deterministic");
+    check_no_simulated_writer_failure(
+        producer,
+        "scene-before-stop caused QPC/counter/paused writer failure");
+    check(adapter.pending_scene_change_commands() == 0,
+          "stop left a queued scene command behind");
+    check(host.scene_release_calls.load(std::memory_order_acquire) == 2 &&
+              host.scene_references.load(std::memory_order_acquire) == 0,
+          "stop path retained or double-released a scene reference");
+    const auto report = adapter.last_report();
+    check(report.has_value() && report->successful,
+          "scene-before-stop caused an unnecessary run abort");
+    adapter.unload();
+}
+
+void test_scene_stop_unload_and_closed_callback_gate_are_safe() {
+    TempRoot root;
+    auto producer = std::make_shared<ProducerState>();
+    auto module = std::make_shared<ModuleCounters>();
+    FakeFactory factory(producer);
+    FakeHost host;
+    host.scene_acquire_block.enabled = true;
+    auto options = test_options(root.path, module);
+    options.unload_deadline = 1ms;
+    ObsJournalAdapter adapter(host, factory, std::move(options));
+    check(adapter.load(), "scene-unload load failed");
+    start_output(host, adapter, producer);
+    anchor_recording(host, producer);
+    host.set_scene("444eb885-e589-4338-832c-8f5fd7eaaf41", "Blocked unload");
+    host.set_signal(recording_path, 10'500'000'000ULL, 38);
+    std::thread callback([&] { host.fire_frontend(FrontendEvent::scene_changed); });
+    host.scene_acquire_block.wait_until_entered();
+    adapter.unload();
+    check(module->pins.load(std::memory_order_acquire) == 2,
+          "scene callback/worker DLL pins were released during unload timeout");
+    check(host.release_calls.load(std::memory_order_acquire) == 0,
+          "recording output reference was released while scene clock capture was blocked");
+    host.scene_acquire_block.release();
+    callback.join();
+    wait_for([&] { return module->pins.load(std::memory_order_acquire) == 0; },
+             "scene callback/worker pins did not drain after unload");
+    check(host.scene_release_calls.load(std::memory_order_acquire) == 1 &&
+              host.scene_references.load(std::memory_order_acquire) == 0 &&
+              host.scene_release_errors.load(std::memory_order_acquire) == 0,
+          "blocked unload did not release scene reference exactly once");
+    check(host.disconnect_calls.load(std::memory_order_acquire) == 1 &&
+              host.release_calls.load(std::memory_order_acquire) == 1,
+          "scene unload did not disconnect and release output exactly once");
+    const auto scene_acquires = host.scene_acquire_calls.load(std::memory_order_acquire);
+    const auto log_count = host.logs.size();
+    host.fire_stale_frontend(FrontendEvent::scene_changed);
+    check(host.scene_acquire_calls.load(std::memory_order_acquire) == scene_acquires &&
+              host.logs.size() == log_count,
+          "callback after closed gate accessed adapter or OBS host state");
 }
 
 void test_output_lifecycle_authority_normative_path_and_exact_binding() {
@@ -685,7 +1420,7 @@ void test_actual_output_pause_resume_is_ordered_and_gates_calibration() {
     host.fire_tick();
     wait_for_producer_count(producer, [](const auto& value) { return value.calibrations == 1; },
                             "calibration did not continue after resume");
-    stop_output_successfully(host, adapter, producer);
+    stop_output_successfully(host, adapter, producer, 18'000'000'000ULL, 302);
     std::lock_guard lock(producer->mutex);
     check(!producer->stop.clock.recording_paused, "stop after resume retained paused flag");
 }
@@ -699,22 +1434,23 @@ void test_writer_terminal_resume_is_immediate_visible_cleanup() {
     check(adapter.load(), "terminal-resume load failed");
     start_output(host, adapter, producer);
     anchor_recording(host, producer);
+    producer->durable_confirm_block.enabled = true;
+    producer->durable_confirm_block.one_shot = true;
     host.set_signal(recording_path, 12'000'000'000ULL, 120);
     host.fire_output(OutputEvent::paused);
     wait_for_producer_count(producer, [](const auto& value) { return value.pauses == 1; },
                             "pause did not precede terminal resume");
-    wait_for_producer_count(
-        producer,
-        [](const auto& value) { return value.durable_confirms == 1; },
-        "pause was not durably confirmed before terminal resume");
-    wait_for([&] { return adapter.pending_pause_resume_commands() == 0; },
-             "pause pending command did not drain before terminal resume");
+    producer->durable_confirm_block.wait_until_entered();
     {
         std::lock_guard lock(producer->mutex);
         producer->durable_result = ProducerResult::producer_internal_error;
+        producer->fail_durable_confirm_call = 2;
     }
     host.set_signal(recording_path, 15'000'000'000ULL, 124);
     host.fire_output(OutputEvent::resumed);
+    check(adapter.pending_pause_resume_commands() == 2,
+          "terminal resume was not queued behind the blocked pause");
+    producer->durable_confirm_block.release();
     wait_for([&] { return adapter.state() == AdapterState::failed; },
              "writer-terminal resume was not immediately fail closed");
     check(host.disconnect_calls.load(std::memory_order_acquire) == 1,
@@ -1256,6 +1992,22 @@ int main() {
     std::cout << std::unitbuf;
     std::cerr << std::unitbuf;
     const std::vector<std::pair<const char*, std::function<void()>>> tests{
+        {"scene-change/gates/value-snapshot/worker-uuid/reference",
+         test_scene_change_gates_and_active_value_snapshot},
+        {"scene-change/fail-closed-capture/pause-control/reference",
+         test_scene_change_fail_closed_capture_and_control_paths},
+        {"global-order/scene-before-pause/same-and-next-frame",
+         test_scene_before_pause_global_order},
+        {"global-order/scene-before-pause-resume", test_scene_before_resume_global_order},
+        {"global-order/paused-resume-before-scene-stop",
+         test_resume_before_scene_is_the_only_allowed_paused_order},
+        {"global-order/calibration-scene-pause-stop",
+         test_calibration_scene_control_global_order},
+        {"scene-change/rapid-bounded-fifo", test_rapid_scene_changes_are_bounded_and_ordered},
+        {"global-order/scene-before-stop/stop-before-late-scene",
+         test_stop_closes_queued_scene_change_path},
+        {"scene-change/unload/callback-gate/module-lifetime",
+         test_scene_stop_unload_and_closed_callback_gate_are_safe},
         {"output-authority/path/session/calibration/stop/cleanup/idempotence",
          test_output_lifecycle_authority_normative_path_and_exact_binding},
         {"failed-or-missing-output-stop", test_failed_or_missing_output_stop_never_calls_normal_stop},

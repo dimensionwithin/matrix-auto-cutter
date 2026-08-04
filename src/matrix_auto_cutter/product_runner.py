@@ -1467,12 +1467,20 @@ class ProductRunner:
             "pending": RunnerStatusCode.APPROVAL_PENDING,
             "approved": RunnerStatusCode.PROPOSAL_APPROVED,
             "rejected": RunnerStatusCode.PROPOSAL_REJECTED,
+            "selected_cuts_approved": RunnerStatusCode.PROPOSAL_APPROVED,
+            "all_rejected": RunnerStatusCode.PROPOSAL_REJECTED,
         }
         message_by_decision = {
             "pending": "Schnittvorschlag wartet auf ausdrückliche Freigabe oder Ablehnung.",
             "approved": "Schnittvorschlag wurde ausdrücklich und digestgebunden freigegeben.",
             "rejected": (
                 "Schnittvorschlag wurde ausdrücklich abgelehnt; Render ist nicht autorisiert."
+            ),
+            "selected_cuts_approved": (
+                "Ausgewählte Schnitte wurden ausdrücklich und digestgebunden freigegeben."
+            ),
+            "all_rejected": (
+                "Alle Schnitte wurden ausdrücklich abgelehnt; Render ist nicht autorisiert."
             ),
         }
         final_code = status_by_decision[gate.decision]
@@ -1546,12 +1554,20 @@ class ProductRunner:
             "pending": RunnerStatusCode.APPROVAL_PENDING,
             "approved": RunnerStatusCode.PROPOSAL_APPROVED,
             "rejected": RunnerStatusCode.PROPOSAL_REJECTED,
+            "selected_cuts_approved": RunnerStatusCode.PROPOSAL_APPROVED,
+            "all_rejected": RunnerStatusCode.PROPOSAL_REJECTED,
         }
         message_by_decision = {
             "pending": "Schnittvorschlag wartet auf ausdrückliche Freigabe oder Ablehnung.",
             "approved": "Schnittvorschlag wurde ausdrücklich und digestgebunden freigegeben.",
             "rejected": (
                 "Schnittvorschlag wurde ausdrücklich abgelehnt; Render ist nicht autorisiert."
+            ),
+            "selected_cuts_approved": (
+                "Ausgewählte Schnitte wurden ausdrücklich und digestgebunden freigegeben."
+            ),
+            "all_rejected": (
+                "Alle Schnitte wurden ausdrücklich abgelehnt; Render ist nicht autorisiert."
             ),
         }
         final_code = status_by_decision[gate.decision]

@@ -26,7 +26,7 @@ class ProtectionRangesDocument(CanonicalModel):
     source_sha256: Sha256
     input_hash: Sha256
     configuration_hash: Sha256
-    sidecar_schema_version: Literal["1.1"] = "1.1"
+    sidecar_schema_version: Literal["1.1", "1.2"] = "1.2"
     time_base: FrameRateModel = Field(default_factory=FrameRateModel)
     ranges: tuple[MaterializedFrameRange, ...]
 

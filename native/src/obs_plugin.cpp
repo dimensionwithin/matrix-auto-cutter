@@ -62,12 +62,16 @@ class Obs32Api final {
     decltype(&obs_frontend_add_event_callback) frontend_add{};
     decltype(&obs_frontend_remove_event_callback) frontend_remove{};
     decltype(&obs_frontend_get_recording_output) frontend_recording_output{};
+    decltype(&obs_frontend_get_current_scene) frontend_current_scene{};
     decltype(&obs_add_tick_callback) add_tick{};
     decltype(&obs_remove_tick_callback) remove_tick{};
     decltype(&obs_output_get_settings) output_settings{};
     decltype(&obs_data_get_string) data_string{};
     decltype(&obs_data_release) data_release{};
     decltype(&obs_output_release) output_release{};
+    decltype(&obs_source_get_uuid) source_uuid{};
+    decltype(&obs_source_get_name) source_name{};
+    decltype(&obs_source_release) source_release{};
     decltype(&obs_output_get_id) output_id{};
     decltype(&obs_output_get_total_frames) output_frames{};
     decltype(&obs_output_get_signal_handler) output_signal_handler{};
@@ -85,12 +89,17 @@ class Obs32Api final {
             resolve<decltype(frontend_remove)>(frontend, "obs_frontend_remove_event_callback");
         frontend_recording_output = resolve<decltype(frontend_recording_output)>(
             frontend, "obs_frontend_get_recording_output");
+        frontend_current_scene = resolve<decltype(frontend_current_scene)>(
+            frontend, "obs_frontend_get_current_scene");
         add_tick = resolve<decltype(add_tick)>(obs, "obs_add_tick_callback");
         remove_tick = resolve<decltype(remove_tick)>(obs, "obs_remove_tick_callback");
         output_settings = resolve<decltype(output_settings)>(obs, "obs_output_get_settings");
         data_string = resolve<decltype(data_string)>(obs, "obs_data_get_string");
         data_release = resolve<decltype(data_release)>(obs, "obs_data_release");
         output_release = resolve<decltype(output_release)>(obs, "obs_output_release");
+        source_uuid = resolve<decltype(source_uuid)>(obs, "obs_source_get_uuid");
+        source_name = resolve<decltype(source_name)>(obs, "obs_source_get_name");
+        source_release = resolve<decltype(source_release)>(obs, "obs_source_release");
         output_id = resolve<decltype(output_id)>(obs, "obs_output_get_id");
         output_frames = resolve<decltype(output_frames)>(obs, "obs_output_get_total_frames");
         output_signal_handler = resolve<decltype(output_signal_handler)>(
@@ -103,11 +112,12 @@ class Obs32Api final {
             resolve<decltype(video_frame_time)>(obs, "obs_get_video_frame_time");
         version_string = resolve<decltype(version_string)>(obs, "obs_get_version_string");
         write_log = resolve<decltype(write_log)>(obs, "blog");
-        return frontend_add && frontend_remove && frontend_recording_output && add_tick &&
-               remove_tick && output_settings && data_string && data_release && output_release &&
-               output_id && output_frames && output_signal_handler && signal_connect &&
-               signal_disconnect && resolved_calldata_get_data && video_frame_time &&
-               version_string && write_log;
+        return frontend_add && frontend_remove && frontend_recording_output &&
+               frontend_current_scene && add_tick && remove_tick && output_settings &&
+               data_string && data_release && output_release && source_uuid && source_name &&
+               source_release && output_id && output_frames && output_signal_handler &&
+               signal_connect && signal_disconnect && resolved_calldata_get_data &&
+               video_frame_time && version_string && write_log;
     }
 };
 
@@ -346,6 +356,40 @@ class NativeObsHost final : public AdapterHost {
         return true;
     }
 
+    SceneHandle acquire_current_program_scene() noexcept override {
+        return api_.frontend_current_scene();
+    }
+
+    std::string_view scene_uuid(const SceneHandle scene) noexcept override {
+        if (scene == nullptr) {
+            return {};
+        }
+        const char* value = api_.source_uuid(static_cast<obs_source_t*>(scene));
+        if (value == nullptr) {
+            return {};
+        }
+        const auto count = strnlen_s(value, max_scene_uuid_utf8 + 1);
+        return std::string_view(value, count);
+    }
+
+    std::string_view scene_name(const SceneHandle scene) noexcept override {
+        if (scene == nullptr) {
+            return {};
+        }
+        const char* value = api_.source_name(static_cast<obs_source_t*>(scene));
+        if (value == nullptr) {
+            return {};
+        }
+        const auto count = strnlen_s(value, max_scene_label_utf8 + 1);
+        return std::string_view(value, count);
+    }
+
+    void release_scene(const SceneHandle scene) noexcept override {
+        if (scene != nullptr) {
+            api_.source_release(static_cast<obs_source_t*>(scene));
+        }
+    }
+
     void release_recording_output() noexcept override {
         disconnect_recording_output_signals();
         if (obs_output_t* output = output_.exchange(nullptr, std::memory_order_acq_rel)) {
@@ -382,7 +426,9 @@ class NativeObsHost final : public AdapterHost {
                                 ? FrontendEvent::recording_stopping
                                 : event == OBS_FRONTEND_EVENT_RECORDING_STOPPED
                                       ? FrontendEvent::recording_stopped
-                                      : FrontendEvent::other;
+                                      : event == OBS_FRONTEND_EVENT_SCENE_CHANGED
+                                            ? FrontendEvent::scene_changed
+                                            : FrontendEvent::other;
             ObsJournalAdapter::frontend_boundary(mapped, data);
         } catch (...) {
         }

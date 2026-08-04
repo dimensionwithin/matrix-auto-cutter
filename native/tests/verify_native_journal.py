@@ -87,8 +87,8 @@ def main() -> int:
         ):
             raise AssertionError("native pause/resume events were not preserved in the sidecar")
         validated = validate_sidecar(json.loads(sidecar.model_dump_json()), identity)
-        if validated.mode != "validated_sidecar_1_1":
-            raise AssertionError("native journal sidecar did not validate as Sidecar 1.1")
+        if validated.mode != "validated_sidecar_1_2":
+            raise AssertionError("native journal sidecar did not validate as Sidecar 1.2")
         if str(sidecar.recording_session_id) != loaded.recording_id:
             raise AssertionError("journal and sidecar session IDs differ")
 

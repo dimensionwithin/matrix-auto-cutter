@@ -259,7 +259,10 @@ def _validate_published_sidecar(
     raw = json.loads(observed.sidecar.model_dump_json(), parse_float=Decimal)
     payload = cast(Mapping[str, object], raw)
     validation = validate_sidecar(payload, expected_source)
-    if validation.mode != "validated_sidecar_1_1" or validation.sidecar != observed.sidecar:
+    if (
+        validation.mode not in {"validated_sidecar_1_1", "validated_sidecar_1_2"}
+        or validation.sidecar != observed.sidecar
+    ):
         reasons = ", ".join(reason.code.value for reason in validation.reasons)
         return ManualFinalizationFailed(
             "sidecar_validation",

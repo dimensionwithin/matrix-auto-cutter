@@ -164,7 +164,7 @@ class FinalizationIntent(CanonicalModel):
     probe_artifact_id: str = Field(min_length=1, max_length=128)
     hash_artifact_id: str = Field(min_length=1, max_length=128)
     assignment_artifact_id: str = Field(min_length=1, max_length=128)
-    sidecar_schema_version: Literal["1.1"] = "1.1"
+    sidecar_schema_version: Literal["1.1", "1.2"] = "1.2"
     journal_schema_version: Literal["1.0"] = "1.0"
     bundle_schema_version: Literal["1.0", "not_available"]
     finalizer_version: Literal["phase2f/1.0"] = "phase2f/1.0"
@@ -253,7 +253,7 @@ class FinalizationReceipt(CanonicalModel):
     sidecar_path_digest: Sha256Hex
     sidecar_sha256: Sha256Hex
     sidecar_size_bytes: int = Field(ge=1, le=MAX_SIDECAR_BYTES)
-    sidecar_schema_version: Literal["1.1"] = "1.1"
+    sidecar_schema_version: Literal["1.1", "1.2"] = "1.2"
     finalizer_run_id: CanonicalUuidText
     finalized_at: AwareDatetime
     intent_id: Sha256Hex

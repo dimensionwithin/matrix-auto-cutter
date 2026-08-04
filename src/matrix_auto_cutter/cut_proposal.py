@@ -19,7 +19,14 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Literal
 
-from pydantic import AwareDatetime, Field, ValidationError, model_validator
+from pydantic import (
+    AwareDatetime,
+    Field,
+    SerializerFunctionWrapHandler,
+    ValidationError,
+    model_serializer,
+    model_validator,
+)
 
 from matrix_auto_cutter.models import (
     CanonicalModel,
@@ -27,17 +34,25 @@ from matrix_auto_cutter.models import (
     Sha256,
     SourceIdentity,
 )
+from matrix_auto_cutter.outro import (
+    OutroCandidateEvidence,
+    OutroResolutionEvidence,
+    default_binding_path,
+    load_binding,
+    resolve_outro,
+)
 from matrix_auto_cutter.phase2.source_confirmation.identity import source_identity_digest
-from matrix_auto_cutter.protection import materialize_protection
-from matrix_auto_cutter.sidecar import ObsEventSidecar, validate_sidecar
+from matrix_auto_cutter.protection import materialize_protection_with_outro
+from matrix_auto_cutter.sidecar import ValidatedObsEventSidecar, validate_sidecar
 from matrix_auto_cutter.timebase import Frame, FrameRange
 
 ANALYSIS_VERSION: Literal["silence_dead_air/1.0"] = "silence_dead_air/1.0"
-PROPOSAL_SCHEMA_VERSION: Literal["1.0"] = "1.0"
+PROPOSAL_SCHEMA_VERSION: Literal["1.1"] = "1.1"
 PROPOSAL_FILE_NAME = "cut-proposal.json"
 MAX_JSON_BYTES = 16 * 1024 * 1024
 MAX_FFMPEG_LOG_BYTES = 2 * 1024 * 1024
-_DIGEST_DOMAIN = b"matrix-auto-cutter/cut-proposal/1.0\0"
+_DIGEST_DOMAIN_V10 = b"matrix-auto-cutter/cut-proposal/1.0\0"
+_DIGEST_DOMAIN_V11 = b"matrix-auto-cutter/cut-proposal/1.1\0"
 _SILENCE_START = re.compile(rb"silence_start:\s*(-?[0-9]+(?:\.[0-9]+)?)")
 _SILENCE_END = re.compile(
     rb"silence_end:\s*(-?[0-9]+(?:\.[0-9]+)?)\s*\|\s*silence_duration:\s*"
@@ -104,17 +119,50 @@ class ProposedCut(CanonicalModel):
     start_timecode: str = Field(pattern=r"^[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}$")
     end_timecode: str = Field(pattern=r"^[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}$")
     duration_ms: int = Field(gt=0)
-    reason: Literal["conservative_silence_dead_air"]
-    audio_evidence: AudioEvidence
-    applied_handles: AppliedHandles
-    protection_result: Literal["clear_no_blocking_overlap"]
+    reason: Literal["conservative_silence_dead_air", "outro_excess_tail"]
+    audio_evidence: AudioEvidence | None = None
+    outro_evidence: OutroCandidateEvidence | None = None
+    applied_handles: AppliedHandles | None = None
+    protection_result: Literal[
+        "clear_no_blocking_overlap", "outro_tail_after_hard_protection"
+    ]
 
     @model_validator(mode="after")
     def nonempty(self) -> ProposedCut:
         """Keep the artifact interval contract explicit."""
+        if any(
+            name in self.model_fields_set and getattr(self, name) is None
+            for name in ("audio_evidence", "outro_evidence", "applied_handles")
+        ):
+            raise ValueError("candidate evidence fields may not be explicit null")
         if self.start_frame >= self.end_frame:
             raise ValueError("proposed cut requires start_frame < end_frame")
+        if self.reason == "conservative_silence_dead_air" and (
+            self.audio_evidence is None
+            or self.applied_handles is None
+            or self.outro_evidence is not None
+            or self.protection_result != "clear_no_blocking_overlap"
+        ):
+            raise ValueError("silence cut evidence is incomplete")
+        if self.reason == "outro_excess_tail" and (
+            self.outro_evidence is None
+            or self.audio_evidence is not None
+            or self.applied_handles is not None
+            or self.protection_result != "outro_tail_after_hard_protection"
+            or self.start_frame != self.outro_evidence.tail_start_frame
+            or self.end_frame != self.outro_evidence.total_source_frames
+        ):
+            raise ValueError("outro tail evidence is incomplete")
         return self
+
+    @model_serializer(mode="wrap")
+    def omit_missing_evidence(self, handler: SerializerFunctionWrapHandler) -> object:
+        """Keep legacy silence bytes unchanged by omitting absent typed evidence."""
+        serialized: dict[str, object] = handler(self)
+        for name in ("audio_evidence", "outro_evidence", "applied_handles"):
+            if getattr(self, name) is None:
+                serialized.pop(name, None)
+        return serialized
 
 
 RejectionReason = Literal[
@@ -124,6 +172,7 @@ RejectionReason = Literal[
     "soft_or_uncertain_protection_overlap",
     "minimum_keep_island",
     "outside_source_timeline",
+    "superseded_by_outro_tail",
 ]
 
 
@@ -148,7 +197,7 @@ class CutProposalContent(CanonicalModel):
     """Digest input: every immutable proposal field except the digest itself."""
 
     artifact_type: Literal["matrix_auto_cutter_cut_proposal"]
-    schema_version: Literal["1.0"]
+    schema_version: Literal["1.0", "1.1"]
     proposal_id: str = Field(pattern=r"^proposal-[0-9a-f]{32}$")
     recording_id: str = Field(min_length=1, max_length=100)
     source_path: str = Field(min_length=1)
@@ -168,6 +217,7 @@ class CutProposalContent(CanonicalModel):
     total_proposed_cuts: int = Field(ge=0)
     total_proposed_savings_ms: int = Field(ge=0)
     generated_at: AwareDatetime
+    outro_resolution: OutroResolutionEvidence | None = None
 
     @model_validator(mode="after")
     def internally_consistent(self) -> CutProposalContent:
@@ -188,6 +238,12 @@ class CutProposalContent(CanonicalModel):
             raise ValueError("ready proposal requires at least one cut")
         if self.status == "no_cuts" and self.proposed_cuts:
             raise ValueError("no_cuts proposal cannot contain cuts")
+        if self.schema_version == "1.0" and self.outro_resolution is not None:
+            raise ValueError("proposal-1.0 cannot contain outro resolution")
+        if self.schema_version == "1.1" and self.outro_resolution is None:
+            raise ValueError("proposal-1.1 requires typed outro resolution")
+        if "outro_resolution" in self.model_fields_set and self.outro_resolution is None:
+            raise ValueError("outro_resolution may not be explicit null")
         previous_end = -1
         for item in self.proposed_cuts:
             if item.start_frame < previous_end or item.end_frame > self.source_frame_count:
@@ -198,6 +254,14 @@ class CutProposalContent(CanonicalModel):
         if expected_counts != observed_counts:
             raise ValueError("rejection counts mismatch")
         return self
+
+    @model_serializer(mode="wrap")
+    def omit_missing_outro_resolution(self, handler: SerializerFunctionWrapHandler) -> object:
+        """Preserve canonical Proposal-1.0 bytes when the field is absent."""
+        serialized: dict[str, object] = handler(self)
+        if self.outro_resolution is None:
+            serialized.pop("outro_resolution", None)
+        return serialized
 
 
 class CutProposal(CutProposalContent):
@@ -263,7 +327,8 @@ def _content_from_proposal(proposal: CutProposal) -> CutProposalContent:
 
 def proposal_content_digest(content: CutProposalContent) -> str:
     """Digest every canonical immutable content field with domain separation."""
-    return hashlib.sha256(_DIGEST_DOMAIN + content.model_dump_json().encode("utf-8")).hexdigest()
+    domain = _DIGEST_DOMAIN_V10 if content.schema_version == "1.0" else _DIGEST_DOMAIN_V11
+    return hashlib.sha256(domain + content.model_dump_json().encode("utf-8")).hexdigest()
 
 
 def _proposal_from_content(content: CutProposalContent) -> CutProposal:
@@ -407,7 +472,7 @@ def validate_ffmpeg(
 
 def _load_valid_sidecar(
     source_path: Path, sidecar_path: Path
-) -> tuple[ObsEventSidecar, str, str] | ProposalFailed:
+) -> tuple[ValidatedObsEventSidecar, str, str] | ProposalFailed:
     try:
         sidecar_data = sidecar_path.read_bytes()
         if not sidecar_data or len(sidecar_data) > MAX_JSON_BYTES:
@@ -420,9 +485,12 @@ def _load_valid_sidecar(
             raise ValueError("Sidecar enthält keine SourceIdentity")
         expected = SourceIdentity.model_validate_json(json.dumps(source_raw))
         validated = validate_sidecar(raw, expected)
-        if validated.mode != "validated_sidecar_1_1" or validated.sidecar is None:
+        if (
+            validated.mode not in {"validated_sidecar_1_1", "validated_sidecar_1_2"}
+            or validated.sidecar is None
+        ):
             reasons = ", ".join(reason.code.value for reason in validated.reasons)
-            raise ValueError(f"Sidecar-1.1-Validierung fehlgeschlagen: {reasons}")
+            raise ValueError(f"Sidecar-Validierung fehlgeschlagen: {reasons}")
         sidecar = validated.sidecar
         stat_before = source_path.stat()
         if not source_path.is_file() or source_path.name != sidecar.source.file_name:
@@ -686,6 +754,7 @@ def _proposal_id(
     sidecar_sha256: str,
     ffmpeg: FfmpegIdentity,
     parameters: AnalysisParameters,
+    outro_resolution: OutroResolutionEvidence,
 ) -> str:
     payload = "\0".join(
         (
@@ -694,6 +763,7 @@ def _proposal_id(
             sidecar_sha256,
             ffmpeg.sha256,
             parameters.model_dump_json(),
+            outro_resolution.model_dump_json(),
         )
     ).encode("utf-8")
     return f"proposal-{hashlib.sha256(payload).hexdigest()[:32]}"
@@ -710,6 +780,8 @@ def generate_proposal(
     timeout_seconds: int = 600,
     process_runner: ProcessRunner = _bounded_process,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    outro_binding_path: Path | None = None,
+    obs_scene_collections_root: Path | None = None,
 ) -> ProposalResult:
     """Validate all bindings, analyze read-only, and atomically publish one generation."""
     rules = parameters or AnalysisParameters()
@@ -725,7 +797,23 @@ def generate_proposal(
     binary = validate_ffmpeg(ffmpeg_path, process_runner=process_runner)
     if isinstance(binary, ProposalFailed):
         return binary
-    proposal_id = _proposal_id(source_digest, sidecar_sha256, binary, rules)
+    binding_path = outro_binding_path or default_binding_path()
+    binding = load_binding(binding_path)
+    collections_root = obs_scene_collections_root or (
+        Path(os.environ.get("APPDATA", "")) / "obs-studio" / "basic" / "scenes"
+    )
+    collection_file = (
+        collections_root / f"{binding.scene_collection_name}.json"
+        if binding is not None
+        else collections_root / "__binding_unavailable__.json"
+    )
+    outro_resolution = resolve_outro(
+        sidecar,
+        sidecar_sha256=sidecar_sha256,
+        binding_path=binding_path,
+        collection_file=collection_file,
+    )
+    proposal_id = _proposal_id(source_digest, sidecar_sha256, binary, rules, outro_resolution)
     target = artifacts_root / recording_id / "proposals" / proposal_id / PROPOSAL_FILE_NAME
     if target.exists():
         reused = load_proposal(target)
@@ -740,6 +828,7 @@ def generate_proposal(
             and proposal.sidecar_sha256 == sidecar_sha256
             and proposal.ffmpeg == binary
             and proposal.analysis_parameters == rules
+            and proposal.outro_resolution == outro_resolution
         )
         if not expected:
             return ProposalFailed(
@@ -747,7 +836,7 @@ def generate_proposal(
                 "Vorhandenes Proposal passt nicht vollständig zu Source, Sidecar und Analyse.",
             )
         return reused
-    protection = materialize_protection(sidecar)
+    protection = materialize_protection_with_outro(sidecar, outro_resolution)
     if protection.status != "materialized":
         return ProposalFailed(
             "E_PROTECTION",
@@ -781,6 +870,59 @@ def generate_proposal(
         rules,
         proposal_id,
     )
+    if outro_resolution.status == "resolved" and outro_resolution.tail_start_frame is not None:
+        assert outro_resolution.binding_digest is not None
+        assert outro_resolution.binding_file_sha256 is not None
+        assert outro_resolution.scene_event_id is not None
+        assert outro_resolution.scene_uuid is not None
+        assert outro_resolution.scene_name is not None
+        assert outro_resolution.outro_start_frame is not None
+        assert outro_resolution.protected_start_frame is not None
+        assert outro_resolution.protected_end_frame is not None
+        tail = ProposedCut(
+            candidate_id=_candidate_id(
+                proposal_id + "\0outro_excess_tail",
+                outro_resolution.tail_start_frame,
+                sidecar.source.video_frame_count,
+            ),
+            start_frame=outro_resolution.tail_start_frame,
+            end_frame=sidecar.source.video_frame_count,
+            start_timecode=_timecode(_duration_ms(outro_resolution.tail_start_frame)),
+            end_timecode=_timecode(_duration_ms(sidecar.source.video_frame_count)),
+            duration_ms=_duration_ms(
+                sidecar.source.video_frame_count - outro_resolution.tail_start_frame
+            ),
+            reason="outro_excess_tail",
+            outro_evidence=OutroCandidateEvidence(
+                binding_digest=outro_resolution.binding_digest,
+                binding_file_sha256=outro_resolution.binding_file_sha256,
+                sidecar_sha256=sidecar_sha256,
+                scene_event_id=outro_resolution.scene_event_id,
+                scene_uuid=outro_resolution.scene_uuid,
+                scene_name=outro_resolution.scene_name,
+                outro_start_frame=outro_resolution.outro_start_frame,
+                protected_start_frame=outro_resolution.protected_start_frame,
+                protected_end_frame=outro_resolution.protected_end_frame,
+                tail_start_frame=outro_resolution.tail_start_frame,
+                total_source_frames=sidecar.source.video_frame_count,
+            ),
+            protection_result="outro_tail_after_hard_protection",
+        )
+        kept: list[ProposedCut] = []
+        for item in proposed:
+            if item.start_frame < tail.end_frame and tail.start_frame < item.end_frame:
+                assert item.audio_evidence is not None
+                rejected = (*rejected,
+                    RejectedCandidate(
+                        candidate_id=item.candidate_id,
+                        raw_silence_start_ms=item.audio_evidence.raw_silence_start_ms,
+                        raw_silence_end_ms=item.audio_evidence.raw_silence_end_ms,
+                        reason="superseded_by_outro_tail",
+                    ),
+                )
+            else:
+                kept.append(item)
+        proposed = (*kept, tail)
     counts = Counter(item.reason for item in rejected)
     content = CutProposalContent(
         artifact_type="matrix_auto_cutter_cut_proposal",
@@ -806,6 +948,7 @@ def generate_proposal(
         total_proposed_cuts=len(proposed),
         total_proposed_savings_ms=sum(item.duration_ms for item in proposed),
         generated_at=now(),
+        outro_resolution=outro_resolution,
     )
     proposal = _proposal_from_content(content)
     data = proposal_bytes(proposal)

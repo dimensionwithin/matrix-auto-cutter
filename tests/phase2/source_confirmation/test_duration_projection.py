@@ -199,7 +199,7 @@ def test_finalizer_publishes_validated_sidecar_for_both_60fps_remainders(
             parse_float=Decimal,
         )
         validated = validate_sidecar(payload, confirmed.source_identity)
-        assert validated.mode == "validated_sidecar_1_1"
+        assert validated.mode == "validated_sidecar_1_2"
         assert validated.sidecar is not None
         assert validated.sidecar.source.duration_ms == expected_ms
     finally:

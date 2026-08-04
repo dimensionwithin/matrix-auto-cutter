@@ -20,6 +20,9 @@
 namespace matrix_auto_cutter::obs_adapter {
 
 inline constexpr std::size_t max_recording_path_utf8 = 32'767;
+inline constexpr std::size_t max_scene_uuid_utf8 = 36;
+inline constexpr std::size_t max_scene_label_utf8 = 500;
+inline constexpr std::size_t scene_change_command_capacity = 8;
 inline constexpr auto calibration_interval = std::chrono::seconds(2);
 
 enum class FrontendEvent {
@@ -27,6 +30,7 @@ enum class FrontendEvent {
     recording_started,
     recording_stopping,
     recording_stopped,
+    scene_changed,
     other,
 };
 enum class OutputEvent { started, paused, resumed, stopped };
@@ -50,6 +54,22 @@ struct RecordingSignal final {
     bool fragmented_mp4{};
 };
 
+using SceneHandle = void*;
+
+struct SceneSignal final {
+    std::array<char, max_scene_uuid_utf8 + 1> uuid{};
+    std::size_t uuid_size{};
+    std::array<char, max_scene_label_utf8 + 1> label{};
+    std::size_t label_size{};
+    std::uint64_t absolute_monotonic_ns{};
+    std::uint64_t output_frame_count{};
+
+    [[nodiscard]] bool assign_uuid(std::string_view value) noexcept;
+    [[nodiscard]] bool assign_label(std::string_view value) noexcept;
+    [[nodiscard]] std::string_view uuid_view() const noexcept;
+    [[nodiscard]] std::string_view label_view() const noexcept;
+};
+
 using FrontendCallback = void (*)(FrontendEvent, void*) noexcept;
 using TickCallback = void (*)(void*) noexcept;
 using OutputCallback = void (*)(OutputEvent, int, void*) noexcept;
@@ -71,6 +91,10 @@ class AdapterHost {
     virtual bool capture_clock(
         std::uint64_t& absolute_monotonic_ns,
         std::uint64_t& output_frame_count) noexcept = 0;
+    virtual SceneHandle acquire_current_program_scene() noexcept = 0;
+    virtual std::string_view scene_uuid(SceneHandle scene) noexcept = 0;
+    virtual std::string_view scene_name(SceneHandle scene) noexcept = 0;
+    virtual void release_scene(SceneHandle scene) noexcept = 0;
     virtual void release_recording_output() noexcept = 0;
     virtual std::string_view obs_version() const noexcept = 0;
     virtual void log(LogLevel level, std::string_view message) noexcept = 0;
@@ -142,6 +166,7 @@ class ObsJournalAdapter final {
     void unload() noexcept;
     [[nodiscard]] AdapterState state() const noexcept;
     [[nodiscard]] unsigned pending_pause_resume_commands() const noexcept;
+    [[nodiscard]] std::size_t pending_scene_change_commands() const noexcept;
     [[nodiscard]] std::optional<RunReport> last_report() const;
 
     static void frontend_boundary(FrontendEvent event, void* private_data) noexcept;
@@ -153,6 +178,11 @@ class ObsJournalAdapter final {
         std::uint64_t absolute_monotonic_ns{};
         std::uint64_t output_frame_count{};
         bool recording_start_anchor{};
+        std::uint64_t order{};
+    };
+    struct SceneCommand final {
+        SceneSignal signal;
+        std::uint64_t order{};
     };
     enum class ControlKind { start, pause, resume, stop };
     struct ControlCommand final {
@@ -163,6 +193,7 @@ class ObsJournalAdapter final {
         int code{};
         bool captured{};
         bool recording_paused{};
+        std::uint64_t order{};
     };
 
     [[nodiscard]] bool enter_callback() noexcept;
@@ -170,11 +201,13 @@ class ObsJournalAdapter final {
     void close_callback_gate() noexcept;
     void probe_callback(CallbackKind kind);
     void on_frontend(FrontendEvent event) noexcept;
+    void on_scene_changed() noexcept;
     void on_tick() noexcept;
     void on_output(OutputEvent event, int code) noexcept;
     void worker_main() noexcept;
     void process_start(const RecordingSignal& signal) noexcept;
     void process_clock(const ClockCommand& command) noexcept;
+    void process_scene_changed(const SceneCommand& command) noexcept;
     void process_pause_or_resume(const ControlCommand& command) noexcept;
     void process_stop(const ControlCommand& command) noexcept;
     void fail_current_run(ProducerResult result, std::string_view reason) noexcept;
@@ -185,6 +218,13 @@ class ObsJournalAdapter final {
     void wait_for_bound_callbacks_to_drain() noexcept;
     void reset_run() noexcept;
     [[nodiscard]] bool queue_forced_failure() noexcept;
+    [[nodiscard]] bool assign_command_order_locked(std::uint64_t& order) noexcept;
+    [[nodiscard]] bool command_clock_is_monotone_locked(
+        std::uint64_t absolute_monotonic_ns,
+        std::uint64_t output_frame_count) const noexcept;
+    void remember_command_clock_locked(
+        std::uint64_t absolute_monotonic_ns,
+        std::uint64_t output_frame_count) noexcept;
 
     static constexpr std::uint64_t callback_gate_closed = UINT64_C(1) << 63U;
     static constexpr std::uint64_t callback_gate_count_mask = callback_gate_closed - 1U;
@@ -220,6 +260,15 @@ class ObsJournalAdapter final {
     std::size_t control_write_{};
     std::size_t control_size_{};
     std::optional<ClockCommand> pending_clock_;
+    std::array<SceneCommand, scene_change_command_capacity> scene_commands_{};
+    std::size_t scene_read_{};
+    std::size_t scene_write_{};
+    std::size_t scene_size_{};
+    std::uint64_t next_command_order_{1};
+    // Absolute QPC/output-counter pair of the latest command linearized under
+    // command_mutex_. This prevents scheduling between capture and try_lock
+    // from admitting a numerically older command behind a newer one.
+    std::optional<ClockSnapshot> last_linearized_command_clock_;
     std::atomic<bool> forced_shutdown_{};
     bool unload_requested_{};
 
@@ -227,6 +276,7 @@ class ObsJournalAdapter final {
     std::optional<RunReport> last_report_;
     std::unique_ptr<ProducerPort> producer_;
     std::optional<EventSnapshot> pending_recording_started_;
+    std::optional<ClockSnapshot> last_worker_clock_;
     std::string recording_path_;
     std::filesystem::path journal_path_;
     std::thread worker_;

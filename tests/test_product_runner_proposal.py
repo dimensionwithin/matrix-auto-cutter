@@ -10,7 +10,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from matrix_auto_cutter.approval import approval_path_for, record_decision
+from matrix_auto_cutter.approval import (
+    approval_path_for,
+    record_decision,
+    record_selected_decision,
+)
 from matrix_auto_cutter.cut_proposal import (
     FfmpegProcessResult,
     ProposalFailed,
@@ -42,6 +46,7 @@ from matrix_auto_cutter.render import (
     submit_render_request,
 )
 from matrix_auto_cutter.review_app import ReviewSingleInstance
+from matrix_auto_cutter.selection import SelectionReady, ensure_selection, update_selection
 
 NOW = datetime(2026, 8, 3, 12, tzinfo=UTC)
 SESSION_A = "11111111-1111-4111-8111-111111111111"
@@ -336,6 +341,69 @@ def test_unchanged_pending_polls_once_then_approved_transition_once(
     assert ports.finalizer_calls == 1
     assert ports.proposal_calls == [SESSION_A]
     assert len(ports.review_opens) == 1
+
+
+def test_selective_approval_transitions_runner_without_key_error(
+    tmp_path: Path, raw_sidecar: dict[str, object]
+) -> None:
+    sources = tmp_path / "sources"
+    source, sidecar, proposal, _ = _materialize_proposal(
+        sources, tmp_path / "state" / "artifacts", raw_sidecar, SESSION_A
+    )
+    ports = FakeRunnerPorts(
+        {_journal_name(SESSION_A): JournalReady(SESSION_A, "a" * 64, str(source))},
+        [_success(source, sidecar, SESSION_A)],
+        {SESSION_A: proposal},
+    )
+    runner = _runner(tmp_path, ports, sources)
+
+    runner.scan_once()
+    state = _session(tmp_path, SESSION_A)
+    assert state.proposal_path is not None
+    record_selected_decision(
+        Path(state.proposal_path), "selected_cuts_approved", now=lambda: NOW
+    )
+    runner.scan_once()
+
+    updated = _session(tmp_path, SESSION_A)
+    assert updated.status is RunnerStatusCode.PROPOSAL_APPROVED
+    assert updated.approval_decision == "selected_cuts_approved"
+
+
+def test_selective_all_rejected_transitions_runner_without_key_error(
+    tmp_path: Path, raw_sidecar: dict[str, object]
+) -> None:
+    sources = tmp_path / "sources"
+    source, sidecar, proposal, _ = _materialize_proposal(
+        sources, tmp_path / "state" / "artifacts", raw_sidecar, SESSION_A
+    )
+    ports = FakeRunnerPorts(
+        {_journal_name(SESSION_A): JournalReady(SESSION_A, "a" * 64, str(source))},
+        [_success(source, sidecar, SESSION_A)],
+        {SESSION_A: proposal},
+    )
+    runner = _runner(tmp_path, ports, sources)
+
+    runner.scan_once()
+    state = _session(tmp_path, SESSION_A)
+    assert state.proposal_path is not None
+    proposal_path = Path(state.proposal_path)
+    selection = ensure_selection(proposal_path, now=lambda: NOW)
+    assert isinstance(selection, SelectionReady)
+    disabled = {item.candidate_id: False for item in selection.selection.candidates}
+    changed = update_selection(
+        proposal_path,
+        disabled,
+        expected_selection_digest=selection.selection.selection_digest,
+        now=lambda: NOW,
+    )
+    assert isinstance(changed, SelectionReady)
+    record_selected_decision(proposal_path, "all_rejected", now=lambda: NOW)
+    runner.scan_once()
+
+    updated = _session(tmp_path, SESSION_A)
+    assert updated.status is RunnerStatusCode.PROPOSAL_REJECTED
+    assert updated.approval_decision == "rejected"
 
 
 def test_multiple_generations_replace_global_review_and_shutdown_owned_only(

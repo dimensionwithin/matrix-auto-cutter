@@ -84,7 +84,7 @@ from matrix_auto_cutter.phase2.workspace import (
     create_project,
     ensure_workspace,
 )
-from matrix_auto_cutter.sidecar import ObsEventSidecar
+from matrix_auto_cutter.sidecar import ObsEventSidecarV12
 
 
 def _project(port):
@@ -354,7 +354,7 @@ def _sidecar_context(port):
     )
     assert hasattr(target_result, "path") and hasattr(temp_result, "path")
     sidecar = build_sidecar(journal, intent)
-    assert isinstance(sidecar, ObsEventSidecar)
+    assert isinstance(sidecar, ObsEventSidecarV12)
     return source, target_result.path, temp_result.path, intent, sidecar
 
 

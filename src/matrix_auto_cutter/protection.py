@@ -15,7 +15,12 @@ from matrix_auto_cutter.models import (
     ProtectionLevel,
     ProtectionPolicy,
 )
-from matrix_auto_cutter.sidecar import ObsEventSidecar, SidecarEvent, _pair_structure_failures
+from matrix_auto_cutter.outro import OutroResolutionEvidence
+from matrix_auto_cutter.sidecar import (
+    SidecarEvent,
+    ValidatedObsEventSidecar,
+    _pair_structure_failures,
+)
 from matrix_auto_cutter.timebase import Frame, FrameRange
 
 
@@ -173,7 +178,7 @@ def normalize_ranges(
     return _partition(raw)
 
 
-def materialize_protection(sidecar: ObsEventSidecar) -> ProtectionResolutionResult:
+def materialize_protection(sidecar: ValidatedObsEventSidecar) -> ProtectionResolutionResult:
     """Paare Events konservativ, puffere, clamp und partitioniere alle Policies."""
     pair_failures = _pair_structure_failures(sidecar.events)
     if pair_failures:
@@ -211,6 +216,9 @@ def materialize_protection(sidecar: ObsEventSidecar) -> ProtectionResolutionResu
         if event.event_id in paired_ids or event.type in {
             "recording_paused",
             "recording_resumed",
+            # A generic scene marker acquires semantic protection only after an
+            # explicit local outro binding resolves it below.
+            "scene_changed",
         }:
             continue
         item = _event_range(event, sidecar.source.video_frame_count)
@@ -219,6 +227,38 @@ def materialize_protection(sidecar: ObsEventSidecar) -> ProtectionResolutionResu
     return ProtectionResolutionResult(
         status="materialized",
         ranges=_partition(tuple(raw_ranges)),
+        errors=(),
+    )
+
+
+def materialize_protection_with_outro(
+    sidecar: ValidatedObsEventSidecar,
+    resolution: OutroResolutionEvidence,
+) -> ProtectionResolutionResult:
+    """Add only an exactly resolved hard outro range, then canonically partition."""
+    base = materialize_protection(sidecar)
+    if base.status != "materialized" or resolution.status != "resolved":
+        return base
+    assert resolution.scene_event_id is not None
+    assert resolution.protected_start_frame is not None
+    assert resolution.protected_end_frame is not None
+    outro = MaterializedFrameRange(
+        protection_id="prot-outro-900",
+        source_start_frame=resolution.protected_start_frame,
+        source_end_frame=resolution.protected_end_frame,
+        level=ProtectionLevel.HARD,
+        source_event_ids=(resolution.scene_event_id,),
+        uncertainty_padding_frames=0,
+        policy=ProtectionPolicy(
+            blocks_time_edits=True,
+            blocks_overlays=True,
+            blocks_local_audio_repair=True,
+            allows_global_mastering=True,
+        ),
+    )
+    return ProtectionResolutionResult(
+        status="materialized",
+        ranges=normalize_ranges((*base.ranges, outro)),
         errors=(),
     )
 

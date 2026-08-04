@@ -1,4 +1,4 @@
-"""No-replace Sidecar 1.1 publisher and complete target validator."""
+"""No-replace Sidecar publisher and complete versioned target validator."""
 
 from __future__ import annotations
 
@@ -32,7 +32,12 @@ from matrix_auto_cutter.phase2.finalizer.models import MAX_SIDECAR_BYTES, Finali
 from matrix_auto_cutter.phase2.pathing import SecureReadFailed, ValidatedPath, secure_read_file
 from matrix_auto_cutter.phase2.source_confirmation.capability import _ConfirmedSourceUsage
 from matrix_auto_cutter.phase2.win32_port import Win32Port
-from matrix_auto_cutter.sidecar import ObsEventSidecar, validate_sidecar
+from matrix_auto_cutter.sidecar import (
+    ObsEventSidecar,
+    ObsEventSidecarV12,
+    ValidatedObsEventSidecar,
+    validate_sidecar,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,9 +49,9 @@ class TargetMissing:
 
 @dataclass(frozen=True, slots=True)
 class TargetValid:
-    """Fully validated visible Sidecar-1.1 commit evidence."""
+    """Fully validated visible versioned Sidecar commit evidence."""
 
-    sidecar: ObsEventSidecar
+    sidecar: ValidatedObsEventSidecar
     location: ArtifactLocation
     volume_serial: int
     file_id_128: bytes | None
@@ -64,7 +69,7 @@ type TargetValidation = TargetMissing | TargetValid | TargetInvalid
 
 @dataclass(frozen=True, slots=True)
 class SidecarPublished:
-    """Successful visible and revalidated Sidecar 1.1 publication."""
+    """Successful visible and revalidated versioned Sidecar publication."""
 
     location: ArtifactLocation
     idempotent: bool
@@ -81,8 +86,8 @@ class SidecarPublishFailed:
 type SidecarPublishResult = SidecarPublished | SidecarPublishFailed
 
 
-def sidecar_bytes(sidecar: ObsEventSidecar) -> bytes:
-    """Return bounded canonical Sidecar-1.1 bytes with final LF."""
+def sidecar_bytes(sidecar: ValidatedObsEventSidecar) -> bytes:
+    """Return bounded canonical versioned Sidecar bytes with final LF."""
     data = canonical_bytes(sidecar)
     if len(data) > MAX_SIDECAR_BYTES:
         raise ValueError("sidecar exceeds its bounded size contract")
@@ -121,7 +126,14 @@ def read_committed_sidecar(
     try:
         if read.data.startswith(b"\xef\xbb\xbf") or not read.data.endswith(b"\n"):
             raise ValueError("sidecar is not canonical UTF-8 with final LF")
-        sidecar = ObsEventSidecar.model_validate_json(read.data.decode("utf-8", errors="strict"))
+        raw = json.loads(read.data.decode("utf-8", errors="strict"))
+        if not isinstance(raw, dict):
+            raise ValueError("sidecar root is not an object")
+        sidecar = (
+            ObsEventSidecar.model_validate_json(read.data.decode("utf-8", errors="strict"))
+            if raw.get("schema_version") == "1.1"
+            else ObsEventSidecarV12.model_validate_json(read.data.decode("utf-8", errors="strict"))
+        )
         if sidecar_bytes(sidecar) != read.data:
             raise ValueError("sidecar bytes are not canonical")
     except (UnicodeError, ValueError) as exc:
@@ -137,13 +149,16 @@ def read_committed_sidecar(
     evidence = expected_source if expected_source is not None else sidecar.source
     phase1_payload = json.loads(sidecar.model_dump_json(), parse_float=Decimal)
     phase1 = validate_sidecar(phase1_payload, evidence)
-    if phase1.mode != "validated_sidecar_1_1" or phase1.sidecar != sidecar:
+    if (
+        phase1.mode not in {"validated_sidecar_1_1", "validated_sidecar_1_2"}
+        or phase1.sidecar != sidecar
+    ):
         return TargetInvalid(
             failure(
                 FinalizerErrorCode.TARGET_ALREADY_EXISTS,
                 FinalizerErrorCategory.INTEGRITY,
                 "target.phase1_validation",
-                "existing target is not a valid source-identical Sidecar 1.1",
+                "existing target is not a valid source-identical Sidecar",
                 underlying=phase1,
             )
         )
@@ -163,7 +178,7 @@ def validate_target(
     port: Win32Port,
     target: ValidatedPath,
     intent: FinalizationIntent | None,
-    expected: ObsEventSidecar | None,
+    expected: ValidatedObsEventSidecar | None,
 ) -> TargetValidation:
     """Bounded-open and fully Phase-1-validate one expected sidecar target."""
     observed = read_committed_sidecar(
@@ -207,7 +222,7 @@ def publish_sidecar(
     intent_path: ValidatedPath,
     intent_data: bytes,
     intent: FinalizationIntent,
-    sidecar: ObsEventSidecar,
+    sidecar: ValidatedObsEventSidecar,
     usage: _ConfirmedSourceUsage,
     cancellation: CancellationToken,
 ) -> SidecarPublishResult:

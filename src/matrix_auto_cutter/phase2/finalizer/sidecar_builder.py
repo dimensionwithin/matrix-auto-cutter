@@ -52,9 +52,9 @@ from matrix_auto_cutter.phase2.finalizer.loader import LoadedJournal
 from matrix_auto_cutter.phase2.finalizer.models import FinalizationIntent
 from matrix_auto_cutter.protection import materialize_protection
 from matrix_auto_cutter.sidecar import (
-    ObsEventSidecar,
+    ObsEventSidecarV12,
     SidecarCapabilities,
-    SidecarEvent,
+    SidecarEventV12,
     validate_sidecar,
 )
 
@@ -239,7 +239,7 @@ def build_sidecar(
     journal: LoadedJournal,
     intent: FinalizationIntent,
     cancellation: CancellationToken | None = None,
-) -> ObsEventSidecar | FinalizerFailure:
+) -> ObsEventSidecarV12 | FinalizerFailure:
     """Compose Phase-1 models and reject unless its validators accept the result."""
     try:
         records = _typed_records(journal, cancellation)
@@ -271,7 +271,7 @@ def build_sidecar(
         if isinstance(values, FinalizerFailure):
             return values
         drift, residual = values
-        events: list[SidecarEvent] = []
+        events: list[SidecarEventV12] = []
         warnings: list[str] = []
 
         def mapped_event(
@@ -282,9 +282,11 @@ def build_sidecar(
             output_frame_count: int | None,
             manual: bool,
             pair_id: object | None = None,
+            scene_uuid: object | None = None,
+            scene_name: str | None = None,
             label: str | None = None,
             protection: EventProtection,
-        ) -> SidecarEvent:
+        ) -> SidecarEventV12:
             _check_cancelled(cancellation)
             mapped = map_event_to_source_frame(
                 event_counter=output_frame_count,
@@ -319,9 +321,13 @@ def build_sidecar(
             }
             if pair_id is not None:
                 kwargs["pair_id"] = pair_id
+            if scene_uuid is not None:
+                kwargs["scene_uuid"] = scene_uuid
+            if scene_name is not None:
+                kwargs["scene_name"] = scene_name
             if label is not None:
                 kwargs["label"] = label
-            return SidecarEvent.model_validate(kwargs)
+            return SidecarEventV12.model_validate(kwargs)
 
         for record in records:
             _check_cancelled(cancellation)
@@ -337,7 +343,13 @@ def build_sidecar(
                         output_frame_count=record.output_frame_count,
                         manual=record.event_type == "manual_protection",
                         pair_id=record.pair_id,
-                        label=record.label,
+                        scene_uuid=(
+                            record.source_uuid if record.event_type == "scene_changed" else None
+                        ),
+                        scene_name=(
+                            record.label if record.event_type == "scene_changed" else None
+                        ),
+                        label=(record.label if record.event_type == "manual_protection" else None),
                         protection=_automatic_policy(record.event_type),
                     )
                 )
@@ -401,9 +413,9 @@ def build_sidecar(
                 "renamed_rebind": "rebind_verified",
             }[intent.source_identity.binding.value],
         )
-        sidecar = ObsEventSidecar(
+        sidecar = ObsEventSidecarV12(
             artifact_type="obs_event_sidecar",
-            schema_version="1.1",
+            schema_version="1.2",
             producer=Producer(
                 name="matrix-auto-cutter-obs-producer",
                 version=header.producer.version,
@@ -458,7 +470,7 @@ def build_sidecar(
         return _cancel_failure()
     phase1_payload = json.loads(sidecar.model_dump_json(), parse_float=Decimal)
     validated = validate_sidecar(phase1_payload, intent.source_identity)
-    if validated.mode != "validated_sidecar_1_1" or validated.sidecar != sidecar:
+    if validated.mode != "validated_sidecar_1_2" or validated.sidecar != sidecar:
         return failure(
             FinalizerErrorCode.JOURNAL_CORRUPT,
             FinalizerErrorCategory.INTEGRITY,

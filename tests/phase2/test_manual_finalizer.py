@@ -107,7 +107,7 @@ def test_controlled_composition_publishes_and_validates_legacy_sidecar(monkeypat
     assert isinstance(result, ManualFinalizationSucceeded), result
     assert result.sidecar_path == SIDECAR_PATH
     assert result.idempotent is False
-    assert validation_modes == ["validated_sidecar_1_1"]
+    assert validation_modes == ["validated_sidecar_1_2"]
     assert case.port._key(SIDECAR_PATH) in case.port.nodes
     assert bytes(case.port.nodes[case.port._key(SOURCE_PATH)].data) == case.source_data
     assert len(case.process.calls) == 2
