@@ -16,6 +16,12 @@ from matrix_auto_cutter.repeat.audio import (
     extract_audio,
     probe_duration_ms,
 )
+from matrix_auto_cutter.repeat.boundary import (
+    BoundaryCandidate,
+    BoundaryDetectionParams,
+    BoundaryDetectionResult,
+    detect_boundary_echoes,
+)
 from matrix_auto_cutter.repeat.detect import (
     DetectionParams,
     DetectionResult,
@@ -24,8 +30,11 @@ from matrix_auto_cutter.repeat.detect import (
     detect_repeats,
 )
 from matrix_auto_cutter.repeat.diagnostics import (
+    AnyDiagnosticsDocument,
     DiagnosticsWriteResult,
+    RepeatCandidateV1_1,
     RepeatDiagnosticsDocument,
+    RepeatDiagnosticsDocumentV1_1,
     build_diagnostics,
     write_diagnostics,
 )
@@ -65,7 +74,11 @@ from matrix_auto_cutter.repeat.whisper_json import convert_whisper_output
 
 __all__ = [
     "DEFAULT_THREADS",
+    "AnyDiagnosticsDocument",
     "BinaryNotFoundError",
+    "BoundaryCandidate",
+    "BoundaryDetectionParams",
+    "BoundaryDetectionResult",
     "DetectionParams",
     "DetectionResult",
     "DiagnosticsWriteResult",
@@ -79,8 +92,10 @@ __all__ = [
     "RawOutputEmptyError",
     "RawOutputMissingError",
     "RepeatCandidate",
+    "RepeatCandidateV1_1",
     "RepeatContractError",
     "RepeatDiagnosticsDocument",
+    "RepeatDiagnosticsDocumentV1_1",
     "RepeatSegment",
     "RepeatTranscriptDocument",
     "RepeatWord",
@@ -101,6 +116,7 @@ __all__ = [
     "compute_similarity",
     "convert_whisper_output",
     "default_timeout_ms",
+    "detect_boundary_echoes",
     "detect_repeats",
     "extract_audio",
     "load_transcript",

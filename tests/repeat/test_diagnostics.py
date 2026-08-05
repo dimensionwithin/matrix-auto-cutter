@@ -9,6 +9,7 @@ from typing import Any
 
 from tests.repeat.conftest import transcript_dict, utterance_segment
 
+from matrix_auto_cutter.repeat.boundary import BoundaryDetectionParams
 from matrix_auto_cutter.repeat.detect import DetectionParams
 from matrix_auto_cutter.repeat.diagnostics import build_diagnostics, write_diagnostics
 from matrix_auto_cutter.repeat.transcript import RepeatTranscriptDocument
@@ -80,6 +81,48 @@ def test_write_diagnostics_reports_structured_failure_on_unwritable_parent(
     assert result.status == "failed"
     assert result.error is not None
     assert not target.exists()
+
+
+def test_v1_0_document_forbids_the_detector_field() -> None:
+    document = build_diagnostics(_document())
+    dumped = json.loads(document.model_dump_json())
+    assert dumped["schema_version"] == "1.0"
+    assert "detector" not in dumped["candidates"][0]
+
+
+def test_v1_1_document_requires_the_detector_field_on_every_candidate() -> None:
+    document = build_diagnostics(_document(), DetectionParams(), BoundaryDetectionParams())
+    dumped = json.loads(document.model_dump_json())
+    assert dumped["schema_version"] == "1.1"
+    assert len(dumped["candidates"]) >= 1
+    for candidate in dumped["candidates"]:
+        assert candidate["detector"] in ("utterance", "boundary")
+
+
+def test_both_detectors_report_the_same_pair_as_separate_entries() -> None:
+    document = build_diagnostics(_document(), DetectionParams(), BoundaryDetectionParams())
+    assert document.schema_version == "1.1"
+    assert len(document.candidates) == 2
+    detectors = {candidate.detector for candidate in document.candidates}
+    assert detectors == {"utterance", "boundary"}
+    for candidate in document.candidates:
+        assert candidate.first.start_ms == 0
+        assert candidate.second.start_ms == 2_000
+    utterance_candidate = next(c for c in document.candidates if c.detector == "utterance")
+    boundary_candidate = next(c for c in document.candidates if c.detector == "boundary")
+    assert utterance_candidate.scores is not None
+    assert utterance_candidate.boundary_score is None
+    assert boundary_candidate.scores is None
+    assert boundary_candidate.boundary_score is not None
+    assert boundary_candidate.window_words is not None
+    assert boundary_candidate.first_window_text is not None
+
+
+def test_boundary_disabled_returns_v1_0_unchanged() -> None:
+    without_boundary = build_diagnostics(_document(), DetectionParams(), None)
+    baseline = build_diagnostics(_document())
+    assert without_boundary == baseline
+    assert without_boundary.schema_version == "1.0"
 
 
 def test_write_diagnostics_replace_failure_removes_temporary_file(

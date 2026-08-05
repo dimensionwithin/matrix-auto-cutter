@@ -9,6 +9,12 @@ from pathlib import Path
 
 from matrix_auto_cutter.repeat.asr import DEFAULT_MAX_SEGMENT_LEN, DEFAULT_THREADS, run_whisper
 from matrix_auto_cutter.repeat.audio import extract_audio, probe_duration_ms
+from matrix_auto_cutter.repeat.boundary import (
+    DEFAULT_MAX_WINDOW_WORDS,
+    DEFAULT_MIN_WINDOW_WORDS,
+    DEFAULT_SCORE_THRESHOLD,
+    BoundaryDetectionParams,
+)
 from matrix_auto_cutter.repeat.detect import DetectionParams
 from matrix_auto_cutter.repeat.diagnostics import build_diagnostics, write_diagnostics
 from matrix_auto_cutter.repeat.errors import (
@@ -78,6 +84,30 @@ def _parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_MAX_SEGMENT_LEN,
         help="whisper-cli -ml (mit --source Pflicht); <= 0 unterdrückt das Flag",
+    )
+    parser.add_argument(
+        "--boundary",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Zweiter Detektor für kurze Echos an der Äußerungsgrenze (repeat_diagnostics/1.1)",
+    )
+    parser.add_argument(
+        "--boundary-threshold",
+        type=float,
+        default=DEFAULT_SCORE_THRESHOLD,
+        help="Score-Schwelle des Boundary-Detektors",
+    )
+    parser.add_argument(
+        "--boundary-min-words",
+        type=int,
+        default=DEFAULT_MIN_WINDOW_WORDS,
+        help="Kleinste Fensterbreite (Wörter) des Boundary-Detektors",
+    )
+    parser.add_argument(
+        "--boundary-max-words",
+        type=int,
+        default=DEFAULT_MAX_WINDOW_WORDS,
+        help="Größte Fensterbreite (Wörter) des Boundary-Detektors",
     )
     return parser
 
@@ -149,7 +179,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         if args.emit_transcript is not None:
             _emit_transcript(args.emit_transcript, transcript)
-        document = build_diagnostics(transcript, DetectionParams())
+        boundary_params = (
+            BoundaryDetectionParams(
+                score_threshold=args.boundary_threshold,
+                min_window_words=args.boundary_min_words,
+                max_window_words=args.boundary_max_words,
+            )
+            if args.boundary
+            else None
+        )
+        document = build_diagnostics(transcript, DetectionParams(), boundary_params)
         result = write_diagnostics(args.out, document)
     except RepeatContractError as exc:
         print(f"Vertragsfehler: {exc}", file=sys.stderr)
