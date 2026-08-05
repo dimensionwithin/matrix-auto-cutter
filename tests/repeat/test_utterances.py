@@ -184,6 +184,47 @@ def test_a_long_punctuated_sentence_under_the_cap_stays_a_single_utterance() -> 
     assert total_duration_ms < UtteranceParams().max_utterance_duration_ms
 
 
+def test_ordinal_period_does_not_split_the_utterance() -> None:
+    raw = transcript_dict(
+        [
+            segment(
+                0,
+                800,
+                [
+                    word(0, 200, "am"),
+                    word(200, 400, "2."),
+                    word(400, 800, "September"),
+                ],
+            )
+        ]
+    )
+    document = RepeatTranscriptDocument.model_validate_json(json.dumps(raw))
+    utterances = build_utterances(document)
+    assert [u.text for u in utterances] == ["am 2. September"]
+
+
+def test_sentence_final_period_after_word_still_splits() -> None:
+    raw = transcript_dict(
+        [
+            segment(
+                0,
+                600,
+                [word(0, 200, "Ende."), word(200, 400, "Neuer"), word(400, 600, "Satz")],
+            )
+        ]
+    )
+    document = RepeatTranscriptDocument.model_validate_json(json.dumps(raw))
+    utterances = build_utterances(document)
+    assert [u.text for u in utterances] == ["Ende.", "Neuer Satz"]
+
+
+def test_ordinal_period_at_utterance_end_without_following_word_does_not_crash() -> None:
+    raw = transcript_dict([segment(0, 400, [word(0, 200, "am"), word(200, 400, "2.")])])
+    document = RepeatTranscriptDocument.model_validate_json(json.dumps(raw))
+    utterances = build_utterances(document)
+    assert [u.text for u in utterances] == ["am 2."]
+
+
 def test_max_duration_cap_still_splits_a_long_unpunctuated_passage() -> None:
     # Over 20s with no sentence punctuation anywhere: the emergency brake
     # must still fire since sentence punctuation never will.

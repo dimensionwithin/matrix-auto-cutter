@@ -40,17 +40,16 @@ def test_cli_success_writes_diagnostics(tmp_path: Path) -> None:
     assert len(document["candidates"]) == 1
 
 
-def test_cli_boundary_default_is_on_and_writes_v1_1(tmp_path: Path) -> None:
+def test_cli_boundary_default_is_on_and_writes_v1_2(tmp_path: Path) -> None:
     transcript_path = tmp_path / "transcript.json"
     out_path = tmp_path / "diagnostics.json"
     _write_transcript(transcript_path)
     exit_code = main(["--transcript", str(transcript_path), "--out", str(out_path)])
     assert exit_code == 0
     document = json.loads(out_path.read_text(encoding="utf-8"))
-    assert document["schema_version"] == "1.1"
-    assert len(document["candidates"]) == 2
-    detectors = {candidate["detector"] for candidate in document["candidates"]}
-    assert detectors == {"utterance", "boundary"}
+    assert document["schema_version"] == "1.2"
+    assert len(document["candidates"]) == 1
+    assert document["candidates"][0]["detector"] == ["utterance", "boundary"]
 
 
 def test_cli_no_boundary_writes_v1_0(tmp_path: Path) -> None:
@@ -97,7 +96,7 @@ def test_cli_boundary_threshold_option_excludes_low_scoring_candidate(tmp_path: 
     )
     assert exit_code == 0
     document = json.loads(out_path.read_text(encoding="utf-8"))
-    boundary_candidates = [c for c in document["candidates"] if c["detector"] == "boundary"]
+    boundary_candidates = [c for c in document["candidates"] if "boundary" in c["detector"]]
     assert boundary_candidates == []
 
 
@@ -118,7 +117,7 @@ def test_cli_boundary_min_words_option_is_applied(tmp_path: Path) -> None:
     assert exit_code == 0
     document = json.loads(out_path.read_text(encoding="utf-8"))
     assert document["boundary_parameters"]["min_window_words"] == 6
-    boundary_candidates = [c for c in document["candidates"] if c["detector"] == "boundary"]
+    boundary_candidates = [c for c in document["candidates"] if "boundary" in c["detector"]]
     assert boundary_candidates == []
 
 

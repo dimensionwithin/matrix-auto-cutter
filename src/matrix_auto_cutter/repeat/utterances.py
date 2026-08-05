@@ -39,6 +39,11 @@ class Utterance(CanonicalModel):
     words: tuple[RepeatWord, ...] = Field(min_length=1)
 
 
+def _is_ordinal_period(text: str) -> bool:
+    """Return True for a trailing ``.`` immediately preceded by a digit, e.g. ``2.``."""
+    return text.endswith(".") and len(text) >= 2 and text[-2].isdigit()
+
+
 def _finalize_utterance(words: list[RepeatWord]) -> Utterance:
     return Utterance(
         start_ms=words[0].start_ms,
@@ -60,7 +65,11 @@ def build_utterances(
     ends with a sentence-final character (``.``, ``?``, ``!``) when
     ``split_on_sentence_punctuation`` is enabled. The third rule uses only the
     transcript's own punctuation at the end of a word's text -- a period inside
-    a word (e.g. an abbreviation) does not trigger it. ``max_pause_ms`` and
+    a word (e.g. an abbreviation) does not trigger it. A trailing ``.``
+    immediately preceded by a digit (e.g. ``2.`` in "am 2. September") is a
+    German ordinal, not a sentence end, and does not trigger the split either
+    -- on real material this otherwise cut dates in half mid-utterance.
+    ``?`` and ``!`` are unaffected. ``max_pause_ms`` and
     ``max_utterance_duration_ms`` remain in effect regardless, since raw
     recordings and punctuation-free transcripts still need them. No language
     model and no punctuation heuristics beyond what the transcript already
@@ -81,7 +90,11 @@ def build_utterances(
                 utterances.append(_finalize_utterance(current))
                 current = []
         current.append(word)
-        if active_params.split_on_sentence_punctuation and word.text.endswith(_SENTENCE_END_CHARS):
+        if (
+            active_params.split_on_sentence_punctuation
+            and word.text.endswith(_SENTENCE_END_CHARS)
+            and not _is_ordinal_period(word.text)
+        ):
             utterances.append(_finalize_utterance(current))
             current = []
     if current:

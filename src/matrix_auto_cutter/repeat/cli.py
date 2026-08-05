@@ -109,7 +109,23 @@ def _parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAX_WINDOW_WORDS,
         help="Größte Fensterbreite (Wörter) des Boundary-Detektors",
     )
+    prompt_group = parser.add_mutually_exclusive_group()
+    prompt_group.add_argument(
+        "--initial-prompt", help="Vokabular-Hinweis, wörtlich an whisper-cli übergeben"
+    )
+    prompt_group.add_argument(
+        "--initial-prompt-file", help="Datei (UTF-8) mit dem Vokabular-Hinweis"
+    )
     return parser
+
+
+def _resolve_initial_prompt(args: argparse.Namespace) -> str | None:
+    if args.initial_prompt is not None:
+        return str(args.initial_prompt)
+    if args.initial_prompt_file is not None:
+        text = Path(args.initial_prompt_file).read_text(encoding="utf-8").strip()
+        return text if text else None
+    return None
 
 
 def _require_source_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
@@ -151,6 +167,7 @@ def _transcribe_source(args: argparse.Namespace) -> RepeatTranscriptDocument:
         threads=args.threads,
         timeout_ms=args.timeout_ms,
         max_segment_len=args.max_segment_len,
+        initial_prompt=_resolve_initial_prompt(args),
     )
     window_offset_ms = args.window_start_ms if args.window_start_ms is not None else 0
     return convert_whisper_output(

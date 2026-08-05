@@ -323,6 +323,157 @@ def test_emit_transcript_persists_when_a_later_step_raises(
     assert not out_path.exists()
 
 
+def test_initial_prompt_option_is_passed_to_whisper(tmp_path: Path, monkeypatch: Any) -> None:
+    source = tmp_path / "in.mp4"
+    source.write_bytes(b"x")
+    binary = tmp_path / "whisper-cli.exe"
+    binary.write_bytes(b"b")
+    model = tmp_path / "model.bin"
+    model.write_bytes(b"m")
+    runner = _FakeRunner(_RAW_WHISPER_JSON)
+    _patch_runner(monkeypatch, runner)
+
+    exit_code = main(
+        [
+            "--source",
+            str(source),
+            "--whisper-binary",
+            str(binary),
+            "--whisper-model",
+            str(model),
+            "--work-dir",
+            str(tmp_path / "work"),
+            "--initial-prompt",
+            "Matrix Market",
+            "--out",
+            str(tmp_path / "out.json"),
+        ]
+    )
+    assert exit_code == 0
+    whisper_argv = next(call for call in runner.calls if "-ojf" in call)
+    assert whisper_argv[-2:] == ["--prompt", "Matrix Market"]
+
+
+def test_no_initial_prompt_option_omits_flag(tmp_path: Path, monkeypatch: Any) -> None:
+    source = tmp_path / "in.mp4"
+    source.write_bytes(b"x")
+    binary = tmp_path / "whisper-cli.exe"
+    binary.write_bytes(b"b")
+    model = tmp_path / "model.bin"
+    model.write_bytes(b"m")
+    runner = _FakeRunner(_RAW_WHISPER_JSON)
+    _patch_runner(monkeypatch, runner)
+
+    exit_code = main(
+        [
+            "--source",
+            str(source),
+            "--whisper-binary",
+            str(binary),
+            "--whisper-model",
+            str(model),
+            "--work-dir",
+            str(tmp_path / "work"),
+            "--out",
+            str(tmp_path / "out.json"),
+        ]
+    )
+    assert exit_code == 0
+    whisper_argv = next(call for call in runner.calls if "-ojf" in call)
+    assert "--prompt" not in whisper_argv
+
+
+def test_initial_prompt_file_option_is_read_and_passed_to_whisper(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    source = tmp_path / "in.mp4"
+    source.write_bytes(b"x")
+    binary = tmp_path / "whisper-cli.exe"
+    binary.write_bytes(b"b")
+    model = tmp_path / "model.bin"
+    model.write_bytes(b"m")
+    prompt_file = tmp_path / "prompt.txt"
+    prompt_file.write_text("  Matrix Market  \n", encoding="utf-8")
+    runner = _FakeRunner(_RAW_WHISPER_JSON)
+    _patch_runner(monkeypatch, runner)
+
+    exit_code = main(
+        [
+            "--source",
+            str(source),
+            "--whisper-binary",
+            str(binary),
+            "--whisper-model",
+            str(model),
+            "--work-dir",
+            str(tmp_path / "work"),
+            "--initial-prompt-file",
+            str(prompt_file),
+            "--out",
+            str(tmp_path / "out.json"),
+        ]
+    )
+    assert exit_code == 0
+    whisper_argv = next(call for call in runner.calls if "-ojf" in call)
+    assert whisper_argv[-2:] == ["--prompt", "Matrix Market"]
+
+
+def test_empty_initial_prompt_file_suppresses_the_flag(tmp_path: Path, monkeypatch: Any) -> None:
+    source = tmp_path / "in.mp4"
+    source.write_bytes(b"x")
+    binary = tmp_path / "whisper-cli.exe"
+    binary.write_bytes(b"b")
+    model = tmp_path / "model.bin"
+    model.write_bytes(b"m")
+    prompt_file = tmp_path / "prompt.txt"
+    prompt_file.write_text("   \n", encoding="utf-8")
+    runner = _FakeRunner(_RAW_WHISPER_JSON)
+    _patch_runner(monkeypatch, runner)
+
+    exit_code = main(
+        [
+            "--source",
+            str(source),
+            "--whisper-binary",
+            str(binary),
+            "--whisper-model",
+            str(model),
+            "--work-dir",
+            str(tmp_path / "work"),
+            "--initial-prompt-file",
+            str(prompt_file),
+            "--out",
+            str(tmp_path / "out.json"),
+        ]
+    )
+    assert exit_code == 0
+    whisper_argv = next(call for call in runner.calls if "-ojf" in call)
+    assert "--prompt" not in whisper_argv
+
+
+def test_initial_prompt_and_initial_prompt_file_are_mutually_exclusive(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            [
+                "--source",
+                "in.mp4",
+                "--whisper-binary",
+                "b.exe",
+                "--whisper-model",
+                "m.bin",
+                "--work-dir",
+                str(tmp_path / "work"),
+                "--initial-prompt",
+                "a",
+                "--initial-prompt-file",
+                "b.txt",
+                "--out",
+                str(tmp_path / "out.json"),
+            ]
+        )
+    assert excinfo.value.code == 2
+
+
 def test_binary_not_found_maps_to_documented_exit_code(tmp_path: Path, monkeypatch: Any) -> None:
     source = tmp_path / "in.mp4"
     source.write_bytes(b"x")

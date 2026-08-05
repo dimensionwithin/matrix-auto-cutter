@@ -31,6 +31,7 @@ def build_whisper_argv(
     wav_path: str | Path,
     threads: int = DEFAULT_THREADS,
     max_segment_len: int = DEFAULT_MAX_SEGMENT_LEN,
+    initial_prompt: str | None = None,
 ) -> list[str]:
     """Build the argv: German, word-level JSON via -ojf, no VAD, bounded segment length.
 
@@ -40,7 +41,8 @@ def build_whisper_argv(
     ``-owts``, which internally sets ``max_len=60``; ``-ml 60`` establishes
     the same bound explicitly, without the extra ``.wts`` output file.
     ``max_segment_len <= 0`` omits the flag entirely (whisper.cpp's own
-    unbounded default).
+    unbounded default). ``initial_prompt``, when given, is appended as
+    ``--prompt <text>``; when ``None`` the flag is omitted entirely.
     """
     argv = [
         whisper_binary,
@@ -56,6 +58,8 @@ def build_whisper_argv(
     ]
     if max_segment_len > 0:
         argv += ["-ml", str(max_segment_len)]
+    if initial_prompt is not None:
+        argv += ["--prompt", initial_prompt]
     return argv
 
 
@@ -84,6 +88,7 @@ def run_whisper(
     threads: int = DEFAULT_THREADS,
     timeout_ms: int | None = None,
     max_segment_len: int = DEFAULT_MAX_SEGMENT_LEN,
+    initial_prompt: str | None = None,
 ) -> WhisperRunResult:
     """Validate binary/model paths, run whisper-cli, and read back its raw JSON output."""
     binary = Path(whisper_binary)
@@ -95,7 +100,9 @@ def run_whisper(
     active_timeout_ms = (
         timeout_ms if timeout_ms is not None else default_timeout_ms(audio_duration_ms)
     )
-    argv = build_whisper_argv(str(binary), str(model), wav_path, threads, max_segment_len)
+    argv = build_whisper_argv(
+        str(binary), str(model), wav_path, threads, max_segment_len, initial_prompt
+    )
     result = runner(argv, active_timeout_ms)
     if result.timed_out:
         raise ProcessTimeoutError("whisper-cli", active_timeout_ms, result.exit_code, result.stderr)

@@ -90,32 +90,87 @@ def test_v1_0_document_forbids_the_detector_field() -> None:
     assert "detector" not in dumped["candidates"][0]
 
 
-def test_v1_1_document_requires_the_detector_field_on_every_candidate() -> None:
+def test_v1_2_document_requires_a_nonempty_detector_list_on_every_candidate() -> None:
     document = build_diagnostics(_document(), DetectionParams(), BoundaryDetectionParams())
     dumped = json.loads(document.model_dump_json())
-    assert dumped["schema_version"] == "1.1"
+    assert dumped["schema_version"] == "1.2"
     assert len(dumped["candidates"]) >= 1
     for candidate in dumped["candidates"]:
-        assert candidate["detector"] in ("utterance", "boundary")
+        assert candidate["detector"]
+        assert set(candidate["detector"]) <= {"utterance", "boundary"}
 
 
-def test_both_detectors_report_the_same_pair_as_separate_entries() -> None:
+def test_both_detectors_reporting_the_same_pair_merge_into_one_candidate() -> None:
     document = build_diagnostics(_document(), DetectionParams(), BoundaryDetectionParams())
+    assert document.schema_version == "1.2"
+    assert len(document.candidates) == 1
+    candidate = document.candidates[0]
+    assert candidate.detector == ("utterance", "boundary")
+    assert candidate.first.start_ms == 0
+    assert candidate.second.start_ms == 2_000
+    assert candidate.utterance_score is not None
+    assert candidate.boundary_score is not None
+    assert candidate.window_words is not None
+    assert candidate.first_window_text is not None
+
+
+def test_v1_1_document_is_still_readable() -> None:
+    from matrix_auto_cutter.repeat.diagnostics import (
+        RepeatCandidateV1_1,
+        RepeatDiagnosticsDocumentV1_1,
+    )
+
+    raw = {
+        "artifact_type": "matrix_auto_cutter_repeat_diagnostics",
+        "schema_version": "1.1",
+        "parameters": json.loads(DetectionParams().model_dump_json()),
+        "boundary_parameters": json.loads(BoundaryDetectionParams().model_dump_json()),
+        "total_pairs_checked": 1,
+        "boundary_total_pairs_checked": 1,
+        "candidates": [
+            {
+                "detector": "utterance",
+                "first": {"text": "a", "start_ms": 0, "end_ms": 100},
+                "second": {"text": "a", "start_ms": 200, "end_ms": 300},
+                "gap_ms": 100,
+                "reasons": ("score_above_threshold",),
+            }
+        ],
+    }
+    document = RepeatDiagnosticsDocumentV1_1.model_validate_json(json.dumps(raw))
     assert document.schema_version == "1.1"
-    assert len(document.candidates) == 2
-    detectors = {candidate.detector for candidate in document.candidates}
-    assert detectors == {"utterance", "boundary"}
-    for candidate in document.candidates:
-        assert candidate.first.start_ms == 0
-        assert candidate.second.start_ms == 2_000
-    utterance_candidate = next(c for c in document.candidates if c.detector == "utterance")
-    boundary_candidate = next(c for c in document.candidates if c.detector == "boundary")
-    assert utterance_candidate.scores is not None
-    assert utterance_candidate.boundary_score is None
-    assert boundary_candidate.scores is None
-    assert boundary_candidate.boundary_score is not None
-    assert boundary_candidate.window_words is not None
-    assert boundary_candidate.first_window_text is not None
+    assert isinstance(document.candidates[0], RepeatCandidateV1_1)
+    assert document.candidates[0].detector == "utterance"
+
+
+def test_boundary_only_pair_is_reported_as_a_single_element_detector_list() -> None:
+    document = build_diagnostics(
+        _document(), DetectionParams(max_gap_ms=0), BoundaryDetectionParams()
+    )
+    assert document.schema_version == "1.2"
+    assert document.total_pairs_checked == 0
+    assert len(document.candidates) == 1
+    candidate = document.candidates[0]
+    assert candidate.detector == ("boundary",)
+    assert candidate.utterance_score is None
+    assert candidate.boundary_score is not None
+
+
+def test_v1_2_candidate_requires_at_least_one_score() -> None:
+    import pytest
+
+    from matrix_auto_cutter.repeat.detect import UtteranceSpan
+    from matrix_auto_cutter.repeat.diagnostics import RepeatCandidateV1_2
+
+    span = UtteranceSpan(text="a", start_ms=0, end_ms=100)
+    with pytest.raises(ValueError, match="utterance_score/boundary_score"):
+        RepeatCandidateV1_2(
+            detector=("utterance",),
+            first=span,
+            second=span,
+            gap_ms=0,
+            reasons=(),
+        )
 
 
 def test_boundary_disabled_returns_v1_0_unchanged() -> None:

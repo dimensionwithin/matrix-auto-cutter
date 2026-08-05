@@ -78,6 +78,18 @@ def test_build_whisper_argv_custom_max_segment_len() -> None:
     assert argv[-2:] == ["-ml", "30"]
 
 
+def test_build_whisper_argv_without_initial_prompt_omits_flag() -> None:
+    argv = build_whisper_argv("whisper-cli.exe", "model.bin", "audio.wav")
+    assert "--prompt" not in argv
+
+
+def test_build_whisper_argv_with_initial_prompt_appends_prompt_flag() -> None:
+    argv = build_whisper_argv(
+        "whisper-cli.exe", "model.bin", "audio.wav", initial_prompt="Matrix Market"
+    )
+    assert argv[-2:] == ["--prompt", "Matrix Market"]
+
+
 def test_whisper_json_path_appends_json_suffix() -> None:
     assert whisper_json_path("work/audio.wav") == Path("work/audio.wav.json")
 
@@ -199,3 +211,38 @@ def test_run_whisper_default_max_segment_len_is_60(tmp_path: Path) -> None:
     runner = _runner(result)
     run_whisper(wav, str(binary), str(model), runner, audio_duration_ms=1_000)
     assert runner.calls[0][-2:] == ["-ml", "60"]
+
+
+def test_run_whisper_passes_through_initial_prompt(tmp_path: Path) -> None:
+    binary = tmp_path / "whisper-cli.exe"
+    binary.write_bytes(b"b")
+    model = tmp_path / "model.bin"
+    model.write_bytes(b"m")
+    wav = tmp_path / "audio.wav"
+    json_path = tmp_path / "audio.wav.json"
+    json_path.write_text('{"transcription": []}', encoding="utf-8")
+    result = ProcessResult(exit_code=0, stdout="", stderr="", timed_out=False, duration_ms=1)
+    runner = _runner(result)
+    run_whisper(
+        wav,
+        str(binary),
+        str(model),
+        runner,
+        audio_duration_ms=1_000,
+        initial_prompt="Matrix Market",
+    )
+    assert runner.calls[0][-2:] == ["--prompt", "Matrix Market"]
+
+
+def test_run_whisper_without_initial_prompt_omits_flag(tmp_path: Path) -> None:
+    binary = tmp_path / "whisper-cli.exe"
+    binary.write_bytes(b"b")
+    model = tmp_path / "model.bin"
+    model.write_bytes(b"m")
+    wav = tmp_path / "audio.wav"
+    json_path = tmp_path / "audio.wav.json"
+    json_path.write_text('{"transcription": []}', encoding="utf-8")
+    result = ProcessResult(exit_code=0, stdout="", stderr="", timed_out=False, duration_ms=1)
+    runner = _runner(result)
+    run_whisper(wav, str(binary), str(model), runner, audio_duration_ms=1_000)
+    assert "--prompt" not in runner.calls[0]
