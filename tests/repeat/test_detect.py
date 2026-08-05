@@ -145,6 +145,26 @@ def test_repetition_separated_by_a_fragment_beyond_max_gap_is_not_a_candidate() 
     assert result.candidates == ()
 
 
+def test_pair_below_old_weighting_threshold_is_a_candidate_under_new_weighting() -> None:
+    # "das sieht nicht gut aus fuer uns" / "ehrlich das sieht nicht gut aus":
+    # ratio=0.7302, ngram=0.5556, prefix=0.0, subsequence=0.7188. Under the
+    # old 0.4/0.2/0.2/0.2 weighting this pair totals ~0.5469 (below the
+    # 0.55 threshold, so it used to be silently dropped). Under the current
+    # 0.5/0.25/0.25 weighting (prefix_similarity excluded) it totals ~0.6837,
+    # comfortably above the threshold, and is now reported as a candidate.
+    segments = [
+        utterance_segment("das sieht nicht gut aus fuer uns", 0),
+        utterance_segment("ehrlich das sieht nicht gut aus", 2_200),
+    ]
+    document = _document(segments, 5_000)
+    result = detect_repeats(document)
+    assert len(result.candidates) == 1
+    candidate = result.candidates[0]
+    assert candidate.scores.prefix_similarity == 0.0
+    assert round(candidate.scores.total, 4) == 0.6837
+    assert candidate.scores.total >= 0.55
+
+
 def test_pair_leaving_the_window_stops_the_inner_scan_and_is_not_counted() -> None:
     # first (end=980) to fragment (start=1_700): gap 720ms, within the 1_500ms
     # window -> checked. first to third (start=2_600): gap 1_620ms, exceeds the

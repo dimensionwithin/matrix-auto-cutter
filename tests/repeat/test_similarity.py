@@ -104,9 +104,13 @@ def test_leading_correction_marker_is_stripped_before_scoring() -> None:
     assert with_marker.correction_marker_bonus > 0
     # Before this change, "Nein, " was left in the scored text and this exact
     # pair scored total=0.637 (ratio dragged down to ~0.66 by the unstripped
-    # marker). Stripping the marker before scoring raises it to 0.775.
-    assert round(without_marker_reference.total, 3) == 0.725
-    assert round(with_marker.total, 3) == 0.775
+    # marker). Stripping the marker before scoring raises it to 0.775 under
+    # the original 0.4/0.2/0.2/0.2 weighting. Under the current weighting
+    # (prefix_similarity dropped from the sum; ratio/ngram/subsequence at
+    # 0.5/0.25/0.25) the same pair scores 0.826 without the marker and 0.876
+    # with it.
+    assert round(without_marker_reference.total, 3) == 0.826
+    assert round(with_marker.total, 3) == 0.876
     assert with_marker.total > 0.637
 
 
@@ -124,6 +128,34 @@ def test_correction_marker_boundary_requires_a_word_break() -> None:
     # "nein" must not match inside a longer word like "neinerlei".
     score = compute_similarity("Das ist gut", "neinerlei sache, das ist gut")
     assert score.correction_marker_bonus == 0
+
+
+def test_prefix_similarity_is_reported_but_excluded_from_total() -> None:
+    # Two texts with a non-zero prefix_similarity but otherwise identical
+    # normalized content on both sides of the comparison; total must match
+    # the documented 0.5/0.25/0.25 + bonus formula exactly, with no
+    # contribution from prefix_similarity.
+    score = compute_similarity("Wir sehen einen Abwaertstrend", "Wir sehen den Abwaertstrend")
+    assert score.prefix_similarity > 0.0
+    expected_total = min(
+        1.0,
+        0.5 * score.ratio
+        + 0.25 * score.ngram_similarity
+        + 0.25 * score.subsequence_similarity
+        + score.correction_marker_bonus,
+    )
+    assert score.total == expected_total
+
+
+def test_prefix_similarity_of_zero_does_not_zero_out_total() -> None:
+    # Regression guard for the old formula, where prefix_similarity carried
+    # 20% of the weight: a pair with prefix_similarity == 0.0 must still be
+    # able to score well under the current weighting.
+    score = compute_similarity(
+        "das sieht nicht gut aus fuer uns", "ehrlich das sieht nicht gut aus"
+    )
+    assert score.prefix_similarity == 0.0
+    assert score.total > 0.6
 
 
 def test_also_leading_marker_is_stripped_exactly_once() -> None:

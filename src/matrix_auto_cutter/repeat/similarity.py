@@ -40,10 +40,14 @@ _DEFAULT_CORRECTION_MARKERS: tuple[str, ...] = (
 _PUNCTUATION_PATTERN = re.compile(r"[^\w\s]", re.UNICODE)
 _WHITESPACE_PATTERN = re.compile(r"\s+")
 
-_RATIO_WEIGHT = 0.4
-_NGRAM_WEIGHT = 0.2
-_PREFIX_WEIGHT = 0.2
-_SUBSEQUENCE_WEIGHT = 0.2
+_RATIO_WEIGHT = 0.5
+_NGRAM_WEIGHT = 0.25
+_SUBSEQUENCE_WEIGHT = 0.25
+# prefix_similarity is deliberately NOT a summand below: in a real transcript
+# probe (whisper.cpp output, German, 11 windowed utterance pairs) it was
+# exactly 0.0 for every pair, permanently burning 20% of the score budget.
+# It stays on SimilarityScore and is still computed and reported -- it is a
+# diagnostic value, not dead code -- it just no longer contributes to `total`.
 
 
 class SimilarityParams(CanonicalModel):
@@ -175,13 +179,18 @@ def compute_similarity(
     second_text: str,
     params: SimilarityParams | None = None,
 ) -> SimilarityScore:
-    """Combine RapidFuzz ratio, n-gram, prefix, and subsequence similarity.
+    """Combine RapidFuzz ratio, n-gram, and subsequence similarity.
 
-    ``total = 0.4 * ratio + 0.2 * ngram_similarity + 0.2 * prefix_similarity
-    + 0.2 * subsequence_similarity + correction_marker_bonus``, clipped to ``[0, 1]``.
-    Before ``ratio``/``ngram_similarity``/``prefix_similarity``/``subsequence_similarity``
+    ``total = 0.5 * ratio + 0.25 * ngram_similarity + 0.25 * subsequence_similarity
+    + correction_marker_bonus``, clipped to ``[0, 1]``. ``prefix_similarity`` is
+    still computed and reported on the returned ``SimilarityScore`` -- it is a
+    diagnostic value someone may want to inspect -- but it is NOT a summand of
+    ``total``. It was dropped from the formula, not overlooked: a real transcript
+    probe found it exactly 0.0 for every windowed pair checked (utterance starts
+    rarely realign after a repeat/self-correction), so it only ever discarded 20%
+    of the score budget. Before ``ratio``/``ngram_similarity``/``subsequence_similarity``
     are computed, a leading correction marker (e.g. "nein", "ich meine", "sorry") is
-    removed from ``second_text``, so the marker itself does not drag those four scores
+    removed from ``second_text``, so the marker itself does not drag those scores
     down for what is otherwise a near-identical repetition. The correction marker
     bonus is added exactly when such a marker was found. ``second_text`` itself is
     never mutated: the unstripped original is what is reported back to the caller via
@@ -204,7 +213,6 @@ def compute_similarity(
     raw_total = (
         _RATIO_WEIGHT * ratio
         + _NGRAM_WEIGHT * ngram_similarity
-        + _PREFIX_WEIGHT * prefix_similarity
         + _SUBSEQUENCE_WEIGHT * subsequence_similarity
         + bonus
     )
