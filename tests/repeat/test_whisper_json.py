@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from matrix_auto_cutter.repeat.errors import RawOutputEmptyError, RawOutputMissingError
-from matrix_auto_cutter.repeat.transcript import RepeatTranscriptDocument
+from matrix_auto_cutter.repeat.transcript import RepeatSegment, RepeatTranscriptDocument
 from matrix_auto_cutter.repeat.whisper_json import convert_whisper_output
 
 _FIXTURE_PATH = Path(__file__).parent / "fixtures" / "whisper_raw_sample.json"
@@ -188,3 +188,164 @@ def test_segment_boundaries_widen_to_contain_all_words() -> None:
     segment_out = document.segments[0]
     assert segment_out.start_ms == 0
     assert segment_out.end_ms == 300
+
+
+def test_segment_end_one_ms_past_source_duration_widens_duration_and_converts() -> None:
+    segment = {
+        "offsets": {"from": 0, "to": _DEFAULT_SOURCE_DURATION_MS + 1},
+        "tokens": [_token(" Hallo", 0, _DEFAULT_SOURCE_DURATION_MS + 1)],
+    }
+    document = _convert([segment])
+    assert document.source_duration_ms == _DEFAULT_SOURCE_DURATION_MS + 1
+    assert document.segments[0].end_ms == _DEFAULT_SOURCE_DURATION_MS + 1
+
+
+def test_segment_end_well_under_source_duration_leaves_duration_unchanged() -> None:
+    segment = {
+        "offsets": {"from": 0, "to": 500},
+        "tokens": [_token(" Hallo", 0, 500)],
+    }
+    document = _convert([segment])
+    assert document.source_duration_ms == _DEFAULT_SOURCE_DURATION_MS
+
+
+def test_duration_diff_note_appears_only_on_deviation(capsys: pytest.CaptureFixture[str]) -> None:
+    segment_within = {
+        "offsets": {"from": 0, "to": 500},
+        "tokens": [_token(" Hallo", 0, 500)],
+    }
+    _convert([segment_within])
+    assert capsys.readouterr().err == ""
+
+    segment_past = {
+        "offsets": {"from": 0, "to": _DEFAULT_SOURCE_DURATION_MS + 5},
+        "tokens": [_token(" Hallo", 0, _DEFAULT_SOURCE_DURATION_MS + 5)],
+    }
+    _convert([segment_past])
+    err = capsys.readouterr().err
+    assert "Quelldauer angepasst" in err
+    assert "Differenz=5ms" in err
+
+
+def test_no_word_is_lost_when_duration_is_reconciled() -> None:
+    segment = {
+        "offsets": {"from": 0, "to": _DEFAULT_SOURCE_DURATION_MS + 1},
+        "tokens": [
+            _token(" eins", 0, 300),
+            _token(" zwei", 300, 700),
+            _token(" drei", 700, _DEFAULT_SOURCE_DURATION_MS + 1),
+        ],
+    }
+    document = _convert([segment])
+    assert len(document.segments[0].words) == 3
+    assert [word.text for word in document.segments[0].words] == ["eins", "zwei", "drei"]
+
+
+def _assert_monotonic_and_non_overlapping(segments: tuple[RepeatSegment, ...]) -> None:
+    previous_end = None
+    for segment in segments:
+        assert segment.start_ms < segment.end_ms
+        if previous_end is not None:
+            assert segment.start_ms >= previous_end
+        for word in segment.words:
+            assert segment.start_ms <= word.start_ms
+            assert word.end_ms <= segment.end_ms
+        previous_end = segment.end_ms
+
+
+def test_word_clock_runs_across_overlapping_raw_segment_times() -> None:
+    segment1 = {
+        "offsets": {"from": 0, "to": 1000},
+        "tokens": [_token(" eins", 0, 1000)],
+    }
+    segment2 = {
+        "offsets": {"from": 900, "to": 1900},
+        "tokens": [_token(" zwei", 900, 1900)],
+    }
+    document = _convert([segment1, segment2])
+    assert len(document.segments) == 2
+    _assert_monotonic_and_non_overlapping(document.segments)
+    all_words = [word.text for segment in document.segments for word in segment.words]
+    assert all_words == ["eins", "zwei"]
+
+
+def test_word_clock_runs_across_raw_segment_times_that_go_backwards() -> None:
+    segment1 = {
+        "offsets": {"from": 5000, "to": 6000},
+        "tokens": [_token(" eins", 5000, 6000)],
+    }
+    segment2 = {
+        "offsets": {"from": 100, "to": 200},
+        "tokens": [_token(" zwei", 100, 200)],
+    }
+    document = _convert([segment1, segment2])
+    assert len(document.segments) == 2
+    _assert_monotonic_and_non_overlapping(document.segments)
+    all_words = [word.text for segment in document.segments for word in segment.words]
+    assert all_words == ["eins", "zwei"]
+
+
+def test_segment_extension_colliding_with_predecessor_end_wins() -> None:
+    segment1 = {
+        "offsets": {"from": 0, "to": 2000},
+        "tokens": [_token(" eins", 0, 500)],
+    }
+    segment2 = {
+        "offsets": {"from": 600, "to": 700},
+        "tokens": [_token(" zwei", 600, 700)],
+    }
+    document = _convert([segment1, segment2])
+    assert len(document.segments) == 2
+    first, second = document.segments
+    assert first.end_ms == 2000
+    assert second.start_ms == first.end_ms
+    _assert_monotonic_and_non_overlapping(document.segments)
+
+
+def test_bracketed_word_assembled_from_three_tokens_is_dropped() -> None:
+    segment = {
+        "offsets": {"from": 0, "to": 1200},
+        "tokens": [
+            _token(" [Mus", 0, 300),
+            _token("ik", 300, 600),
+            _token("]", 600, 900),
+            _token(" Hallo", 900, 1200),
+        ],
+    }
+    document = _convert([segment])
+    words = document.segments[0].words
+    assert [word.text for word in words] == ["Hallo"]
+
+
+def test_segment_consisting_only_of_bracketed_word_is_dropped_entirely() -> None:
+    segment1 = {
+        "offsets": {"from": 0, "to": 900},
+        "tokens": [
+            _token(" [Mus", 0, 300),
+            _token("ik", 300, 600),
+            _token("]", 600, 900),
+        ],
+    }
+    segment2 = {
+        "offsets": {"from": 1000, "to": 1500},
+        "tokens": [_token(" Hallo", 1000, 1500)],
+    }
+    document = _convert([segment1, segment2])
+    assert len(document.segments) == 1
+    assert [word.text for word in document.segments[0].words] == ["Hallo"]
+
+
+def test_word_count_unchanged_when_nothing_is_bracketed() -> None:
+    segment1 = {
+        "offsets": {"from": 0, "to": 1000},
+        "tokens": [_token(" eins", 0, 500), _token(" zwei", 500, 1000)],
+    }
+    segment2 = {
+        "offsets": {"from": 1000, "to": 1600},
+        "tokens": [_token(" drei", 1000, 1600)],
+    }
+    document = _convert([segment1, segment2])
+    total_words = sum(len(segment.words) for segment in document.segments)
+    assert total_words == 3
+    all_words = [word.text for segment in document.segments for word in segment.words]
+    assert all_words == ["eins", "zwei", "drei"]

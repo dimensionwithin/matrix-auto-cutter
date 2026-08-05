@@ -178,6 +178,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             else _transcribe_source(args)
         )
         if args.emit_transcript is not None:
+            # Written before diagnostics/boundary detection run: if a later step
+            # raises, the already-converted transcript stays on disk regardless.
             _emit_transcript(args.emit_transcript, transcript)
         boundary_params = (
             BoundaryDetectionParams(

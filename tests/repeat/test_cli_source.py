@@ -280,6 +280,49 @@ def test_ffprobe_failure_maps_to_documented_exit_code(tmp_path: Path, monkeypatc
     assert exit_code == 5
 
 
+def test_emit_transcript_persists_when_a_later_step_raises(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    source = tmp_path / "in.mp4"
+    source.write_bytes(b"x")
+    binary = tmp_path / "whisper-cli.exe"
+    binary.write_bytes(b"b")
+    model = tmp_path / "model.bin"
+    model.write_bytes(b"m")
+    out_path = tmp_path / "diagnostics.json"
+    emit_path = tmp_path / "transcript.json"
+    _patch_runner(monkeypatch, _FakeRunner(_RAW_WHISPER_JSON))
+
+    def _boom(*args: Any, **kwargs: Any) -> Any:
+        msg = "boom"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(cli_module, "build_diagnostics", _boom)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        main(
+            [
+                "--source",
+                str(source),
+                "--whisper-binary",
+                str(binary),
+                "--whisper-model",
+                str(model),
+                "--work-dir",
+                str(tmp_path / "work"),
+                "--emit-transcript",
+                str(emit_path),
+                "--out",
+                str(out_path),
+            ]
+        )
+
+    assert emit_path.exists()
+    emitted = json.loads(emit_path.read_text(encoding="utf-8"))
+    assert emitted["artifact_type"] == "matrix_auto_cutter_repeat_transcript"
+    assert not out_path.exists()
+
+
 def test_binary_not_found_maps_to_documented_exit_code(tmp_path: Path, monkeypatch: Any) -> None:
     source = tmp_path / "in.mp4"
     source.write_bytes(b"x")
