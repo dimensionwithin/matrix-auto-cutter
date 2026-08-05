@@ -2,6 +2,20 @@
 
 from __future__ import annotations
 
+from matrix_auto_cutter.repeat.asr import (
+    DEFAULT_THREADS,
+    WhisperRunResult,
+    build_whisper_argv,
+    default_timeout_ms,
+    run_whisper,
+    whisper_json_path,
+)
+from matrix_auto_cutter.repeat.audio import (
+    build_ffmpeg_argv,
+    build_ffprobe_argv,
+    extract_audio,
+    probe_duration_ms,
+)
 from matrix_auto_cutter.repeat.detect import (
     DetectionParams,
     DetectionResult,
@@ -15,7 +29,24 @@ from matrix_auto_cutter.repeat.diagnostics import (
     build_diagnostics,
     write_diagnostics,
 )
-from matrix_auto_cutter.repeat.errors import RepeatContractError
+from matrix_auto_cutter.repeat.errors import (
+    BinaryNotFoundError,
+    FfmpegError,
+    FfprobeError,
+    ModelNotFoundError,
+    ProcessTimeoutError,
+    RawOutputEmptyError,
+    RawOutputMissingError,
+    RepeatContractError,
+    SourceNotFoundError,
+    WhisperError,
+)
+from matrix_auto_cutter.repeat.process import (
+    NativeProcessRunner,
+    ProcessResult,
+    ProcessRunner,
+    run_process,
+)
 from matrix_auto_cutter.repeat.similarity import (
     SimilarityParams,
     SimilarityScore,
@@ -30,11 +61,23 @@ from matrix_auto_cutter.repeat.transcript import (
     load_transcript,
 )
 from matrix_auto_cutter.repeat.utterances import Utterance, UtteranceParams, build_utterances
+from matrix_auto_cutter.repeat.whisper_json import convert_whisper_output
 
 __all__ = [
+    "DEFAULT_THREADS",
+    "BinaryNotFoundError",
     "DetectionParams",
     "DetectionResult",
     "DiagnosticsWriteResult",
+    "FfmpegError",
+    "FfprobeError",
+    "ModelNotFoundError",
+    "NativeProcessRunner",
+    "ProcessResult",
+    "ProcessRunner",
+    "ProcessTimeoutError",
+    "RawOutputEmptyError",
+    "RawOutputMissingError",
     "RepeatCandidate",
     "RepeatContractError",
     "RepeatDiagnosticsDocument",
@@ -43,15 +86,28 @@ __all__ = [
     "RepeatWord",
     "SimilarityParams",
     "SimilarityScore",
+    "SourceNotFoundError",
     "Utterance",
     "UtteranceParams",
     "UtteranceSpan",
+    "WhisperError",
+    "WhisperRunResult",
     "WordDiffOp",
     "build_diagnostics",
+    "build_ffmpeg_argv",
+    "build_ffprobe_argv",
     "build_utterances",
+    "build_whisper_argv",
     "compute_similarity",
+    "convert_whisper_output",
+    "default_timeout_ms",
     "detect_repeats",
+    "extract_audio",
     "load_transcript",
     "normalize_text",
+    "probe_duration_ms",
+    "run_process",
+    "run_whisper",
+    "whisper_json_path",
     "write_diagnostics",
 ]
