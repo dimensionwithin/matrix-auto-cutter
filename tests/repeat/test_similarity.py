@@ -81,3 +81,57 @@ def test_custom_filler_and_correction_marker_lists_are_respected() -> None:
     assert normalized == "hello world"
     score = compute_similarity("Hello world", "actually wait hello world", params)
     assert score.correction_marker_bonus == params.correction_marker_bonus
+
+
+def test_leading_correction_marker_is_stripped_before_scoring() -> None:
+    # "nein," is not a filler word, so before the marker was stripped from the
+    # text going into ratio/ngram/prefix/subsequence it dragged all four scores
+    # down for what is otherwise a near-identical repetition. Stripping exactly
+    # one leading marker leaves a remainder identical to the marker-free text.
+    first = "Ich habe drei Aepfel gekauft"
+    second_with_marker = "Nein, ich habe vier Aepfel gekauft"
+    second_without_marker = "ich habe vier Aepfel gekauft"
+    with_marker = compute_similarity(first, second_with_marker)
+    without_marker_reference = compute_similarity(first, second_without_marker)
+    assert with_marker.ratio == without_marker_reference.ratio
+    assert with_marker.ngram_similarity == without_marker_reference.ngram_similarity
+    assert with_marker.prefix_similarity == without_marker_reference.prefix_similarity
+    assert with_marker.subsequence_similarity == without_marker_reference.subsequence_similarity
+    # The marker bonus is the only difference in the total: this pair is a
+    # verified self-correction (marker detected) getting a strictly higher
+    # score than an unmarked, otherwise-identical repetition would.
+    assert with_marker.total == without_marker_reference.total + with_marker.correction_marker_bonus
+    assert with_marker.correction_marker_bonus > 0
+    # Before this change, "Nein, " was left in the scored text and this exact
+    # pair scored total=0.637 (ratio dragged down to ~0.66 by the unstripped
+    # marker). Stripping the marker before scoring raises it to 0.775.
+    assert round(without_marker_reference.total, 3) == 0.725
+    assert round(with_marker.total, 3) == 0.775
+    assert with_marker.total > 0.637
+
+
+def test_leading_correction_marker_stripping_preserves_the_raw_word_diff() -> None:
+    score = compute_similarity(
+        "Ich habe die Zahlen fuer Q3 fertig",
+        "Nein, ich meine, ich habe die Zahlen fuer Q3 fertig",
+    )
+    all_second_tokens = [token for op in score.word_diff for token in op.second_tokens]
+    assert "Nein," in all_second_tokens
+    assert "meine," in all_second_tokens
+
+
+def test_correction_marker_boundary_requires_a_word_break() -> None:
+    # "nein" must not match inside a longer word like "neinerlei".
+    score = compute_similarity("Das ist gut", "neinerlei sache, das ist gut")
+    assert score.correction_marker_bonus == 0
+
+
+def test_also_leading_marker_is_stripped_exactly_once() -> None:
+    # "also" is both a filler word and a correction marker. Stripping the
+    # leading marker instance must not interact badly with filler removal of
+    # a later, unrelated "also" in the same text.
+    score = compute_similarity("wir sind dann fertig", "also, wir sind also dann fertig")
+    normalized = normalize_text("wir sind also dann fertig", SimilarityParams().filler_words)
+    assert normalized == "wir sind dann fertig"
+    assert score.correction_marker_bonus > 0
+    assert score.ratio == 1.0

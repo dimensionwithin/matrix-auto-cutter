@@ -1,8 +1,6 @@
-"""Detection of adjacent repeats and self-corrections. Diagnosis only, never a cut."""
+"""Detection of nearby repeats and self-corrections. Diagnosis only, never a cut."""
 
 from __future__ import annotations
-
-from itertools import pairwise
 
 from pydantic import Field
 
@@ -17,7 +15,7 @@ from matrix_auto_cutter.repeat.utterances import UtteranceParams, build_utteranc
 
 
 class DetectionParams(CanonicalModel):
-    """Configurable thresholds for adjacent-pair repeat detection."""
+    """Configurable thresholds for windowed repeat detection."""
 
     max_gap_ms: int = Field(default=2_000, ge=0)
     score_threshold: float = Field(default=0.55, ge=0.0, le=1.0)
@@ -34,7 +32,7 @@ class UtteranceSpan(CanonicalModel):
 
 
 class RepeatCandidate(CanonicalModel):
-    """One diagnosed adjacent repeat/self-correction pair."""
+    """One diagnosed nearby repeat/self-correction pair."""
 
     first: UtteranceSpan
     second: UtteranceSpan
@@ -44,7 +42,7 @@ class RepeatCandidate(CanonicalModel):
 
 
 class DetectionResult(CanonicalModel):
-    """Sorted candidates plus the total number of adjacent pairs actually compared."""
+    """Sorted candidates plus the total number of windowed pairs actually compared."""
 
     candidates: tuple[RepeatCandidate, ...]
     total_pairs_checked: int = Field(ge=0)
@@ -54,39 +52,46 @@ def detect_repeats(
     transcript: RepeatTranscriptDocument,
     params: DetectionParams | None = None,
 ) -> DetectionResult:
-    """Compare only time-adjacent utterance pairs; never a global or vector search.
+    """Compare only utterance pairs within a time window; never a global or vector search.
 
-    A pair is checked (counted toward ``total_pairs_checked``) only when the gap
-    between the end of the first utterance and the start of the second is at most
-    ``max_gap_ms``. Among checked pairs, a candidate is produced only when the
-    combined similarity score reaches ``score_threshold``.
+    For each utterance ``i``, every later utterance ``j`` is checked (counted toward
+    ``total_pairs_checked``) as long as the gap between the end of ``i`` and the
+    start of ``j`` is at most ``max_gap_ms``. Utterances are time-ordered, so once a
+    later utterance falls outside the window, all subsequent ones do too; the inner
+    scan stops there instead of comparing them. This also catches a repeat separated
+    from its restart by one short intervening fragment (a filler word, a breath),
+    not only immediate neighbors. Among checked pairs, a candidate is produced only
+    when the combined similarity score reaches ``score_threshold``.
     """
     active_params = params if params is not None else DetectionParams()
     utterances = build_utterances(transcript, active_params.utterance_params)
     candidates: list[RepeatCandidate] = []
     checked = 0
-    for first, second in pairwise(utterances):
-        gap_ms = second.start_ms - first.end_ms
-        if gap_ms > active_params.max_gap_ms:
-            continue
-        checked += 1
-        scores = compute_similarity(first.text, second.text, active_params.similarity_params)
-        if scores.total < active_params.score_threshold:
-            continue
-        reasons = ("score_above_threshold", *scores.triggered_reasons)
-        candidates.append(
-            RepeatCandidate(
-                first=UtteranceSpan(text=first.text, start_ms=first.start_ms, end_ms=first.end_ms),
-                second=UtteranceSpan(
-                    text=second.text,
-                    start_ms=second.start_ms,
-                    end_ms=second.end_ms,
-                ),
-                gap_ms=gap_ms,
-                scores=scores,
-                reasons=reasons,
+    for index, first in enumerate(utterances):
+        for second in utterances[index + 1 :]:
+            gap_ms = second.start_ms - first.end_ms
+            if gap_ms > active_params.max_gap_ms:
+                break
+            checked += 1
+            scores = compute_similarity(first.text, second.text, active_params.similarity_params)
+            if scores.total < active_params.score_threshold:
+                continue
+            reasons = ("score_above_threshold", *scores.triggered_reasons)
+            candidates.append(
+                RepeatCandidate(
+                    first=UtteranceSpan(
+                        text=first.text, start_ms=first.start_ms, end_ms=first.end_ms
+                    ),
+                    second=UtteranceSpan(
+                        text=second.text,
+                        start_ms=second.start_ms,
+                        end_ms=second.end_ms,
+                    ),
+                    gap_ms=gap_ms,
+                    scores=scores,
+                    reasons=reasons,
+                )
             )
-        )
     ordered = tuple(
         sorted(
             candidates, key=lambda candidate: (candidate.first.start_ms, candidate.second.start_ms)

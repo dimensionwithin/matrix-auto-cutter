@@ -134,12 +134,24 @@ def _subsequence_ratio(first: str, second: str) -> float:
     return _lcs_length(first, second) / max_len
 
 
-def _correction_bonus(second_text: str, markers: Sequence[str], bonus: float) -> float:
-    lowered = second_text.strip().lower()
+def _strip_leading_correction_marker(text: str, markers: Sequence[str]) -> tuple[str, bool]:
+    """Remove one leading correction marker (e.g. "nein,") and report whether it matched.
+
+    Matching is case-insensitive and requires a word boundary right after the marker,
+    so "nein" does not match inside "neinerlei". Only the first configured marker
+    that matches is removed; later occurrences of the same word are left untouched.
+    """
+    working = text.lstrip()
+    lowered = working.lower()
     for marker in markers:
-        if lowered.startswith(marker.lower()):
-            return bonus
-    return 0.0
+        marker_lower = marker.lower()
+        if not lowered.startswith(marker_lower):
+            continue
+        boundary = len(marker_lower)
+        if boundary < len(lowered) and lowered[boundary].isalnum():
+            continue
+        return working[boundary:].lstrip(" \t,.:;!?-"), True
+    return text, False
 
 
 def _word_diff(first_text: str, second_text: str) -> tuple[WordDiffOp, ...]:
@@ -167,12 +179,20 @@ def compute_similarity(
 
     ``total = 0.4 * ratio + 0.2 * ngram_similarity + 0.2 * prefix_similarity
     + 0.2 * subsequence_similarity + correction_marker_bonus``, clipped to ``[0, 1]``.
-    The correction marker bonus is added when ``second_text`` starts with a
-    configured correction marker (e.g. "nein", "ich meine", "sorry").
+    Before ``ratio``/``ngram_similarity``/``prefix_similarity``/``subsequence_similarity``
+    are computed, a leading correction marker (e.g. "nein", "ich meine", "sorry") is
+    removed from ``second_text``, so the marker itself does not drag those four scores
+    down for what is otherwise a near-identical repetition. The correction marker
+    bonus is added exactly when such a marker was found. ``second_text`` itself is
+    never mutated: the unstripped original is what is reported back to the caller via
+    the word diff, so the marker stays visible to a human reading the passage.
     """
     active_params = params if params is not None else SimilarityParams()
+    scoring_second_text, marker_matched = _strip_leading_correction_marker(
+        second_text, active_params.correction_markers
+    )
     normalized_first = normalize_text(first_text, active_params.filler_words)
-    normalized_second = normalize_text(second_text, active_params.filler_words)
+    normalized_second = normalize_text(scoring_second_text, active_params.filler_words)
     ratio = fuzz.ratio(normalized_first, normalized_second) / 100.0
     ngram_similarity = _jaccard(
         _char_ngrams(normalized_first, active_params.ngram_size),
@@ -180,11 +200,7 @@ def compute_similarity(
     )
     prefix_similarity = _common_prefix_ratio(normalized_first, normalized_second)
     subsequence_similarity = _subsequence_ratio(normalized_first, normalized_second)
-    bonus = _correction_bonus(
-        second_text,
-        active_params.correction_markers,
-        active_params.correction_marker_bonus,
-    )
+    bonus = active_params.correction_marker_bonus if marker_matched else 0.0
     raw_total = (
         _RATIO_WEIGHT * ratio
         + _NGRAM_WEIGHT * ngram_similarity

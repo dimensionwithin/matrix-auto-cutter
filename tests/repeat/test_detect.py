@@ -1,4 +1,4 @@
-"""Adjacent-only repeat/self-correction detection. Diagnosis only, never a cut."""
+"""Windowed repeat/self-correction detection. Diagnosis only, never a cut."""
 
 from __future__ import annotations
 
@@ -107,3 +107,60 @@ def test_default_params_are_used_when_none_given() -> None:
     ]
     document = _document(segments, 5_000)
     assert detect_repeats(document, None) == detect_repeats(document)
+
+
+def test_repetition_separated_by_one_short_fragment_is_found() -> None:
+    # first ends at 980; the "ähm" fragment (>700ms later) becomes its own
+    # utterance, so the repeat is not the fragment's immediate neighbor either
+    # way. Adjacent-only pairing (the old itertools.pairwise behavior) would
+    # only ever compare (first, fragment) and (fragment, third) and would
+    # never compare (first, third) directly.
+    segments = [
+        utterance_segment("ich gehe jetzt nach hause", 0),
+        utterance_segment("ähm", 1_700),
+        utterance_segment("ich gehe jetzt nach hause", 2_600),
+    ]
+    document = _document(segments, 5_000)
+    result = detect_repeats(document)
+    repeat_candidates = [
+        candidate
+        for candidate in result.candidates
+        if candidate.first.start_ms == 0 and candidate.second.start_ms == 2_600
+    ]
+    assert len(repeat_candidates) == 1
+    assert repeat_candidates[0].scores.total == 1.0
+
+
+def test_repetition_separated_by_a_fragment_beyond_max_gap_is_not_a_candidate() -> None:
+    # Same shape as above, but the window is tightened so the first-to-third
+    # gap (1_620ms) no longer fits; the fragment itself is too dissimilar to
+    # either passage to be a candidate on its own.
+    segments = [
+        utterance_segment("ich gehe jetzt nach hause", 0),
+        utterance_segment("ähm", 1_700),
+        utterance_segment("ich gehe jetzt nach hause", 2_600),
+    ]
+    document = _document(segments, 5_000)
+    result = detect_repeats(document, DetectionParams(max_gap_ms=1_500))
+    assert result.candidates == ()
+
+
+def test_pair_leaving_the_window_stops_the_inner_scan_and_is_not_counted() -> None:
+    # first (end=980) to fragment (start=1_700): gap 720ms, within the 1_500ms
+    # window -> checked. first to third (start=2_600): gap 1_620ms, exceeds the
+    # window -> the inner scan for `first` stops there and this pair is not
+    # counted. fragment to third: gap 900ms, within the window -> checked.
+    # Total: exactly 2 pairs checked, and the far (first, third) pair never
+    # appears as a candidate even though the two passages are identical.
+    segments = [
+        utterance_segment("ich gehe jetzt nach hause", 0),
+        utterance_segment("ähm", 1_700),
+        utterance_segment("ich gehe jetzt nach hause", 2_600),
+    ]
+    document = _document(segments, 5_000)
+    result = detect_repeats(document, DetectionParams(max_gap_ms=1_500))
+    assert result.total_pairs_checked == 2
+    assert not any(
+        candidate.first.start_ms == 0 and candidate.second.start_ms == 2_600
+        for candidate in result.candidates
+    )
