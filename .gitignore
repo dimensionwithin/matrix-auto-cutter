@@ -82,3 +82,8 @@ llvm/
 *.mkv
 *.wav
 *.mp3
+
+# repeat: grosse, nachbaubare Artefakte
+# docs/ und labels/ bleiben ausdruecklich versioniert
+/artefakte/
+*.m4a

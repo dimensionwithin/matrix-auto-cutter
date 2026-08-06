@@ -1,0 +1,530 @@
+[
+  {
+    "datei": "2026-02-19-20-00-22",
+    "eintragsnummer": 1,
+    "erste_passage": {
+      "start_ms": 476640,
+      "end_ms": 496450
+    },
+    "zweite_passage": {
+      "start_ms": 496450,
+      "end_ms": 503200
+    },
+    "scores": {
+      "utterance": null,
+      "boundary": 0.875
+    },
+    "detektoren": [
+      "boundary"
+    ],
+    "urteil": "versprecher",
+    "notiz": "Der Versprecher ist nur - ein schnelles Retracement haben bis 6.008 -"
+  },
+  {
+    "datei": "2026-02-19-20-00-22",
+    "eintragsnummer": 2,
+    "erste_passage": {
+      "start_ms": 2470120,
+      "end_ms": 2475120
+    },
+    "zweite_passage": {
+      "start_ms": 2477120,
+      "end_ms": 2479120
+    },
+    "scores": {
+      "utterance": null,
+      "boundary": 0.826086956521739
+    },
+    "detektoren": [
+      "boundary"
+    ],
+    "urteil": "unsinn",
+    "notiz": "Ich hatte verschiedene Charts durchgeguckt und nach einem gesucht welches genug daten hatee, deswegen das nicht vollstaendig gerede."
+  },
+  {
+    "datei": "2026-02-19-20-00-22",
+    "eintragsnummer": 3,
+    "erste_passage": {
+      "start_ms": 3122120,
+      "end_ms": 3125120
+    },
+    "zweite_passage": {
+      "start_ms": 3125120,
+      "end_ms": 3128120
+    },
+    "scores": {
+      "utterance": 0.5996784373503994,
+      "boundary": null
+    },
+    "detektoren": [
+      "utterance"
+    ],
+    "urteil": "versprecher",
+    "notiz": ""
+  },
+  {
+    "datei": "2026-02-19-20-00-22",
+    "eintragsnummer": 4,
+    "erste_passage": {
+      "start_ms": 3303120,
+      "end_ms": 3305120
+    },
+    "zweite_passage": {
+      "start_ms": 3305120,
+      "end_ms": 3311950
+    },
+    "scores": {
+      "utterance": null,
+      "boundary": 0.8387096774193549
+    },
+    "detektoren": [
+      "boundary"
+    ],
+    "urteil": "bewusst",
+    "notiz": ""
+  },
+  {
+    "datei": "2026-02-19-20-00-22",
+    "eintragsnummer": 5,
+    "erste_passage": {
+      "start_ms": 4069690,
+      "end_ms": 4079121
+    },
+    "zweite_passage": {
+      "start_ms": 4080120,
+      "end_ms": 4092020
+    },
+    "scores": {
+      "utterance": null,
+      "boundary": 0.7428571428571429
+    },
+    "detektoren": [
+      "boundary"
+    ],
+    "urteil": "bewusst",
+    "notiz": ""
+  },
+  {
+    "datei": "2026-02-26-20-06-43",
+    "eintragsnummer": 1,
+    "erste_passage": {
+      "start_ms": 1120960,
+      "end_ms": 1128870
+    },
+    "zweite_passage": {
+      "start_ms": 1129710,
+      "end_ms": 1149210
+    },
+    "scores": {
+      "utterance": null,
+      "boundary": 0.8737864077669903
+    },
+    "detektoren": [
+      "boundary"
+    ],
+    "urteil": "bewusst",
+    "notiz": ""
+  },
+  {
+    "datei": "2026-02-26-20-06-43",
+    "eintragsnummer": 2,
+    "erste_passage": {
+      "start_ms": 1561140,
+      "end_ms": 1571040
+    },
+    "zweite_passage": {
+      "start_ms": 1571040,
+      "end_ms": 1589720
+    },
+    "scores": {
+      "utterance": null,
+      "boundary": 0.875
+    },
+    "detektoren": [
+      "boundary"
+    ],
+    "urteil": "bewusst",
+    "notiz": ""
+  },
+  {
+    "datei": "2026-02-26-20-06-43",
+    "eintragsnummer": 3,
+    "erste_passage": {
+      "start_ms": 1688520,
+      "end_ms": 1708010
+    },
+    "zweite_passage": {
+      "start_ms": 1708010,
+      "end_ms": 1718360
+    },
+    "scores": {
+      "utterance": null,
+      "boundary": 1
+    },
+    "detektoren": [
+      "boundary"
+    ],
+    "urteil": "bewusst",
+    "notiz": ""
+  },
+  {
+    "datei": "2026-02-26-20-06-43",
+    "eintragsnummer": 4,
+    "erste_passage": {
+      "start_ms": 1966660,
+      "end_ms": 1968600
+    },
+    "zweite_passage": {
+      "start_ms": 1968600,
+      "end_ms": 1971400
+    },
+    "scores": {
+      "utterance": null,
+      "boundary": 0.8214285714285714
+    },
+    "detektoren": [
+      "boundary"
+    ],
+    "urteil": "bewusst",
+    "notiz": ""
+  },
+  {
+    "datei": "2026-02-26-20-06-43",
+    "eintragsnummer": 5,
+    "erste_passage": {
+      "start_ms": 1978940,
+      "end_ms": 1982080
+    },
+    "zweite_passage": {
+      "start_ms": 1983670,
+      "end_ms": 1985140
+    },
+    "scores": {
+      "utterance": 0.5815656565656566,
+      "boundary": null
+    },
+    "detektoren": [
+      "utterance"
+    ],
+    "urteil": "bewusst",
+    "notiz": ""
+  },
+  {
+    "datei": "2026-02-26-20-06-43",
+    "eintragsnummer": 6,
+    "erste_passage": {
+      "start_ms": 2342520,
+      "end_ms": 2362430
+    },
+    "zweite_passage": {
+      "start_ms": 2362430,
+      "end_ms": 2368020
+    },
+    "scores": {
+      "utterance": null,
+      "boundary": 0.8205128205128205
+    },
+    "detektoren": [
+      "boundary"
+    ],
+    "urteil": "bewusst",
+    "notiz": ""
+  },
+  {
+    "datei": "2026-02-26-20-06-43",
+    "eintragsnummer": 7,
+    "erste_passage": {
+      "start_ms": 2641880,
+      "end_ms": 2661860
+    },
+    "zweite_passage": {
+      "start_ms": 2661860,
+      "end_ms": 2681750
+    },
+    "scores": {
+      "utterance": null,
+      "boundary": 0.782608695652174
+    },
+    "detektoren": [
+      "boundary"
+    ],
+    "urteil": "versprecher",
+    "notiz": ""
+  },
+  {
+    "datei": "2026-02-26-20-06-43",
+    "eintragsnummer": 8,
+    "erste_passage": {
+      "start_ms": 2780800,
+      "end_ms": 2799300
+    },
+    "zweite_passage": {
+      "start_ms": 2799300,
+      "end_ms": 2805480
+    },
+    "scores": {
+      "utterance": null,
+      "boundary": 0.8235294117647058
+    },
+    "detektoren": [
+      "boundary"
+    ],
+    "urteil": "bewusst",
+    "notiz": ""
+  },
+  {
+    "datei": "2026-02-26-20-06-43",
+    "eintragsnummer": 9,
+    "erste_passage": {
+      "start_ms": 2865320,
+      "end_ms": 2875480
+    },
+    "zweite_passage": {
+      "start_ms": 2875480,
+      "end_ms": 2881700
+    },
+    "scores": {
+      "utterance": 0.972014717126449,
+      "boundary": null
+    },
+    "detektoren": [
+      "utterance"
+    ],
+    "urteil": "versprecher",
+    "notiz": ""
+  },
+  {
+    "datei": "2026-02-26-20-06-43",
+    "eintragsnummer": 10,
+    "erste_passage": {
+      "start_ms": 3040240,
+      "end_ms": 3042820
+    },
+    "zweite_passage": {
+      "start_ms": 3044680,
+      "end_ms": 3047650
+    },
+    "scores": {
+      "utterance": 0.5936681571382946,
+      "boundary": null
+    },
+    "detektoren": [
+      "utterance"
+    ],
+    "urteil": "bewusst",
+    "notiz": ""
+  },
+  {
+    "datei": "2026-02-26-20-06-43",
+    "eintragsnummer": 11,
+    "erste_passage": {
+      "start_ms": 3186680,
+      "end_ms": 3194120
+    },
+    "zweite_passage": {
+      "start_ms": 3194310,
+      "end_ms": 3199730
+    },
+    "scores": {
+      "utterance": null,
+      "boundary": 0.7142857142857143
+    },
+    "detektoren": [
+      "boundary"
+    ],
+    "urteil": "bewusst",
+    "notiz": ""
+  },
+  {
+    "datei": "2026-02-26-20-06-43",
+    "eintragsnummer": 12,
+    "erste_passage": {
+      "start_ms": 3194310,
+      "end_ms": 3199730
+    },
+    "zweite_passage": {
+      "start_ms": 3199730,
+      "end_ms": 3202670
+    },
+    "scores": {
+      "utterance": 0.5597772488609003,
+      "boundary": null
+    },
+    "detektoren": [
+      "utterance"
+    ],
+    "urteil": "bewusst",
+    "notiz": ""
+  },
+  {
+    "datei": "2025-11-24-20-33-44",
+    "eintragsnummer": 1,
+    "erste_passage": {
+      "start_ms": 13670,
+      "end_ms": 16780
+    },
+    "zweite_passage": {
+      "start_ms": 16780,
+      "end_ms": 16860
+    },
+    "scores": {
+      "utterance": 1,
+      "boundary": 1
+    },
+    "detektoren": [
+      "utterance",
+      "boundary"
+    ],
+    "urteil": "bewusst",
+    "notiz": ""
+  },
+  {
+    "datei": "2025-11-24-20-33-44",
+    "eintragsnummer": 2,
+    "erste_passage": {
+      "start_ms": 736900,
+      "end_ms": 743790
+    },
+    "zweite_passage": {
+      "start_ms": 743910,
+      "end_ms": 746900
+    },
+    "scores": {
+      "utterance": 0.7051314459049545,
+      "boundary": 0.8717948717948718
+    },
+    "detektoren": [
+      "utterance",
+      "boundary"
+    ],
+    "urteil": "bewusst",
+    "notiz": ""
+  },
+  {
+    "datei": "2025-11-24-20-33-44",
+    "eintragsnummer": 3,
+    "erste_passage": {
+      "start_ms": 762910,
+      "end_ms": 766900
+    },
+    "zweite_passage": {
+      "start_ms": 766910,
+      "end_ms": 767900
+    },
+    "scores": {
+      "utterance": 0.7978896103896105,
+      "boundary": 0.8
+    },
+    "detektoren": [
+      "utterance",
+      "boundary"
+    ],
+    "urteil": "bewusst",
+    "notiz": ""
+  },
+  {
+    "datei": "2025-11-24-20-33-44",
+    "eintragsnummer": 4,
+    "erste_passage": {
+      "start_ms": 1711370,
+      "end_ms": 1712760
+    },
+    "zweite_passage": {
+      "start_ms": 1712840,
+      "end_ms": 1717900
+    },
+    "scores": {
+      "utterance": null,
+      "boundary": 0.7741935483870968
+    },
+    "detektoren": [
+      "boundary"
+    ],
+    "urteil": "bewusst",
+    "notiz": ""
+  },
+  {
+    "datei": "2025-11-24-20-33-44",
+    "eintragsnummer": 5,
+    "erste_passage": {
+      "start_ms": 1780910,
+      "end_ms": 1785440
+    },
+    "zweite_passage": {
+      "start_ms": 1785540,
+      "end_ms": 1790200
+    },
+    "scores": {
+      "utterance": 0.6198879551820728,
+      "boundary": null
+    },
+    "detektoren": [
+      "utterance"
+    ],
+    "urteil": "bewusst",
+    "notiz": ""
+  },
+  {
+    "datei": "2025-11-24-20-33-44",
+    "eintragsnummer": 6,
+    "erste_passage": {
+      "start_ms": 1861910,
+      "end_ms": 1879900
+    },
+    "zweite_passage": {
+      "start_ms": 1879900,
+      "end_ms": 1887900
+    },
+    "scores": {
+      "utterance": null,
+      "boundary": 0.7142857142857143
+    },
+    "detektoren": [
+      "boundary"
+    ],
+    "urteil": "bewusst",
+    "notiz": ""
+  },
+  {
+    "datei": "2026-01-08-20-39-41",
+    "eintragsnummer": 1,
+    "erste_passage": {
+      "start_ms": 860860,
+      "end_ms": 864980
+    },
+    "zweite_passage": {
+      "start_ms": 864980,
+      "end_ms": 878170
+    },
+    "scores": {
+      "utterance": null,
+      "boundary": 0.7868852459016393
+    },
+    "detektoren": [
+      "boundary"
+    ],
+    "urteil": "bewusst",
+    "notiz": ""
+  },
+  {
+    "datei": "2026-01-08-20-39-41",
+    "eintragsnummer": 2,
+    "erste_passage": {
+      "start_ms": 878170,
+      "end_ms": 880860
+    },
+    "zweite_passage": {
+      "start_ms": 880860,
+      "end_ms": 883310
+    },
+    "scores": {
+      "utterance": 0.6076013513513513,
+      "boundary": null
+    },
+    "detektoren": [
+      "utterance"
+    ],
+    "urteil": "versprecher",
+    "notiz": ""
+  }
+]
