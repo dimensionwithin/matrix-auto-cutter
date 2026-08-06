@@ -65,9 +65,15 @@ def _parser() -> argparse.ArgumentParser:
             "Erkenne benachbarte Wiederholungen und Selbstkorrekturen in einem Transkript."
         ),
     )
-    source_group = parser.add_mutually_exclusive_group(required=True)
-    source_group.add_argument("--transcript", help="Pfad zur repeat_transcript/1.0-Datei")
-    source_group.add_argument("--source", help="Pfad zur Audio-/Videoquelle für die Transkription")
+    parser.add_argument("--transcript", help="Pfad zur repeat_transcript/1.0-Datei")
+    parser.add_argument(
+        "--source",
+        help=(
+            "Pfad zur Audio-/Videoquelle. Ohne --transcript: wird transkribiert "
+            "(whisper läuft). Zusammen mit --transcript: dient ausschließlich als "
+            "Audioquelle für --snippet-dir/--emit-review, whisper läuft NICHT."
+        ),
+    )
     parser.add_argument("--out", required=True, help="Zielpfad der repeat_diagnostics/1.0-Datei")
     parser.add_argument(
         "--emit-transcript", help="Schreibt das konvertierte Transkript zusätzlich an diesen Pfad"
@@ -158,6 +164,33 @@ def _require_source_args(parser: argparse.ArgumentParser, args: argparse.Namespa
         parser.error(f"--source erfordert: {', '.join(missing)}")
 
 
+def _validate_transcript_source(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    """Route transcript vs. source: whisper only runs when there is no transcript to reuse.
+
+    whisper-cli is the expensive step (minutes per recording); reusing an
+    already-transcribed ``repeat_transcript/1.0`` file is the normal case,
+    not the exception. When ``--transcript`` is given, it always supplies the
+    transcript and whisper is never invoked -- ``--source``, if also given,
+    then serves only as the audio source for ``--snippet-dir``/``--emit-review``
+    (ffmpeg slicing), not for transcription. ``--whisper-binary``/``--whisper-model``
+    are meaningless in that combination and are ignored with a stderr warning
+    rather than rejected, so an operator's leftover flags from a source-only
+    invocation don't turn into a hard error.
+    """
+    if args.transcript is None and args.source is None:
+        parser.error("einer von --transcript oder --source ist erforderlich")
+    if args.transcript is None:
+        _require_source_args(parser, args)
+    elif args.source is not None and (
+        args.whisper_binary is not None or args.whisper_model is not None
+    ):
+        print(
+            "Warnung: --whisper-binary/--whisper-model werden ignoriert, "
+            "da --transcript angegeben ist (kein whisper-Lauf).",
+            file=sys.stderr,
+        )
+
+
 def _require_snippet_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     if args.emit_review is not None and args.snippet_dir is None:
         parser.error("--emit-review erfordert --snippet-dir")
@@ -231,9 +264,7 @@ def _emit_snippets_and_review(args: argparse.Namespace, document: object) -> Non
     manifest_entries: list = []
     if args.snippet_dir is not None:
         runner = NativeProcessRunner()
-        source_duration_ms = probe_duration_ms(
-            args.source, args.ffprobe, runner, _PROBE_TIMEOUT_MS
-        )
+        source_duration_ms = probe_duration_ms(args.source, args.ffprobe, runner, _PROBE_TIMEOUT_MS)
         manifest_entries = build_snippets(
             candidates=list(document.candidates),
             stem=stem,
@@ -296,8 +327,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Validate/transcribe a source, detect adjacent repeats, and write diagnostics atomically."""
     parser = _parser()
     args = parser.parse_args(argv)
-    if args.source is not None:
-        _require_source_args(parser, args)
+    _validate_transcript_source(args, parser)
     _require_snippet_args(parser, args)
     try:
         transcript = (

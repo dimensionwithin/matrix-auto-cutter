@@ -151,19 +151,28 @@ def test_source_custom_max_segment_len_is_passed_to_whisper(
     assert "-ml" not in whisper_argv
 
 
-def test_source_and_transcript_are_mutually_exclusive(tmp_path: Path) -> None:
-    with pytest.raises(SystemExit) as excinfo:
-        main(
-            [
-                "--source",
-                "in.mp4",
-                "--transcript",
-                "t.json",
-                "--out",
-                str(tmp_path / "out.json"),
-            ]
-        )
-    assert excinfo.value.code == 2
+def test_source_and_transcript_together_no_longer_raise_a_parser_error(
+    tmp_path: Path,
+) -> None:
+    """REPEAT-2B: --transcript + --source is now a supported combination.
+
+    See tests/repeat/test_cli_transcript_source.py for the full behavior
+    (whisper skipped, --source used only for snippet audio). This test only
+    guards that argparse itself no longer rejects the combination -- the
+    missing transcript file here fails later, inside main()'s own
+    RepeatContractError handling, not via SystemExit.
+    """
+    exit_code = main(
+        [
+            "--source",
+            "in.mp4",
+            "--transcript",
+            str(tmp_path / "missing-transcript.json"),
+            "--out",
+            str(tmp_path / "out.json"),
+        ]
+    )
+    assert exit_code == 1
 
 
 def test_missing_transcript_and_source_is_an_error(tmp_path: Path) -> None:
