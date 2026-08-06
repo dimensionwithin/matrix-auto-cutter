@@ -121,6 +121,12 @@ _TEMPLATE = """<!doctype html>
     gap: 0.5rem;
   }
   #progress { font-weight: 600; }
+  .schnitt-row { display: none; margin-top: 0.4rem; }
+  .schnitt-row button.active {
+    background: var(--accent);
+    color: white;
+    border-color: var(--accent);
+  }
   #size-warning {
     font-size: 0.85rem;
     color: #b5541a;
@@ -208,6 +214,7 @@ _TEMPLATE = """<!doctype html>
 <header>
   <div id="progress">0 von 0 beurteilt</div>
   <div class="hint">Tasten: 1 Versprecher &middot; 2 Bewusst &middot; 3 Unsinn &middot;
+  4 Erste raus &middot; 5 Zweite raus &middot; 6 Beide raus &middot;
   Leertaste Wiedergabe</div>
 </header>
 <div id="size-warning"></div>
@@ -220,7 +227,7 @@ _TEMPLATE = """<!doctype html>
 const ENTRIES = __ENTRIES_JSON__;
 const SIZE_WARNING_BYTES = __SIZE_WARNING_BYTES__;
 
-const state = ENTRIES.map(() => ({ urteil: null, notiz: "" }));
+const state = ENTRIES.map(() => ({ urteil: null, notiz: "", schnitt: null }));
 
 function fmtHms(ms) {
   const totalSeconds = Math.floor(ms / 1000);
@@ -249,8 +256,22 @@ function updateProgress() {
 
 function setUrteil(index, urteil) {
   state[index].urteil = state[index].urteil === urteil ? null : urteil;
+  if (state[index].urteil === "versprecher") {
+    // Vorbelegung "erste": bei einer echten Wiederholung bricht die erste
+    // Passage ab, die zweite traegt den Gedanken weiter -- die erste ist
+    // damit im Regelfall die richtige zum Herausschneiden.
+    if (state[index].schnitt === null) state[index].schnitt = "erste";
+  } else {
+    state[index].schnitt = null;
+  }
   renderCardButtons(index);
   updateProgress();
+}
+
+function setSchnitt(index, schnitt) {
+  if (state[index].urteil !== "versprecher") return;
+  state[index].schnitt = schnitt;
+  renderCardButtons(index);
 }
 
 function renderCardButtons(index) {
@@ -261,6 +282,15 @@ function renderCardButtons(index) {
     const btn = card.querySelector('button[data-urteil="' + key + '"]');
     if (btn) btn.classList.toggle("active", state[index].urteil === key);
   });
+  const schnittRow = card.querySelector(".schnitt-row");
+  if (schnittRow) {
+    const show = state[index].urteil === "versprecher";
+    schnittRow.style.display = show ? "flex" : "none";
+    ["erste", "zweite", "beide"].forEach((key) => {
+      const btn = schnittRow.querySelector('button[data-schnitt="' + key + '"]');
+      if (btn) btn.classList.toggle("active", state[index].schnitt === key);
+    });
+  }
 }
 
 function buildCard(entry, index) {
@@ -370,6 +400,22 @@ function buildCard(entry, index) {
   });
   card.appendChild(buttons);
 
+  const schnittRow = document.createElement("div");
+  schnittRow.className = "schnitt-row buttons";
+  const schnittDefs = [
+    ["erste", "Erste raus"],
+    ["zweite", "Zweite raus"],
+    ["beide", "Beide raus"],
+  ];
+  schnittDefs.forEach(([key, label]) => {
+    const btn = document.createElement("button");
+    btn.textContent = label;
+    btn.dataset.schnitt = key;
+    btn.addEventListener("click", () => setSchnitt(index, key));
+    schnittRow.appendChild(btn);
+  });
+  card.appendChild(schnittRow);
+
   const note = document.createElement("input");
   note.type = "text";
   note.placeholder = "Notiz (optional)";
@@ -424,6 +470,9 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "1") { setUrteil(index, "versprecher"); e.preventDefault(); }
   else if (e.key === "2") { setUrteil(index, "bewusst"); e.preventDefault(); }
   else if (e.key === "3") { setUrteil(index, "unsinn"); e.preventDefault(); }
+  else if (e.key === "4") { setSchnitt(index, "erste"); e.preventDefault(); }
+  else if (e.key === "5") { setSchnitt(index, "zweite"); e.preventDefault(); }
+  else if (e.key === "6") { setSchnitt(index, "beide"); e.preventDefault(); }
   else if (e.code === "Space") {
     const audio = document.getElementById("audio-" + index);
     if (audio) {
@@ -442,6 +491,7 @@ document.getElementById("download-btn").addEventListener("click", () => {
     scores: { utterance: entry.utterance_score, boundary: entry.boundary_score },
     detektoren: entry.detectors,
     urteil: state[index].urteil,
+    schnitt: state[index].schnitt,
     notiz: state[index].notiz,
   }));
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });

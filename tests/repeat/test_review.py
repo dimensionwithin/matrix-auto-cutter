@@ -91,3 +91,25 @@ def test_build_review_html_nothing_preselected_no_sort_hint() -> None:
     assert "recommended" not in html_text.lower()
     entries = _extract_entries_json(html_text)
     assert "urteil" not in entries[0]
+
+
+def test_build_review_html_has_schnitt_row_defaulting_to_erste() -> None:
+    html_text = build_review_html([_entry()])
+    assert "schnitt-row" in html_text
+    assert 'dataset.schnitt = key' in html_text
+    assert '["erste", "Erste raus"]' in html_text
+    assert '["zweite", "Zweite raus"]' in html_text
+    assert '["beide", "Beide raus"]' in html_text
+    assert 'state[index].schnitt = "erste"' in html_text
+
+
+def test_build_review_html_schnitt_keys_are_wired() -> None:
+    html_text = build_review_html([_entry()])
+    assert 'setSchnitt(index, "erste")' in html_text
+    assert 'setSchnitt(index, "zweite")' in html_text
+    assert 'setSchnitt(index, "beide")' in html_text
+
+
+def test_build_review_html_download_payload_includes_schnitt() -> None:
+    html_text = build_review_html([_entry()])
+    assert "schnitt: state[index].schnitt" in html_text
