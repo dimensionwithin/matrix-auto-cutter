@@ -30,6 +30,8 @@ from matrix_auto_cutter.repeat.errors import (
     WhisperError,
 )
 from matrix_auto_cutter.repeat.process import NativeProcessRunner
+from matrix_auto_cutter.repeat.review import ReviewEntry, build_review_html
+from matrix_auto_cutter.repeat.snippets import build_snippets, write_snippet_manifest
 from matrix_auto_cutter.repeat.transcript import RepeatTranscriptDocument, load_transcript
 from matrix_auto_cutter.repeat.whisper_json import convert_whisper_output
 
@@ -116,6 +118,20 @@ def _parser() -> argparse.ArgumentParser:
     prompt_group.add_argument(
         "--initial-prompt-file", help="Datei (UTF-8) mit dem Vokabular-Hinweis"
     )
+    parser.add_argument(
+        "--snippet-dir",
+        help=(
+            "Verzeichnis für Audio-Schnipsel (m4a) je Kandidat plus "
+            "snippets.json (erfordert --source)"
+        ),
+    )
+    parser.add_argument(
+        "--emit-review",
+        help=(
+            "Schreibt eine eigenständige review.html mit eingebettetem "
+            "Audio (erfordert --snippet-dir)"
+        ),
+    )
     return parser
 
 
@@ -140,6 +156,100 @@ def _require_source_args(parser: argparse.ArgumentParser, args: argparse.Namespa
     ]
     if missing:
         parser.error(f"--source erfordert: {', '.join(missing)}")
+
+
+def _require_snippet_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.emit_review is not None and args.snippet_dir is None:
+        parser.error("--emit-review erfordert --snippet-dir")
+    if (args.snippet_dir is not None or args.emit_review is not None) and args.source is None:
+        parser.error("--snippet-dir/--emit-review erfordern --source")
+
+
+def _candidate_detectors(candidate: object) -> tuple[str, ...]:
+    detector = getattr(candidate, "detector", None)
+    if detector is None:
+        return ("utterance",)
+    if isinstance(detector, str):
+        return (detector,)
+    return tuple(detector)
+
+
+def _candidate_scores(candidate: object) -> tuple[float | None, float | None]:
+    utterance_score_obj = getattr(candidate, "utterance_score", None) or getattr(
+        candidate, "scores", None
+    )
+    utterance_score = utterance_score_obj.total if utterance_score_obj is not None else None
+    boundary_score = getattr(candidate, "boundary_score", None)
+    return utterance_score, boundary_score
+
+
+def _build_review_entries(
+    candidates: tuple[object, ...],
+    stem: str,
+    source: str,
+    manifest_entries: list,
+) -> list[ReviewEntry]:
+    manifest_by_nr = {entry.nr: entry for entry in manifest_entries}
+    entries: list[ReviewEntry] = []
+    for nr, candidate in enumerate(candidates, start=1):
+        manifest_entry = manifest_by_nr.get(nr)
+        audio_bytes: bytes | None = None
+        audio_error: str | None = None
+        if manifest_entry is not None and manifest_entry.path is not None:
+            audio_bytes = Path(manifest_entry.path).read_bytes()
+        elif manifest_entry is not None:
+            audio_error = manifest_entry.error
+        else:
+            audio_error = "kein Schnipsel erzeugt"
+        utterance_score, boundary_score = _candidate_scores(candidate)
+        entries.append(
+            ReviewEntry(
+                stem=stem,
+                nr=nr,
+                source=source,
+                first_text=candidate.first.text,
+                first_start_ms=candidate.first.start_ms,
+                first_end_ms=candidate.first.end_ms,
+                second_text=candidate.second.text,
+                second_start_ms=candidate.second.start_ms,
+                second_end_ms=candidate.second.end_ms,
+                detectors=_candidate_detectors(candidate),
+                utterance_score=utterance_score,
+                boundary_score=boundary_score,
+                window_words=getattr(candidate, "window_words", None),
+                first_window_text=getattr(candidate, "first_window_text", None),
+                second_window_text=getattr(candidate, "second_window_text", None),
+                audio_bytes=audio_bytes,
+                audio_error=audio_error,
+            )
+        )
+    return entries
+
+
+def _emit_snippets_and_review(args: argparse.Namespace, document: object) -> None:
+    stem = Path(args.source).stem
+    manifest_entries: list = []
+    if args.snippet_dir is not None:
+        runner = NativeProcessRunner()
+        source_duration_ms = probe_duration_ms(
+            args.source, args.ffprobe, runner, _PROBE_TIMEOUT_MS
+        )
+        manifest_entries = build_snippets(
+            candidates=list(document.candidates),
+            stem=stem,
+            source_path=args.source,
+            source_duration_ms=source_duration_ms,
+            ffmpeg_path=args.ffmpeg,
+            snippet_dir=args.snippet_dir,
+            runner=runner,
+        )
+        write_snippet_manifest(args.snippet_dir, manifest_entries)
+    if args.emit_review is not None:
+        entries = _build_review_entries(
+            tuple(document.candidates), stem, str(args.source), manifest_entries
+        )
+        html_text = build_review_html(entries)
+        Path(args.emit_review).write_text(html_text, encoding="utf-8")
 
 
 def _transcribe_source(args: argparse.Namespace) -> RepeatTranscriptDocument:
@@ -188,6 +298,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.source is not None:
         _require_source_args(parser, args)
+    _require_snippet_args(parser, args)
     try:
         transcript = (
             load_transcript(args.transcript)
@@ -209,6 +320,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         document = build_diagnostics(transcript, DetectionParams(), boundary_params)
         result = write_diagnostics(args.out, document)
+        if args.snippet_dir is not None or args.emit_review is not None:
+            _emit_snippets_and_review(args, document)
     except RepeatContractError as exc:
         print(f"Vertragsfehler: {exc}", file=sys.stderr)
         return _exit_code_for(exc)
