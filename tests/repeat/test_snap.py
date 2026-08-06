@@ -109,10 +109,12 @@ def test_detect_silence_timeout_raises(tmp_path: Path) -> None:
 
 # --- snap_point ------------------------------------------------------------------
 
+_AMPLE_DURATION_MS = 100_000
+
 
 def test_snap_point_silence_exactly_at_target_gives_minimal_shift() -> None:
     periods = [SilencePeriod(1_960, 2_040)]
-    result = snap_point(2_000, periods, window_ms=750)
+    result = snap_point(2_000, periods, _AMPLE_DURATION_MS, window_ms=750)
     assert result.snapped is True
     assert result.new_ms == 2_000
     assert result.shift_ms == 0
@@ -120,14 +122,14 @@ def test_snap_point_silence_exactly_at_target_gives_minimal_shift() -> None:
 
 def test_snap_point_silence_at_window_edge_is_snapped() -> None:
     periods = [SilencePeriod(2_700, 2_760)]
-    result = snap_point(2_000, periods, window_ms=750)
+    result = snap_point(2_000, periods, _AMPLE_DURATION_MS, window_ms=750)
     assert result.snapped is True
     assert result.new_ms == 2_725
 
 
 def test_snap_point_silence_just_outside_window_is_not_snapped() -> None:
     periods = [SilencePeriod(2_760, 2_800)]
-    result = snap_point(2_000, periods, window_ms=750)
+    result = snap_point(2_000, periods, _AMPLE_DURATION_MS, window_ms=750)
     assert result.snapped is False
     assert result.new_ms == 2_000
     assert result.shift_ms == 0
@@ -135,20 +137,20 @@ def test_snap_point_silence_just_outside_window_is_not_snapped() -> None:
 
 def test_snap_point_multiple_silences_nearest_wins() -> None:
     periods = [SilencePeriod(1_100, 1_150), SilencePeriod(1_980, 2_010)]
-    result = snap_point(2_000, periods, window_ms=750)
+    result = snap_point(2_000, periods, _AMPLE_DURATION_MS, window_ms=750)
     assert result.snapped is True
     assert result.new_ms == 1_995
 
 
 def test_snap_point_silence_extends_past_window_is_clipped() -> None:
     periods = [SilencePeriod(1_000, 3_000)]
-    result = snap_point(2_000, periods, window_ms=750)
+    result = snap_point(2_000, periods, _AMPLE_DURATION_MS, window_ms=750)
     assert result.snapped is True
     assert result.new_ms == 2_000
 
 
 def test_snap_point_no_silence_leaves_point_unchanged_and_unsnapped() -> None:
-    result = snap_point(2_000, [], window_ms=750)
+    result = snap_point(2_000, [], _AMPLE_DURATION_MS, window_ms=750)
     assert result.snapped is False
     assert result.original_ms == 2_000
     assert result.new_ms == 2_000
@@ -156,5 +158,39 @@ def test_snap_point_no_silence_leaves_point_unchanged_and_unsnapped() -> None:
 
 
 def test_snap_point_reports_original_value() -> None:
-    result = snap_point(2_000, [SilencePeriod(2_700, 2_760)], window_ms=750)
+    result = snap_point(2_000, [SilencePeriod(2_700, 2_760)], _AMPLE_DURATION_MS, window_ms=750)
     assert result.original_ms == 2_000
+
+
+# --- snap_point window clamped to [0, duration_ms] ----------------------------------
+
+
+def test_snap_point_near_file_start_clamps_window_to_zero_no_negative_result() -> None:
+    """Without the clamp, the raw window [-650, 850] would let a silence period
+    starting before 0 pull the snapped point negative -- impossible for a real
+    file position. The clamp excludes anything before 0 from the search."""
+    periods = [SilencePeriod(-200, 50)]
+    result = snap_point(100, periods, duration_ms=10_000, window_ms=750)
+    assert result.snapped is True
+    assert result.new_ms == 25
+    assert result.new_ms >= 0
+
+
+def test_snap_point_near_file_end_clamps_window_to_duration() -> None:
+    """Without the clamp, the raw window [9_150, 10_650] would let a silence
+    period past the file's own duration pull the snapped point beyond it.
+    The clamp excludes anything past duration_ms from the search."""
+    periods = [SilencePeriod(9_950, 10_300)]
+    result = snap_point(9_900, periods, duration_ms=10_000, window_ms=750)
+    assert result.snapped is True
+    assert result.new_ms == 9_975
+    assert result.new_ms <= 10_000
+
+
+def test_snap_point_silence_entirely_past_clamped_window_is_not_snapped() -> None:
+    """A silence period that only exists past duration_ms (e.g. from a
+    slightly-off probe) must never be reachable once the window is clamped."""
+    periods = [SilencePeriod(10_050, 10_200)]
+    result = snap_point(9_900, periods, duration_ms=10_000, window_ms=750)
+    assert result.snapped is False
+    assert result.new_ms == 9_900

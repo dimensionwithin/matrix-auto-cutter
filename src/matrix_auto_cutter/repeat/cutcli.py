@@ -213,9 +213,33 @@ def _format_hms(milliseconds: int) -> str:
     return f"{sign}{hours:02d}:{minutes:02d}:{seconds:02d}.{millis:03d}"
 
 
+def _resolve_snap_or_discard(
+    start_result: SnapResult, end_result: SnapResult
+) -> tuple[SnapResult, SnapResult, bool]:
+    """Discard both snaps for one removal if they would cross (start >= end).
+
+    A removal whose snapped start lands at or past its snapped end would
+    have negative or zero duration, breaking the "kept + removed ==
+    total" invariant compute_cut_plan enforces. The original boundary
+    values are always valid (they came from the judgment itself), so
+    falling back to them is always safe -- no partial snap, no swapping
+    the boundaries.
+    """
+    if start_result.new_ms >= end_result.new_ms:
+        discarded_start = SnapResult(
+            start_result.original_ms, start_result.original_ms, 0, False, crossing_discarded=True
+        )
+        discarded_end = SnapResult(
+            end_result.original_ms, end_result.original_ms, 0, False, crossing_discarded=True
+        )
+        return discarded_start, discarded_end, True
+    return start_result, end_result, False
+
+
 def snap_urteile(
     urteile: list[dict],
     periods: list[SilencePeriod],
+    duration_ms: int,
     window_ms: int,
 ) -> tuple[list[dict], list[SnapResult]]:
     """Snap both removal boundaries of every "versprecher" urteil onto silence.
@@ -226,6 +250,10 @@ def snap_urteile(
     ``compute_cut_plan`` merges the (now snapped) removals afterwards, never
     before -- snapping can push two previously separate removals into
     overlap, and merging first would have produced a duplicate cut.
+
+    If snapping would cross a single removal's own boundaries, that
+    removal's snap is discarded entirely (see ``_resolve_snap_or_discard``)
+    and its original, unsnapped boundaries are kept.
     """
     adjusted: list[dict] = []
     results: list[SnapResult] = []
@@ -237,20 +265,26 @@ def snap_urteile(
         erste = dict(urteil["erste_passage"])
         zweite = dict(urteil["zweite_passage"])
         if schnitt == "erste":
-            start_result = snap_point(erste["start_ms"], periods, window_ms)
-            end_result = snap_point(erste["end_ms"], periods, window_ms)
-            erste["start_ms"] = start_result.new_ms
-            erste["end_ms"] = end_result.new_ms
+            start_result = snap_point(erste["start_ms"], periods, duration_ms, window_ms)
+            end_result = snap_point(erste["end_ms"], periods, duration_ms, window_ms)
+            start_result, end_result, crossed = _resolve_snap_or_discard(start_result, end_result)
+            if not crossed:
+                erste["start_ms"] = start_result.new_ms
+                erste["end_ms"] = end_result.new_ms
         elif schnitt == "zweite":
-            start_result = snap_point(zweite["start_ms"], periods, window_ms)
-            end_result = snap_point(zweite["end_ms"], periods, window_ms)
-            zweite["start_ms"] = start_result.new_ms
-            zweite["end_ms"] = end_result.new_ms
+            start_result = snap_point(zweite["start_ms"], periods, duration_ms, window_ms)
+            end_result = snap_point(zweite["end_ms"], periods, duration_ms, window_ms)
+            start_result, end_result, crossed = _resolve_snap_or_discard(start_result, end_result)
+            if not crossed:
+                zweite["start_ms"] = start_result.new_ms
+                zweite["end_ms"] = end_result.new_ms
         else:
-            start_result = snap_point(erste["start_ms"], periods, window_ms)
-            end_result = snap_point(zweite["end_ms"], periods, window_ms)
-            erste["start_ms"] = start_result.new_ms
-            zweite["end_ms"] = end_result.new_ms
+            start_result = snap_point(erste["start_ms"], periods, duration_ms, window_ms)
+            end_result = snap_point(zweite["end_ms"], periods, duration_ms, window_ms)
+            start_result, end_result, crossed = _resolve_snap_or_discard(start_result, end_result)
+            if not crossed:
+                erste["start_ms"] = start_result.new_ms
+                zweite["end_ms"] = end_result.new_ms
         results.append(start_result)
         results.append(end_result)
         new_urteil = dict(urteil)
@@ -262,9 +296,15 @@ def snap_urteile(
 
 def _report_snap_results(results: list[SnapResult]) -> None:
     snapped_count = 0
+    crossing_discarded_count = 0
     max_shift_ms = 0
     for result in results:
-        if result.snapped:
+        if result.crossing_discarded:
+            crossing_discarded_count += 1
+            print(
+                f"Original {_format_hms(result.original_ms)} Heranruecken verworfen (Ueberkreuzung)"
+            )
+        elif result.snapped:
             snapped_count += 1
             max_shift_ms = max(max_shift_ms, abs(result.shift_ms))
             print(
@@ -277,9 +317,10 @@ def _report_snap_results(results: list[SnapResult]) -> None:
                 f"Original {_format_hms(result.original_ms)} "
                 "nicht herangerueckt (keine Stille im Fenster)"
             )
-    not_snapped_count = len(results) - snapped_count
+    not_snapped_count = len(results) - snapped_count - crossing_discarded_count
     print(
         f"Herangerueckt: {snapped_count}, nicht herangerueckt: {not_snapped_count}, "
+        f"verworfen (Ueberkreuzung): {crossing_discarded_count}, "
         f"groesste Verschiebung: {max_shift_ms} ms"
     )
 
@@ -351,7 +392,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         except ProcessTimeoutError as exc:
             print(f"Fehler: {exc}", file=sys.stderr)
             return _EXIT_PROCESS_TIMEOUT
-        urteile, snap_results = snap_urteile(urteile, periods, args.snap_window_ms)
+        urteile, snap_results = snap_urteile(urteile, periods, duration_ms, args.snap_window_ms)
 
     try:
         plan = compute_cut_plan(urteile, duration_ms)

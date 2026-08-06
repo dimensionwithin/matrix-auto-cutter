@@ -505,7 +505,7 @@ def _urteil(
 def test_snap_urteile_snaps_erste_boundaries_only() -> None:
     entry = _urteil(schnitt="erste", erste_start=1_000, erste_end=2_000)
     periods = [SilencePeriod(940, 1_060), SilencePeriod(1_950, 2_050)]
-    adjusted, results = snap_urteile([entry], periods, window_ms=750)
+    adjusted, results = snap_urteile([entry], periods, 10_000, window_ms=750)
     assert adjusted[0]["erste_passage"] == {"start_ms": 1_000, "end_ms": 2_000}
     assert adjusted[0]["zweite_passage"] == entry["zweite_passage"]
     assert [r.snapped for r in results] == [True, True]
@@ -514,7 +514,7 @@ def test_snap_urteile_snaps_erste_boundaries_only() -> None:
 def test_snap_urteile_snaps_zweite_boundaries_only() -> None:
     entry = _urteil(schnitt="zweite", zweite_start=2_500, zweite_end=3_000)
     periods = [SilencePeriod(2_400, 2_460), SilencePeriod(2_960, 3_020)]
-    adjusted, results = snap_urteile([entry], periods, window_ms=750)
+    adjusted, results = snap_urteile([entry], periods, 10_000, window_ms=750)
     assert adjusted[0]["zweite_passage"]["start_ms"] == 2_430
     assert adjusted[0]["zweite_passage"]["end_ms"] == 2_990
     assert adjusted[0]["erste_passage"] == entry["erste_passage"]
@@ -525,7 +525,7 @@ def test_snap_urteile_beide_snaps_only_outer_boundaries() -> None:
         schnitt="beide", erste_start=1_000, erste_end=2_000, zweite_start=2_500, zweite_end=3_000
     )
     periods = [SilencePeriod(940, 1_060), SilencePeriod(2_960, 3_020)]
-    adjusted, results = snap_urteile([entry], periods, window_ms=750)
+    adjusted, results = snap_urteile([entry], periods, 10_000, window_ms=750)
     assert adjusted[0]["erste_passage"]["start_ms"] == 1_000
     assert adjusted[0]["erste_passage"]["end_ms"] == 2_000
     assert adjusted[0]["zweite_passage"]["start_ms"] == 2_500
@@ -534,7 +534,7 @@ def test_snap_urteile_beide_snaps_only_outer_boundaries() -> None:
 
 def test_snap_urteile_leaves_non_versprecher_entries_untouched() -> None:
     entry = _urteil(urteil="kein_versprecher")
-    adjusted, results = snap_urteile([entry], [SilencePeriod(940, 1_060)], window_ms=750)
+    adjusted, results = snap_urteile([entry], [SilencePeriod(940, 1_060)], 10_000, window_ms=750)
     assert adjusted[0] is entry
     assert results == []
 
@@ -543,11 +543,72 @@ def test_snap_urteile_causing_overlap_then_merge_yields_single_segment() -> None
     entry1 = _urteil(schnitt="erste", erste_start=1_000, erste_end=2_000)
     entry2 = _urteil(schnitt="erste", erste_start=2_100, erste_end=3_000)
     periods = [SilencePeriod(2_000, 2_200)]
-    adjusted, _results = snap_urteile([entry1, entry2], periods, window_ms=750)
+    adjusted, _results = snap_urteile([entry1, entry2], periods, 10_000, window_ms=750)
     plan = compute_cut_plan(adjusted, 10_000)
     assert plan.cut_count_before_merge == 2
     assert plan.cut_count == 1
     assert plan.kept_segments == (KeptSegment(0, 1_000), KeptSegment(3_000, 10_000))
+
+
+# --- snap_urteile crossing discard (pure) -----------------------------------------
+
+
+def test_snap_urteile_crossing_boundaries_discards_snap_keeps_originals() -> None:
+    entry = _urteil(schnitt="erste", erste_start=1_000, erste_end=1_010)
+    periods = [SilencePeriod(990, 1_012)]
+    adjusted, results = snap_urteile([entry], periods, 10_000, window_ms=750)
+    assert adjusted[0]["erste_passage"] == {"start_ms": 1_000, "end_ms": 1_010}
+    assert [r.crossing_discarded for r in results] == [True, True]
+    assert [r.snapped for r in results] == [False, False]
+    assert [r.new_ms for r in results] == [1_000, 1_010]
+    assert [r.shift_ms for r in results] == [0, 0]
+
+
+def test_snap_urteile_crossing_boundaries_zweite_schnitt_keeps_originals() -> None:
+    entry = _urteil(schnitt="zweite", zweite_start=2_000, zweite_end=2_010)
+    periods = [SilencePeriod(1_990, 2_012)]
+    adjusted, results = snap_urteile([entry], periods, 10_000, window_ms=750)
+    assert adjusted[0]["zweite_passage"] == {"start_ms": 2_000, "end_ms": 2_010}
+    assert [r.crossing_discarded for r in results] == [True, True]
+
+
+def test_snap_urteile_crossing_boundaries_beide_schnitt_keeps_originals() -> None:
+    entry = _urteil(
+        schnitt="beide", erste_start=1_000, erste_end=1_500, zweite_start=1_500, zweite_end=1_010
+    )
+    periods = [SilencePeriod(990, 1_012)]
+    adjusted, results = snap_urteile([entry], periods, 10_000, window_ms=750)
+    assert adjusted[0]["erste_passage"]["start_ms"] == 1_000
+    assert adjusted[0]["zweite_passage"]["end_ms"] == 1_010
+    assert [r.crossing_discarded for r in results] == [True, True]
+
+
+def test_snap_urteile_crossing_discard_preserves_integrity() -> None:
+    entry = _urteil(schnitt="erste", erste_start=1_000, erste_end=1_010)
+    periods = [SilencePeriod(990, 1_012)]
+    adjusted, _results = snap_urteile([entry], periods, 10_000, window_ms=750)
+    plan = compute_cut_plan(adjusted, 10_000)
+    assert plan.duration_after_ms + plan.removed_duration_ms == plan.duration_before_ms
+    assert plan.removed_duration_ms == 10
+
+
+# --- snap_urteile window clamped to file duration (integration through cutcli) -----
+
+
+def test_snap_urteile_near_file_start_passes_duration_through() -> None:
+    entry = _urteil(schnitt="erste", erste_start=100, erste_end=5_000)
+    periods = [SilencePeriod(0, 60)]
+    adjusted, results = snap_urteile([entry], periods, 10_000, window_ms=750)
+    assert adjusted[0]["erste_passage"]["start_ms"] == 30
+    assert results[0].new_ms >= 0
+
+
+def test_snap_urteile_near_file_end_passes_duration_through() -> None:
+    entry = _urteil(schnitt="erste", erste_start=5_000, erste_end=9_900)
+    periods = [SilencePeriod(9_960, 10_000)]
+    adjusted, results = snap_urteile([entry], periods, 10_000, window_ms=750)
+    assert adjusted[0]["erste_passage"]["end_ms"] == 9_980
+    assert results[1].new_ms <= 10_000
 
 
 # --- main() with silence data ---------------------------------------------------------
@@ -578,7 +639,10 @@ def test_main_snap_default_moves_boundaries_and_reports_shift(
     out_text = capsys.readouterr().out
     assert "Verschiebung -60 ms" in out_text
     assert "Verschiebung +50 ms" in out_text
-    assert "Herangerueckt: 2, nicht herangerueckt: 0, groesste Verschiebung: 60 ms" in out_text
+    assert (
+        "Herangerueckt: 2, nicht herangerueckt: 0, verworfen (Ueberkreuzung): 0, "
+        "groesste Verschiebung: 60 ms"
+    ) in out_text
 
 
 def test_main_snap_dry_run_reports_shift_without_encoding(
@@ -611,7 +675,37 @@ def test_main_no_silence_found_reports_not_snapped(
     assert exit_code == 0
     out_text = capsys.readouterr().out
     assert "nicht herangerueckt (keine Stille im Fenster)" in out_text
-    assert "Herangerueckt: 0, nicht herangerueckt: 2, groesste Verschiebung: 0 ms" in out_text
+    assert (
+        "Herangerueckt: 0, nicht herangerueckt: 2, verworfen (Ueberkreuzung): 0, "
+        "groesste Verschiebung: 0 ms"
+    ) in out_text
+
+
+def test_main_crossing_boundaries_discards_snap_and_reports_it(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    source = _write_source(tmp_path)
+    urteile = _write_urteile(tmp_path)
+    out = tmp_path / "out.mp4"
+    silence_stderr = "silence_start: 1.400\nsilence_end: 1.600\n"
+    runner = _FakeRunner(
+        duration_stdout="10.0", out_duration_stdout="9.0", silence_stderr=silence_stderr
+    )
+    _patch_runner(monkeypatch, runner)
+    exit_code = main(["--source", str(source), "--urteile", str(urteile), "--out", str(out)])
+    assert exit_code == 0
+    out_text = capsys.readouterr().out
+    assert out_text.count("Heranruecken verworfen (Ueberkreuzung)") == 2
+    assert "Original 00:00:01.000 Heranruecken verworfen (Ueberkreuzung)" in out_text
+    assert "Original 00:00:02.000 Heranruecken verworfen (Ueberkreuzung)" in out_text
+    assert (
+        "Herangerueckt: 0, nicht herangerueckt: 0, verworfen (Ueberkreuzung): 2, "
+        "groesste Verschiebung: 0 ms"
+    ) in out_text
+    encode_call = next(call for call in runner.calls if "-filter_complex" in call)
+    filtergraph = " ".join(encode_call)
+    assert "start=0.000:end=1.000" in filtergraph
+    assert "start=2.000:end=10.000" in filtergraph
 
 
 def test_main_silence_detect_ffmpeg_failure_returns_exit_6(

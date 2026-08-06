@@ -41,6 +41,7 @@ class SnapResult:
     new_ms: int
     shift_ms: int
     snapped: bool
+    crossing_discarded: bool = False
 
 
 def build_silencedetect_argv(
@@ -104,17 +105,22 @@ def detect_silence(
 def snap_point(
     point_ms: int,
     periods: list[SilencePeriod],
+    duration_ms: int,
     window_ms: int = DEFAULT_WINDOW_MS,
 ) -> SnapResult:
     """Move ``point_ms`` onto the middle of the nearest silence within +/- ``window_ms``.
 
-    Silence periods that extend past the window are clipped to the window
-    before their middle is taken. Among several candidates, the one whose
-    (clipped) middle is closest to ``point_ms`` wins. If no silence falls in
-    the window at all, the point is returned unchanged and unsnapped.
+    The search window is clamped to ``[0, duration_ms]`` before it is used,
+    so a point near the start or end of the file never searches (or lands)
+    outside the file. Silence periods that extend past the (already
+    clamped) window are separately clipped to it before their middle is
+    taken -- that clipping is unrelated and stays as-is. Among several
+    candidates, the one whose (clipped) middle is closest to ``point_ms``
+    wins. If no silence falls in the window at all, the point is returned
+    unchanged and unsnapped.
     """
-    window_start = point_ms - window_ms
-    window_end = point_ms + window_ms
+    window_start = max(0, point_ms - window_ms)
+    window_end = min(duration_ms, point_ms + window_ms)
     best_mid: int | None = None
     best_distance: int | None = None
     for period in periods:
