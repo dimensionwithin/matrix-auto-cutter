@@ -29,7 +29,9 @@ from matrix_auto_cutter.repeat.cut import (
     CutPlan,
     EmptyResultError,
     KeptSegment,
+    SchnittWert,
     compute_cut_plan,
+    resolve_schnitt,
 )
 from matrix_auto_cutter.repeat.errors import (
     FfmpegError,
@@ -38,12 +40,23 @@ from matrix_auto_cutter.repeat.errors import (
     SourceNotFoundError,
 )
 from matrix_auto_cutter.repeat.process import NativeProcessRunner, ProcessRunner
+from matrix_auto_cutter.repeat.snap import (
+    DEFAULT_MIN_SILENCE_MS,
+    DEFAULT_NOISE_DB,
+    DEFAULT_WINDOW_MS,
+    SilencePeriod,
+    SnapResult,
+    detect_silence,
+    snap_point,
+)
 
 _PROBE_TIMEOUT_MS = 30_000
 _ORPHAN_CHECK_TIMEOUT_MS = 10_000
 _MIN_ENCODE_TIMEOUT_MS = 60_000
 _ENCODE_TIMEOUT_FACTOR = 5
 _DURATION_MISMATCH_WARNING_MS = 500
+_MIN_SILENCE_DETECT_TIMEOUT_MS = 30_000
+_SILENCE_DETECT_TIMEOUT_FACTOR = 2
 
 _DEFAULT_VIDEO_CODEC = "libx264"
 _DEFAULT_PRESET = "slow"
@@ -83,6 +96,22 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--crf", type=int, default=_DEFAULT_CRF)
     parser.add_argument("--preset", default=_DEFAULT_PRESET)
     parser.add_argument("--audio-bitrate", default=_DEFAULT_AUDIO_BITRATE)
+    parser.add_argument(
+        "--snap",
+        dest="snap",
+        action="store_true",
+        help="Schnittpunkte an gemessene Stille heranruecken (Vorgabe: an)",
+    )
+    parser.add_argument(
+        "--no-snap",
+        dest="snap",
+        action="store_false",
+        help="Schnittpunkte nicht heranruecken -- Urteile unveraendert verwenden",
+    )
+    parser.set_defaults(snap=True)
+    parser.add_argument("--snap-window-ms", type=int, default=DEFAULT_WINDOW_MS)
+    parser.add_argument("--snap-noise-db", type=float, default=DEFAULT_NOISE_DB)
+    parser.add_argument("--snap-min-silence-ms", type=int, default=DEFAULT_MIN_SILENCE_MS)
     return parser
 
 
@@ -171,6 +200,90 @@ def _encode_timeout_ms(plan: CutPlan) -> int:
     return max(_MIN_ENCODE_TIMEOUT_MS, plan.duration_after_ms * _ENCODE_TIMEOUT_FACTOR)
 
 
+def _silence_detect_timeout_ms(duration_ms: int) -> int:
+    return max(_MIN_SILENCE_DETECT_TIMEOUT_MS, duration_ms * _SILENCE_DETECT_TIMEOUT_FACTOR)
+
+
+def _format_hms(milliseconds: int) -> str:
+    sign = "-" if milliseconds < 0 else ""
+    total_ms = abs(milliseconds)
+    hours, rem_ms = divmod(total_ms, 3_600_000)
+    minutes, rem_ms = divmod(rem_ms, 60_000)
+    seconds, millis = divmod(rem_ms, 1000)
+    return f"{sign}{hours:02d}:{minutes:02d}:{seconds:02d}.{millis:03d}"
+
+
+def snap_urteile(
+    urteile: list[dict],
+    periods: list[SilencePeriod],
+    window_ms: int,
+) -> tuple[list[dict], list[SnapResult]]:
+    """Snap both removal boundaries of every "versprecher" urteil onto silence.
+
+    Removals are built from the judgments exactly as ``cut.py`` builds them
+    (via the public ``resolve_schnitt``); only the two removal-boundary
+    fields are rewritten with their snapped values, so the unmodified
+    ``compute_cut_plan`` merges the (now snapped) removals afterwards, never
+    before -- snapping can push two previously separate removals into
+    overlap, and merging first would have produced a duplicate cut.
+    """
+    adjusted: list[dict] = []
+    results: list[SnapResult] = []
+    for urteil in urteile:
+        schnitt: SchnittWert | None = resolve_schnitt(urteil)
+        if schnitt is None:
+            adjusted.append(urteil)
+            continue
+        erste = dict(urteil["erste_passage"])
+        zweite = dict(urteil["zweite_passage"])
+        if schnitt == "erste":
+            start_result = snap_point(erste["start_ms"], periods, window_ms)
+            end_result = snap_point(erste["end_ms"], periods, window_ms)
+            erste["start_ms"] = start_result.new_ms
+            erste["end_ms"] = end_result.new_ms
+        elif schnitt == "zweite":
+            start_result = snap_point(zweite["start_ms"], periods, window_ms)
+            end_result = snap_point(zweite["end_ms"], periods, window_ms)
+            zweite["start_ms"] = start_result.new_ms
+            zweite["end_ms"] = end_result.new_ms
+        else:
+            start_result = snap_point(erste["start_ms"], periods, window_ms)
+            end_result = snap_point(zweite["end_ms"], periods, window_ms)
+            erste["start_ms"] = start_result.new_ms
+            zweite["end_ms"] = end_result.new_ms
+        results.append(start_result)
+        results.append(end_result)
+        new_urteil = dict(urteil)
+        new_urteil["erste_passage"] = erste
+        new_urteil["zweite_passage"] = zweite
+        adjusted.append(new_urteil)
+    return adjusted, results
+
+
+def _report_snap_results(results: list[SnapResult]) -> None:
+    snapped_count = 0
+    max_shift_ms = 0
+    for result in results:
+        if result.snapped:
+            snapped_count += 1
+            max_shift_ms = max(max_shift_ms, abs(result.shift_ms))
+            print(
+                f"Original {_format_hms(result.original_ms)} -> "
+                f"Neu {_format_hms(result.new_ms)}, "
+                f"Verschiebung {result.shift_ms:+d} ms"
+            )
+        else:
+            print(
+                f"Original {_format_hms(result.original_ms)} "
+                "nicht herangerueckt (keine Stille im Fenster)"
+            )
+    not_snapped_count = len(results) - snapped_count
+    print(
+        f"Herangerueckt: {snapped_count}, nicht herangerueckt: {not_snapped_count}, "
+        f"groesste Verschiebung: {max_shift_ms} ms"
+    )
+
+
 def _report(plan: CutPlan, argv_ffmpeg: Sequence[str], args: argparse.Namespace) -> None:
     audio_bitrate = args.audio_bitrate if args.audio_bitrate is not None else "(Encoder-Default)"
     print(f"Anzahl Stellen (behaltene Segmente): {len(plan.kept_segments)}")
@@ -217,6 +330,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _EXIT_PROCESS_TIMEOUT
 
     urteile = json.loads(Path(args.urteile).read_text(encoding="utf-8"))
+
+    snap_results: list[SnapResult] = []
+    if args.snap:
+        # source's existence was already confirmed above by probe_duration_ms,
+        # so detect_silence's own SourceNotFoundError check cannot trigger here.
+        try:
+            periods = detect_silence(
+                source,
+                args.ffmpeg,
+                runner,
+                _silence_detect_timeout_ms(duration_ms),
+                duration_ms,
+                args.snap_noise_db,
+                args.snap_min_silence_ms,
+            )
+        except FfmpegError as exc:
+            print(f"Fehler: {exc}", file=sys.stderr)
+            return _EXIT_FFMPEG_ERROR
+        except ProcessTimeoutError as exc:
+            print(f"Fehler: {exc}", file=sys.stderr)
+            return _EXIT_PROCESS_TIMEOUT
+        urteile, snap_results = snap_urteile(urteile, periods, args.snap_window_ms)
+
     try:
         plan = compute_cut_plan(urteile, duration_ms)
     except (EmptyResultError, CutIntegrityError) as exc:
@@ -233,6 +369,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.preset,
         args.audio_bitrate,
     )
+    if args.snap:
+        _report_snap_results(snap_results)
     _report(plan, argv_ffmpeg, args)
 
     if args.dry_run:

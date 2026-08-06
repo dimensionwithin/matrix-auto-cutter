@@ -12,9 +12,15 @@ import pytest
 
 import matrix_auto_cutter.repeat.cutcli as cutcli_module
 import matrix_auto_cutter.repeat.process as process_module
-from matrix_auto_cutter.repeat.cut import KeptSegment
-from matrix_auto_cutter.repeat.cutcli import build_ffmpeg_argv, build_filtergraph, main
+from matrix_auto_cutter.repeat.cut import KeptSegment, compute_cut_plan
+from matrix_auto_cutter.repeat.cutcli import (
+    build_ffmpeg_argv,
+    build_filtergraph,
+    main,
+    snap_urteile,
+)
 from matrix_auto_cutter.repeat.process import ProcessResult
+from matrix_auto_cutter.repeat.snap import SilencePeriod
 
 _URTEILE_ONE_VERSPRECHER = [
     {
@@ -39,6 +45,9 @@ class _FakeRunner:
         ffmpeg_timed_out: bool = False,
         orphan_pids: str = "",
         probe_timed_out: bool = False,
+        silence_stderr: str = "",
+        silence_exit: int = 0,
+        silence_timed_out: bool = False,
     ) -> None:
         self.calls: list[list[str]] = []
         self.duration_stdout = duration_stdout
@@ -49,12 +58,19 @@ class _FakeRunner:
         self.ffmpeg_timed_out = ffmpeg_timed_out
         self.orphan_pids = orphan_pids
         self.probe_timed_out = probe_timed_out
+        self.silence_stderr = silence_stderr
+        self.silence_exit = silence_exit
+        self.silence_timed_out = silence_timed_out
         self._probe_calls = 0
 
     def __call__(self, argv: list[str], timeout_ms: int) -> ProcessResult:
         self.calls.append(argv)
         if argv[0] == "powershell":
             return ProcessResult(0, self.orphan_pids, "", False, 1)
+        if "-af" in argv and any("silencedetect" in part for part in argv):
+            if self.silence_timed_out:
+                return ProcessResult(-9, "", "timeout", True, 1)
+            return ProcessResult(self.silence_exit, "", self.silence_stderr, False, 1)
         if "-show_entries" in argv:
             self._probe_calls += 1
             if self.probe_timed_out:
@@ -457,3 +473,248 @@ def test_custom_encoder_flags_are_used(tmp_path: Path, monkeypatch: Any) -> None
     assert "23" in encode_call
     assert "fast" in encode_call
     assert "192k" in encode_call
+
+
+# --- snap_urteile (pure) -------------------------------------------------------------
+
+
+def _urteil(
+    *,
+    schnitt: str | None = None,
+    erste_start: int = 1_000,
+    erste_end: int = 2_000,
+    zweite_start: int = 2_500,
+    zweite_end: int = 3_000,
+    urteil: str = "versprecher",
+) -> dict:
+    entry = {
+        "datei": "stem",
+        "eintragsnummer": 1,
+        "erste_passage": {"start_ms": erste_start, "end_ms": erste_end},
+        "zweite_passage": {"start_ms": zweite_start, "end_ms": zweite_end},
+        "scores": {"utterance": None, "boundary": 0.9},
+        "detektoren": ["boundary"],
+        "urteil": urteil,
+        "notiz": "",
+    }
+    if schnitt is not None:
+        entry["schnitt"] = schnitt
+    return entry
+
+
+def test_snap_urteile_snaps_erste_boundaries_only() -> None:
+    entry = _urteil(schnitt="erste", erste_start=1_000, erste_end=2_000)
+    periods = [SilencePeriod(940, 1_060), SilencePeriod(1_950, 2_050)]
+    adjusted, results = snap_urteile([entry], periods, window_ms=750)
+    assert adjusted[0]["erste_passage"] == {"start_ms": 1_000, "end_ms": 2_000}
+    assert adjusted[0]["zweite_passage"] == entry["zweite_passage"]
+    assert [r.snapped for r in results] == [True, True]
+
+
+def test_snap_urteile_snaps_zweite_boundaries_only() -> None:
+    entry = _urteil(schnitt="zweite", zweite_start=2_500, zweite_end=3_000)
+    periods = [SilencePeriod(2_400, 2_460), SilencePeriod(2_960, 3_020)]
+    adjusted, results = snap_urteile([entry], periods, window_ms=750)
+    assert adjusted[0]["zweite_passage"]["start_ms"] == 2_430
+    assert adjusted[0]["zweite_passage"]["end_ms"] == 2_990
+    assert adjusted[0]["erste_passage"] == entry["erste_passage"]
+
+
+def test_snap_urteile_beide_snaps_only_outer_boundaries() -> None:
+    entry = _urteil(
+        schnitt="beide", erste_start=1_000, erste_end=2_000, zweite_start=2_500, zweite_end=3_000
+    )
+    periods = [SilencePeriod(940, 1_060), SilencePeriod(2_960, 3_020)]
+    adjusted, results = snap_urteile([entry], periods, window_ms=750)
+    assert adjusted[0]["erste_passage"]["start_ms"] == 1_000
+    assert adjusted[0]["erste_passage"]["end_ms"] == 2_000
+    assert adjusted[0]["zweite_passage"]["start_ms"] == 2_500
+    assert adjusted[0]["zweite_passage"]["end_ms"] == 2_990
+
+
+def test_snap_urteile_leaves_non_versprecher_entries_untouched() -> None:
+    entry = _urteil(urteil="kein_versprecher")
+    adjusted, results = snap_urteile([entry], [SilencePeriod(940, 1_060)], window_ms=750)
+    assert adjusted[0] is entry
+    assert results == []
+
+
+def test_snap_urteile_causing_overlap_then_merge_yields_single_segment() -> None:
+    entry1 = _urteil(schnitt="erste", erste_start=1_000, erste_end=2_000)
+    entry2 = _urteil(schnitt="erste", erste_start=2_100, erste_end=3_000)
+    periods = [SilencePeriod(2_000, 2_200)]
+    adjusted, _results = snap_urteile([entry1, entry2], periods, window_ms=750)
+    plan = compute_cut_plan(adjusted, 10_000)
+    assert plan.cut_count_before_merge == 2
+    assert plan.cut_count == 1
+    assert plan.kept_segments == (KeptSegment(0, 1_000), KeptSegment(3_000, 10_000))
+
+
+# --- main() with silence data ---------------------------------------------------------
+
+
+def test_main_snap_default_moves_boundaries_and_reports_shift(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    source = _write_source(tmp_path)
+    urteile = _write_urteile(tmp_path)
+    out = tmp_path / "out.mp4"
+    silence_stderr = (
+        "[silencedetect @ 0x0] silence_start: 0.900\n"
+        "[silencedetect @ 0x0] silence_end: 0.980 | silence_duration: 0.080\n"
+        "[silencedetect @ 0x0] silence_start: 2.010\n"
+        "[silencedetect @ 0x0] silence_end: 2.090 | silence_duration: 0.080\n"
+    )
+    runner = _FakeRunner(
+        duration_stdout="10.0", out_duration_stdout="8.89", silence_stderr=silence_stderr
+    )
+    _patch_runner(monkeypatch, runner)
+    exit_code = main(["--source", str(source), "--urteile", str(urteile), "--out", str(out)])
+    assert exit_code == 0
+    encode_call = next(call for call in runner.calls if "-filter_complex" in call)
+    filtergraph = " ".join(encode_call)
+    assert "start=0.000:end=0.940" in filtergraph
+    assert "start=2.050:end=10.000" in filtergraph
+    out_text = capsys.readouterr().out
+    assert "Verschiebung -60 ms" in out_text
+    assert "Verschiebung +50 ms" in out_text
+    assert "Herangerueckt: 2, nicht herangerueckt: 0, groesste Verschiebung: 60 ms" in out_text
+
+
+def test_main_snap_dry_run_reports_shift_without_encoding(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    source = _write_source(tmp_path)
+    urteile = _write_urteile(tmp_path)
+    out = tmp_path / "out.mp4"
+    silence_stderr = "silence_start: 0.900\nsilence_end: 0.980\n"
+    runner = _FakeRunner(duration_stdout="10.0", silence_stderr=silence_stderr)
+    _patch_runner(monkeypatch, runner)
+    exit_code = main(
+        ["--source", str(source), "--urteile", str(urteile), "--out", str(out), "--dry-run"]
+    )
+    assert exit_code == 0
+    assert not out.exists()
+    out_text = capsys.readouterr().out
+    assert "Verschiebung" in out_text
+
+
+def test_main_no_silence_found_reports_not_snapped(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    source = _write_source(tmp_path)
+    urteile = _write_urteile(tmp_path)
+    out = tmp_path / "out.mp4"
+    runner = _FakeRunner(duration_stdout="10.0", out_duration_stdout="9.0")
+    _patch_runner(monkeypatch, runner)
+    exit_code = main(["--source", str(source), "--urteile", str(urteile), "--out", str(out)])
+    assert exit_code == 0
+    out_text = capsys.readouterr().out
+    assert "nicht herangerueckt (keine Stille im Fenster)" in out_text
+    assert "Herangerueckt: 0, nicht herangerueckt: 2, groesste Verschiebung: 0 ms" in out_text
+
+
+def test_main_silence_detect_ffmpeg_failure_returns_exit_6(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    source = _write_source(tmp_path)
+    urteile = _write_urteile(tmp_path)
+    out = tmp_path / "out.mp4"
+    runner = _FakeRunner(duration_stdout="10.0", silence_exit=1)
+    _patch_runner(monkeypatch, runner)
+    exit_code = main(["--source", str(source), "--urteile", str(urteile), "--out", str(out)])
+    assert exit_code == 6
+    assert not out.exists()
+
+
+def test_main_silence_detect_timeout_returns_exit_7(tmp_path: Path, monkeypatch: Any) -> None:
+    source = _write_source(tmp_path)
+    urteile = _write_urteile(tmp_path)
+    out = tmp_path / "out.mp4"
+    runner = _FakeRunner(duration_stdout="10.0", silence_timed_out=True)
+    _patch_runner(monkeypatch, runner)
+    exit_code = main(["--source", str(source), "--urteile", str(urteile), "--out", str(out)])
+    assert exit_code == 7
+    assert not out.exists()
+
+
+def test_main_custom_snap_flags_are_honored(tmp_path: Path, monkeypatch: Any) -> None:
+    source = _write_source(tmp_path)
+    urteile = _write_urteile(tmp_path)
+    out = tmp_path / "out.mp4"
+    runner = _FakeRunner(duration_stdout="10.0", out_duration_stdout="9.0")
+    _patch_runner(monkeypatch, runner)
+    exit_code = main(
+        [
+            "--source",
+            str(source),
+            "--urteile",
+            str(urteile),
+            "--out",
+            str(out),
+            "--snap-window-ms",
+            "500",
+            "--snap-noise-db",
+            "-40",
+            "--snap-min-silence-ms",
+            "100",
+        ]
+    )
+    assert exit_code == 0
+    silence_call = next(call for call in runner.calls if "silencedetect" in " ".join(call))
+    assert "silencedetect=noise=-40.0dB:d=0.1" in " ".join(silence_call)
+
+
+# --- main() with --no-snap (regression: must match pre-snap behavior exactly) --------
+
+
+def test_main_no_snap_skips_silence_detection(tmp_path: Path, monkeypatch: Any) -> None:
+    source = _write_source(tmp_path)
+    urteile = _write_urteile(tmp_path)
+    out = tmp_path / "out.mp4"
+    silence_stderr = "silence_start: 0.900\nsilence_end: 0.980\n"
+    runner = _FakeRunner(
+        duration_stdout="10.0", out_duration_stdout="9.0", silence_stderr=silence_stderr
+    )
+    _patch_runner(monkeypatch, runner)
+    exit_code = main(
+        ["--source", str(source), "--urteile", str(urteile), "--out", str(out), "--no-snap"]
+    )
+    assert exit_code == 0
+    assert not any("silencedetect" in " ".join(call) for call in runner.calls)
+
+
+def test_main_no_snap_produces_unshifted_kept_segments(tmp_path: Path, monkeypatch: Any) -> None:
+    source = _write_source(tmp_path)
+    urteile = _write_urteile(tmp_path)
+    out = tmp_path / "out.mp4"
+    silence_stderr = "silence_start: 0.900\nsilence_end: 0.980\n"
+    runner = _FakeRunner(
+        duration_stdout="10.0", out_duration_stdout="9.0", silence_stderr=silence_stderr
+    )
+    _patch_runner(monkeypatch, runner)
+    exit_code = main(
+        ["--source", str(source), "--urteile", str(urteile), "--out", str(out), "--no-snap"]
+    )
+    assert exit_code == 0
+    encode_call = next(call for call in runner.calls if "-filter_complex" in call)
+    filtergraph = " ".join(encode_call)
+    assert "start=0.000:end=1.000" in filtergraph
+    assert "start=2.000:end=10.000" in filtergraph
+
+
+def test_main_no_snap_report_omits_snap_lines(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    source = _write_source(tmp_path)
+    urteile = _write_urteile(tmp_path)
+    out = tmp_path / "out.mp4"
+    runner = _FakeRunner(duration_stdout="10.0", out_duration_stdout="9.0")
+    _patch_runner(monkeypatch, runner)
+    exit_code = main(
+        ["--source", str(source), "--urteile", str(urteile), "--out", str(out), "--no-snap"]
+    )
+    assert exit_code == 0
+    out_text = capsys.readouterr().out
+    assert "Herangerueckt" not in out_text
+    assert "Verschiebung" not in out_text
