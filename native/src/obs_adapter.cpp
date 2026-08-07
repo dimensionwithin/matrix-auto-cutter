@@ -1337,23 +1337,30 @@ void ObsJournalAdapter::process_stop(const ControlCommand& command) noexcept {
             const bool paused = command.recording_paused;
             bool valid = signal.absolute_monotonic_ns >= origin &&
                          signal.path.view() == recording_path_;
+            // The stop callback reads the output counter some whole number of
+            // frames behind the video clock, because OBS 32.1.2 increments
+            // total_frames only when encoded packets leave its A/V interleaver.
+            // Anchoring the stop on the counter keeps that backlog out of the
+            // journal, exactly as the recording_started anchor does, and it is
+            // what keeps the finalizer drift measurement from reporting the
+            // backlog as clock drift. The size of the backlog is a finding
+            // about the recording, never a reason to discard an otherwise valid
+            // stop, so no tolerance bounds this adjustment: recording
+            // ff2618be-a9c1-4260-81ea-c0e08b630ff4 of 2026-08-07 lost 42 frames
+            // at one scene change and had its stop rejected by a former 8-frame
+            // bound. Monotonicity against the last written record is restored by
+            // the producer writer, which is the only place that knows it.
             if (valid && !pause_seen_.load(std::memory_order_acquire)) {
                 const auto started_frames =
                     recording_started_frame_count_.load(std::memory_order_acquire);
                 const auto started_ns = recording_started_ns_.load(std::memory_order_acquire);
-                constexpr std::uint64_t max_stop_qpc_adjustment_frames = 8;
-                const auto max_adjustment = frame_span_ns(max_stop_qpc_adjustment_frames);
                 const auto counter_span = signal.output_frame_count >= started_frames
                                               ? frame_span_ns(signal.output_frame_count - started_frames)
                                               : std::nullopt;
-                valid = max_adjustment.has_value() && counter_span.has_value() &&
-                        started_ns <= UINT64_MAX - counter_span.value_or(0);
+                valid = counter_span.has_value() && started_ns <= UINT64_MAX - *counter_span;
                 if (valid) {
                     const auto final_frame_ns = started_ns + *counter_span;
-                    const auto difference = final_frame_ns <= signal.absolute_monotonic_ns
-                                                ? signal.absolute_monotonic_ns - final_frame_ns
-                                                : final_frame_ns - signal.absolute_monotonic_ns;
-                    valid = difference <= *max_adjustment && final_frame_ns >= origin;
+                    valid = final_frame_ns >= origin;
                     if (valid) {
                         signal.absolute_monotonic_ns = final_frame_ns;
                     }

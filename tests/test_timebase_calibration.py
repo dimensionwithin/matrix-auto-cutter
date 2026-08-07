@@ -138,6 +138,49 @@ def test_residual_drift_and_uncertainty_boundaries() -> None:
         )
 
 
+def test_drift_ppm_characterises_the_counter_anchor_not_clock_drift() -> None:
+    """Halte fest, was `drift_ppm` bei counterverankertem Stop tatsächlich misst.
+
+    Der OBS-Adapter verankert den Stop-Record auf dem Output-Framecounter
+    (`obs_adapter.cpp`, `process_stop`). Dadurch ist `qpc_end - qpc_start`
+    konstruktionsbedingt exakt die Counterspanne, und `drift_ppm` ist bei jedem
+    pausenlosen Lauf 0 — unabhängig davon, wie die Uhr sich verhalten hat. Alle
+    zehn pausenlosen Läufe der Produktionshistorie messen dementsprechend
+    0,00 ppm.
+
+    Diese Zahl misst also DERZEIT KEINE UHRENDRIFT. Ohne die Verankerung ergibt
+    sie `L / span`, wobei L der Rückstand des Counters gegenüber der Videouhr in
+    Frames ist — der A/V-Interleaver-Rückstand von OBS plus real verlorene
+    Frames. Weil die Normierung längenabhängig ist, sind dieselben verlorenen
+    Frames in einem langen Lauf harmlos und in einem kurzen fatal.
+
+    Der Test ändert die Semantik nicht, er schreibt sie nur fest, damit der
+    nächste Leser die Verankerung nicht für einen Fehler hält und entfernt.
+    """
+
+    def frame_span_ns(frames: int) -> int:
+        """Spiegele `frame_span_ns` aus obs_adapter.cpp bitgenau."""
+        return (frames // 60) * 1_000_000_000 + ((frames % 60) * 1_000_000_000) // 60
+
+    # Verankerter Stop: der Rest ist reine Nanosekundentrunkierung und liegt
+    # unter der Vergleichstoleranz von 0,001 ppm, mit der sidecar.py die
+    # deklarierte gegen die nachgerechnete Drift prüft.
+    for span in (470, 604, 2916, 62233):
+        anchored_elapsed_ns = frame_span_ns(span)
+        assert calculate_drift_ppm(anchored_elapsed_ns, span) < Decimal("0.001")
+
+    # Ohne Verankerung: drift_ppm == L / span * 1e6. Erste Zeile ist der reale
+    # Lauf ff2618be (L = 46 Frames Rückstand, span = 62233 Frames, 17,3 min),
+    # zweite Zeile dieselben 46 Frames in einem Fünfminutenlauf, dritte Zeile
+    # ein einziger Frame Rückstand im Zehnsekundenlauf 51afb549.
+    for lag_frames, span, expected_ppm in ((46, 62233, 739), (46, 18000, 2556), (1, 604, 1656)):
+        raw_elapsed_ns = frame_span_ns(span + lag_frames)
+        measured = calculate_drift_ppm(raw_elapsed_ns, span)
+        assert round(measured) == expected_ppm
+        closed_form = Decimal(lag_frames) / Decimal(span) * Decimal(1_000_000)
+        assert abs(measured - closed_form) < Decimal("0.001")
+
+
 def test_sample_gap_gate_and_pause_adjustment() -> None:
     assert sample_gaps_valid((sample(0, 0), sample(5_000_000_000, 300)))
     assert not sample_gaps_valid((sample(0, 0), sample(5_000_000_001, 300)))

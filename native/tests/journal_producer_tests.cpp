@@ -667,6 +667,140 @@ void test_pause_resume_event_ids_cannot_reuse_an_existing_event_id() {
     check(state->lines.size() == 2, "duplicate UUID wrote a pause or successful stop record");
 }
 
+std::uint64_t json_number(const std::string_view line, const std::string_view key) {
+    const auto start = line.find(key);
+    check(start != std::string_view::npos, "journal line did not contain the requested key");
+    const auto value = line.substr(start + key.size());
+    const auto end = value.find_first_not_of("0123456789");
+    check(end != 0, "journal key was not followed by a number");
+    return std::stoull(std::string(value.substr(0, end)));
+}
+
+void test_counter_anchored_stop_is_lifted_onto_the_last_written_record() {
+    // Recording 51afb549-4b74-4116-9a92-f9cd2d7b79a8 of 2026-08-03. Its final
+    // calibration sample carried the raw video clock at 10'349'999'586 ns with
+    // counter 604, while the counter still trailed that clock by two frames.
+    // The stop followed four milliseconds later at counter 605, so the adapter
+    // anchored it on 10'333'333'322 ns - one frame ahead of the counter but
+    // 16.67 ms behind its own predecessor. The former writer gate rejected it
+    // and the run ended without any stop record at all.
+    auto state = std::make_shared<SinkState>();
+    JournalProducer producer(options_for(state));
+    check(producer.start_recording(start_request()) == ProducerResult::producer_ok, "start failed");
+    auto started = start_event();
+    started.clock = ClockSnapshot{266'666'656, 1, false};
+    check(producer.submit(std::move(started)) == CallbackResult::accepted,
+          "recording_started rejected");
+    check(producer.submit(CalibrationSnapshot{ClockSnapshot{10'349'999'586, 604, false}}) ==
+              CallbackResult::accepted,
+          "final calibration sample rejected");
+    check(producer.normal_stop(RecordingStop{
+              ClockSnapshot{10'333'333'322, 605, false}, std::string(recording_path)}) ==
+              ProducerResult::producer_ok,
+          "backwards-anchored stop was refused by normal_stop");
+    check(producer.shutdown() == ProducerResult::producer_ok,
+          "backwards-anchored stop did not shut down cleanly");
+    check(producer.state() == ProducerState::closed, "producer did not close after a lifted stop");
+
+    std::lock_guard lock(state->mutex);
+    check(state->lines.size() == 4, "lifted stop journal line count differs");
+    const auto& stop_line = state->lines.back();
+    check(stop_line.find("\"record_type\":\"stop\"") != std::string::npos,
+          "no stop record was written for a backwards-anchored stop");
+    check(json_number(stop_line, "\"monotonic_ns\":") == 10'349'999'586ULL,
+          "stop timestamp was not lifted onto the last written record");
+    check(json_number(stop_line, "\"output_frame_count\":") == 605ULL,
+          "the timestamp correction altered the stop counter");
+}
+
+void test_large_counter_backlog_stop_is_written_without_correction() {
+    // Recording ff2618be-a9c1-4260-81ea-c0e08b630ff4 of 2026-08-07 with its
+    // measured values: recording_started at 283'333'322 ns / counter 1, final
+    // calibration sample at 1'036'849'958'526 ns / counter 62149, stop counter
+    // 62234 as reported by OBS. The counter anchor puts the stop at
+    // 1'037'499'999'988 ns, 0.65 s past its predecessor, so the correction must
+    // not touch it - the 46-frame backlog is visible in the journal, not hidden.
+    auto state = std::make_shared<SinkState>();
+    JournalProducer producer(options_for(state));
+    check(producer.start_recording(start_request()) == ProducerResult::producer_ok, "start failed");
+    auto started = start_event();
+    started.clock = ClockSnapshot{283'333'322, 1, false};
+    check(producer.submit(std::move(started)) == CallbackResult::accepted,
+          "backlog recording_started rejected");
+    check(producer.submit(CalibrationSnapshot{
+              ClockSnapshot{1'036'849'958'526, 62'149, false}}) == CallbackResult::accepted,
+          "backlog calibration sample rejected");
+    check(producer.normal_stop(RecordingStop{
+              ClockSnapshot{1'037'499'999'988, 62'234, false}, std::string(recording_path)}) ==
+              ProducerResult::producer_ok,
+          "large-backlog stop was refused by normal_stop");
+    check(producer.shutdown() == ProducerResult::producer_ok,
+          "large-backlog stop did not shut down cleanly");
+
+    std::lock_guard lock(state->mutex);
+    const auto& stop_line = state->lines.back();
+    check(stop_line.find("\"record_type\":\"stop\"") != std::string::npos,
+          "no stop record was written for a large counter backlog");
+    check(json_number(stop_line, "\"monotonic_ns\":") == 1'037'499'999'988ULL,
+          "a forward stop timestamp was altered by the correction");
+    check(json_number(stop_line, "\"output_frame_count\":") == 62'234ULL,
+          "large-backlog stop did not keep its counter");
+}
+
+void test_stop_timestamp_is_monotone_against_every_predecessor() {
+    // The correction may only ever move a stop timestamp forward onto its
+    // predecessor. A counter regression stays a hard integrity failure, so the
+    // stop must be refused rather than repaired.
+    struct Case final {
+        const char* name;
+        ClockSnapshot stop;
+        bool expect_written;
+    };
+    constexpr std::uint64_t previous_ns = 10'349'999'586;
+    constexpr std::uint64_t previous_counter = 604;
+    const std::vector<Case> cases{
+        {"anchor one frame behind", ClockSnapshot{previous_ns - 16'666'666, 605, false}, true},
+        {"anchor far behind", ClockSnapshot{previous_ns - 766'666'666, 650, false}, true},
+        {"anchor on the predecessor", ClockSnapshot{previous_ns, 605, false}, true},
+        {"anchor ahead", ClockSnapshot{previous_ns + 16'666'666, 605, false}, true},
+        {"counter regression is not repaired",
+         ClockSnapshot{previous_ns - 16'666'666, previous_counter - 1, false},
+         false},
+    };
+    for (const auto& item : cases) {
+        auto state = std::make_shared<SinkState>();
+        JournalProducer producer(options_for(state));
+        check(producer.start_recording(start_request()) == ProducerResult::producer_ok,
+              "monotone-stop start failed");
+        auto started = start_event();
+        started.clock = ClockSnapshot{266'666'656, 1, false};
+        check(producer.submit(std::move(started)) == CallbackResult::accepted,
+              "monotone-stop recording_started rejected");
+        check(producer.submit(CalibrationSnapshot{
+                  ClockSnapshot{previous_ns, previous_counter, false}}) == CallbackResult::accepted,
+              "monotone-stop calibration rejected");
+        check(producer.normal_stop(RecordingStop{item.stop, std::string(recording_path)}) ==
+                  ProducerResult::producer_ok,
+              "monotone-stop request was refused before the writer");
+        const auto shutdown = producer.shutdown();
+        std::lock_guard lock(state->mutex);
+        const bool written =
+            state->lines.back().find("\"record_type\":\"stop\"") != std::string::npos;
+        check(written == item.expect_written, item.name);
+        if (!written) {
+            check(shutdown == ProducerResult::producer_internal_error,
+                  "a refused stop did not leave the run unfinalizable");
+            continue;
+        }
+        check(shutdown == ProducerResult::producer_ok, "a written stop did not shut down cleanly");
+        check(json_number(state->lines.back(), "\"monotonic_ns\":") >= previous_ns,
+              "a written stop was not monotone against its predecessor");
+        check(json_number(state->lines.back(), "\"output_frame_count\":") ==
+                  item.stop.output_frame_count,
+              "a written stop did not keep its counter");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -698,6 +832,12 @@ int main() {
         {"pause-resume/queue-overflow-drain",
          test_queue_overflow_with_accepted_pause_resume_drains_without_stop},
         {"pause-resume/duplicate-event-id", test_pause_resume_event_ids_cannot_reuse_an_existing_event_id},
+        {"stop/counter-anchor-lifted-onto-predecessor",
+         test_counter_anchored_stop_is_lifted_onto_the_last_written_record},
+        {"stop/large-counter-backlog-written-unchanged",
+         test_large_counter_backlog_stop_is_written_without_correction},
+        {"stop/timestamp-monotone-against-predecessor",
+         test_stop_timestamp_is_monotone_against_every_predecessor},
     };
     int failures = 0;
     for (const auto& [name, test] : tests) {

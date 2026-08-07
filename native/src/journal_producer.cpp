@@ -618,6 +618,23 @@ void writer_main(const std::shared_ptr<JournalProducer::Shared>& shared) noexcep
             }
             continue;
         }
+        // The adapter anchors an unpaused stop on the output frame counter, so
+        // its timestamp can land just before the last written record whenever
+        // that record was sampled while the counter still trailed the video
+        // clock. Lifting the stop onto the predecessor keeps the journal
+        // monotone. This is the only place that knows the last written clock,
+        // which is why the correction lives here and not in the adapter.
+        //
+        // The correction only ever adjusts the timestamp of a stop the producer
+        // already accepted: `stop` is read exclusively in the stop_requested
+        // state, which no terminally failed producer can be in, and every other
+        // stop condition below still rejects. A counter regression is a genuine
+        // integrity failure and is deliberately left unclamped.
+        if (stop.has_value() && previous.has_value() &&
+            stop->clock.monotonic_ns < previous->monotonic_ns &&
+            stop->clock.output_frame_count >= previous->output_frame_count) {
+            stop->clock.monotonic_ns = previous->monotonic_ns;
+        }
         if (!stop.has_value() || stop->clock.recording_paused != paused ||
             !clock_valid(stop->clock, previous, !paused) ||
             stop->recording_path_utf8 != shared->start.recording_path_utf8) {

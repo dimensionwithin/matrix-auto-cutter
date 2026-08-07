@@ -1620,6 +1620,78 @@ void test_active_stop_retains_counter_quantized_qpc() {
           "active stop used callback latency instead of the output counter anchor");
 }
 
+// Recording ff2618be-a9c1-4260-81ea-c0e08b630ff4 of 2026-08-07 mirrored onto
+// the fake host. OBS lost 42 frames at one scene change, so at the stop the
+// output counter trailed the video clock by 46 frames - 766 ms. A former
+// 8-frame bound rejected that stop and the run ended without a stop record at
+// all. The backlog is a finding about the recording, not a reason to discard an
+// otherwise valid stop.
+void test_large_counter_backlog_does_not_reject_the_stop() {
+    TempRoot root;
+    auto producer = std::make_shared<ProducerState>();
+    FakeFactory factory(producer);
+    FakeHost host;
+    ObsJournalAdapter adapter(host, factory, test_options(root.path));
+    check(adapter.load(), "counter-backlog load failed");
+    start_output(host, adapter, producer);
+    host.set_signal(recording_path, 10'299'999'988ULL, 8);
+    host.fire_tick();
+    wait_for_producer_count(producer, [](const auto& value) { return value.events == 1; },
+                            "counter-backlog recording_started was not anchored");
+    host.set_signal(recording_path, 1'046'849'958'526ULL, 62'156);
+    host.fire_tick();
+    wait_for_producer_count(producer, [](const auto& value) { return value.calibrations == 1; },
+                            "counter-backlog calibration was not accepted");
+    host.set_signal(recording_path, 1'048'266'666'654ULL, 62'241);
+    host.fire_output(OutputEvent::stopped, 0);
+    wait_for([&] { return adapter.state() == AdapterState::idle; },
+             "a 46-frame counter backlog rejected the stop");
+    std::lock_guard lock(producer->mutex);
+    check(producer->stops == 1, "no stop was authorized for a large counter backlog");
+    check(producer->stop.clock.output_frame_count == 62'241ULL,
+          "large-backlog stop did not keep the observed counter");
+    check(producer->stop.clock.monotonic_ns == 1'037'499'999'988ULL,
+          "large-backlog stop was not anchored on the output counter");
+    check(producer->stop.clock.monotonic_ns > 1'036'849'958'526ULL,
+          "large-backlog stop was not monotone against its calibration sample");
+}
+
+// The seam between adapter and producer, mirrored from recording
+// 51afb549-4b74-4116-9a92-f9cd2d7b79a8 of 2026-08-03. The adapter deliberately
+// emits the counter anchor even when it points behind the last submitted
+// record; only the producer writer knows the last *written* clock, so the
+// monotonicity correction lives there. Anyone tempted to clamp here instead
+// should read journal_producer.cpp first.
+void test_counter_anchored_stop_may_point_behind_the_last_sample() {
+    TempRoot root;
+    auto producer = std::make_shared<ProducerState>();
+    FakeFactory factory(producer);
+    FakeHost host;
+    ObsJournalAdapter adapter(host, factory, test_options(root.path));
+    check(adapter.load(), "backwards-anchor load failed");
+    start_output(host, adapter, producer);
+    host.set_signal(recording_path, 10'283'333'322ULL, 8);
+    host.fire_tick();
+    wait_for_producer_count(producer, [](const auto& value) { return value.events == 1; },
+                            "backwards-anchor recording_started was not anchored");
+    host.set_signal(recording_path, 20'349'999'586ULL, 611);
+    host.fire_tick();
+    wait_for_producer_count(producer, [](const auto& value) { return value.calibrations == 1; },
+                            "backwards-anchor calibration was not accepted");
+    host.set_signal(recording_path, 20'366'666'252ULL, 612);
+    host.fire_output(OutputEvent::stopped, 0);
+    wait_for([&] { return adapter.state() == AdapterState::idle; },
+             "backwards-anchored stop was not authorized");
+    std::lock_guard lock(producer->mutex);
+    check(producer->stops == 1, "no stop was authorized for a backwards-pointing anchor");
+    check(producer->stop.clock.monotonic_ns == 10'333'333'322ULL,
+          "adapter did not emit the raw counter anchor");
+    // 10'349'999'586 is the calibration sample submitted above, relative to the
+    // output start. The anchor lands one frame - 16.67 ms - behind it.
+    check(producer->stop.clock.monotonic_ns < 10'349'999'586ULL,
+          "the 51afb549 seam no longer reproduces a backwards anchor");
+}
+
 void test_control_fifo_overflow_is_fail_closed() {
     TempRoot root;
     auto producer = std::make_shared<ProducerState>();
@@ -2023,6 +2095,9 @@ int main() {
         {"draining-callback-failure-wins-over-stop",
          test_failure_from_a_draining_callback_wins_over_stop_authorization},
         {"active-stop/counter-quantized-qpc", test_active_stop_retains_counter_quantized_qpc},
+        {"active-stop/large-counter-backlog", test_large_counter_backlog_does_not_reject_the_stop},
+        {"active-stop/anchor-behind-last-sample",
+         test_counter_anchored_stop_may_point_behind_the_last_sample},
         {"control-fifo-overflow/fail-closed", test_control_fifo_overflow_is_fail_closed},
         {"stop-wins-over-blocked-pause-resume",
          test_stop_wins_over_blocked_pause_and_resume_callbacks},
