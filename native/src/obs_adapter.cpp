@@ -88,6 +88,20 @@ bool direct_mp4_signal(const RecordingSignal& signal) noexcept {
            !signal.fragmented_mp4;
 }
 
+const char* adapter_state_text(const AdapterState value) noexcept {
+    switch (value) {
+        case AdapterState::unloaded: return "unloaded";
+        case AdapterState::idle: return "idle";
+        case AdapterState::start_pending: return "start_pending";
+        case AdapterState::active: return "active";
+        case AdapterState::paused: return "paused";
+        case AdapterState::stopping: return "stopping";
+        case AdapterState::failed: return "failed";
+        case AdapterState::unloading: return "unloading";
+    }
+    return "unknown";
+}
+
 std::string producer_status_text(const ProducerStatus& status) {
     return std::string("state=") + to_string(status.state) +
            " result=" + to_string(status.result) +
@@ -793,6 +807,16 @@ void ObsJournalAdapter::on_output(const OutputEvent event, const int code) noexc
     if (locked_state == AdapterState::idle || locked_state == AdapterState::stopping ||
         locked_state == AdapterState::failed || locked_state == AdapterState::unloading ||
         locked_state == AdapterState::unloaded) {
+        // Dropping the stop here is intended: the run has already left the
+        // states that can authorize one, so a second or late stop signal must
+        // not queue another command. It is not a failure and stays out of the
+        // journal, but it used to leave no trace at all, which made a missing
+        // stop record indistinguishable from a stop that never arrived.
+        lock.unlock();
+        host_.log(
+            LogLevel::warning,
+            std::string("actual output stop ignored: adapter is already in state ") +
+                adapter_state_text(locked_state));
         return;
     }
     if (control_size_ == control_command_capacity) {
@@ -1330,13 +1354,29 @@ void ObsJournalAdapter::process_stop(const ControlCommand& command) noexcept {
 
         ProducerResult stop_result = ProducerResult::producer_internal_error;
         std::optional<RecordingStop> stop_request;
-        if (producer_ && command.captured && command.code == 0 &&
-            recording_started_accepted_.load(std::memory_order_acquire)) {
+        // Every reason that can withhold a stop record names itself here. The
+        // journal stays silent either way, but the diagnostic channel must not
+        // collapse seven distinct causes into one sentence.
+        std::string_view stop_rejection;
+        if (!producer_) {
+            stop_rejection = "no producer was running for this output stop";
+        } else if (!command.captured) {
+            stop_rejection = "the output stop callback could not capture path and clock";
+        } else if (command.code != 0) {
+            stop_rejection = "OBS reported a non-zero output stop result code";
+        } else if (!recording_started_accepted_.load(std::memory_order_acquire)) {
+            stop_rejection = "recording_started was never journaled for this run";
+        } else {
             RecordingSignal signal = command.signal;
             const auto origin = origin_ns_.load(std::memory_order_acquire);
             const bool paused = command.recording_paused;
-            bool valid = signal.absolute_monotonic_ns >= origin &&
-                         signal.path.view() == recording_path_;
+            bool valid = signal.absolute_monotonic_ns >= origin;
+            if (!valid) {
+                stop_rejection = "the captured stop clock preceded the output start epoch";
+            } else if (signal.path.view() != recording_path_) {
+                valid = false;
+                stop_rejection = "the stop path differed from the path the run started with";
+            }
             // The stop callback reads the output counter some whole number of
             // frames behind the video clock, because OBS 32.1.2 increments
             // total_frames only when encoded packets leave its A/V interleaver.
@@ -1358,11 +1398,17 @@ void ObsJournalAdapter::process_stop(const ControlCommand& command) noexcept {
                                               ? frame_span_ns(signal.output_frame_count - started_frames)
                                               : std::nullopt;
                 valid = counter_span.has_value() && started_ns <= UINT64_MAX - *counter_span;
-                if (valid) {
+                if (!valid) {
+                    stop_rejection =
+                        "the stop counter fell below the recording_started counter or overflowed";
+                } else {
                     const auto final_frame_ns = started_ns + *counter_span;
                     valid = final_frame_ns >= origin;
                     if (valid) {
                         signal.absolute_monotonic_ns = final_frame_ns;
+                    } else {
+                        stop_rejection =
+                            "the counter-anchored stop clock preceded the output start epoch";
                     }
                 }
             }
@@ -1428,9 +1474,15 @@ void ObsJournalAdapter::process_stop(const ControlCommand& command) noexcept {
         } else {
             state_.store(AdapterState::failed, std::memory_order_release);
             host_.log(LogLevel::error, to_string(report_result));
+            if (stop_rejection.empty()) {
+                stop_rejection = stop_result != ProducerResult::producer_ok
+                                     ? "the producer refused the authorized stop record"
+                                     : "the producer did not shut down with a stable journal";
+            }
             host_.log(
                 LogLevel::error,
-                "output stop was absent/failed/invalid; no finalizable stop record authorized");
+                std::string("no finalizable stop record authorized: ") +
+                    std::string(stop_rejection));
         }
     } catch (...) {
         force_cleanup(ProducerResult::producer_internal_error, "stop processing threw");
