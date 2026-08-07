@@ -22,7 +22,6 @@ import matrix_auto_cutter.journal as journal_module
 import matrix_auto_cutter.models as models_module
 from conftest import START_ID, event, sidecar_dict, soft_protection
 from matrix_auto_cutter.atomic import ProtectionRangesDocument, write_protection_ranges
-from matrix_auto_cutter.calibration import calculate_drift_ppm, subtract_paused_ns
 from matrix_auto_cutter.clock_bounds import MAX_DRIFT_PPM
 from matrix_auto_cutter.errors import ErrorCode
 from matrix_auto_cutter.journal import JournalEvent, JournalHeader, validate_journal
@@ -30,7 +29,6 @@ from matrix_auto_cutter.models import (
     CanonicalModel,
     ClockCalibration,
     Lifecycle,
-    PauseMeasurement,
     ProtectionLevel,
     SourceIdentity,
     _canonical_json_value,
@@ -119,16 +117,6 @@ def test_invalid_counter_span_and_unmappable_qpc_are_clock_failures() -> None:
     assert ErrorCode.SIDECAR_CLOCK_UNRELIABLE in _clock_codes(fallback)
 
 
-def _set_stop_qpc_and_declared_drift(raw: dict[str, Any], stop_ns: int) -> None:
-    raw["events"][-1]["clock_sample"]["monotonic_ns"] = stop_ns
-    pauses = tuple(
-        PauseMeasurement(start_ns=item["pause_monotonic_ns"], end_ns=item["end_monotonic_ns"])
-        for item in raw["pause_intervals"]
-    )
-    active_ns = subtract_paused_ns(0, stop_ns, pauses)
-    raw["clock"]["drift_ppm"] = float(calculate_drift_ppm(active_ns, 600))
-
-
 def _add_valid_resume_pause(raw: dict[str, Any], start_ns: int, end_ns: int) -> None:
     pause_id = str(uuid4())
     resume_id = str(uuid4())
@@ -150,72 +138,49 @@ def _add_valid_resume_pause(raw: dict[str, Any], start_ns: int, end_ns: int) -> 
     ]
 
 
-def test_consumer_recomputes_actual_qpc_drift() -> None:
-    invalid = sidecar_dict()
-    invalid["events"][-1]["clock_sample"]["monotonic_ns"] = 100_000_000_000
-    invalid["clock"]["drift_ppm"] = 0
-    assert ErrorCode.SIDECAR_CLOCK_UNRELIABLE in _clock_codes(invalid)
+def test_consumer_accepts_a_declared_drift_it_cannot_recompute() -> None:
+    """`drift_ppm` ist eine deklarierte Kennzahl; der Verbraucher prüft nur den Bereich.
 
-    valid = sidecar_dict()
-    _set_stop_qpc_and_declared_drift(valid, 10_000_000_000)
-    assert validate_sidecar(valid, _expected_source(valid)).mode == "validated_sidecar_1_1"
+    Die Steigung über die Kalibrierreihe ist aus dem Sidecar nicht nachrechenbar,
+    weil das Sidecar nur `calibration_sample_count` trägt, nicht die Reihe. Die
+    frühere Nachrechnung aus Start- und Stop-Event maß nicht die Uhr, sondern den
+    Interleaver-Rückstand im Moment des Stops: Aufnahme 89c344e6 vom 07.08.2026
+    scheiterte daran mit 1257 ppm, obwohl die Uhr über 411 s exakt lief.
+    Behandelt wird `drift_ppm` damit wie `max_calibration_residual_ms`, das seit
+    jeher deklariert und nie nachgerechnet wird.
+    """
+    raw = sidecar_dict()
+    raw["events"][-1]["clock_sample"]["monotonic_ns"] = 100_000_000_000
+    raw["clock"]["drift_ppm"] = 0
+    assert validate_sidecar(raw, _expected_source(raw)).mode == "validated_sidecar_1_1"
+
+    out_of_range = sidecar_dict()
+    out_of_range["clock"]["drift_ppm"] = float(MAX_DRIFT_PPM) + 0.0001
+    assert validate_sidecar(out_of_range, _expected_source(out_of_range)).mode != (
+        "validated_sidecar_1_1"
+    )
 
 
-def test_consumer_recomputes_drift_with_pause_exactly_once() -> None:
+def test_pause_interval_survives_validation_and_json_roundtrip() -> None:
     valid = sidecar_dict()
     _add_valid_resume_pause(valid, 5_000_000_000, 7_000_000_000)
-    _set_stop_qpc_and_declared_drift(valid, 12_000_000_000)
+    valid["events"][-1]["clock_sample"]["monotonic_ns"] = 12_000_000_000
     validated = validate_sidecar(valid, _expected_source(valid))
     assert validated.mode == "validated_sidecar_1_1"
     assert validated.sidecar is not None
+    assert len(validated.sidecar.pause_intervals) == 1
     roundtrip_payload = json.loads(validated.sidecar.model_dump_json())
     assert (
         validate_sidecar(roundtrip_payload, _expected_source(roundtrip_payload)).mode
         == "validated_sidecar_1_1"
     )
 
-    declared_without_pause = sidecar_dict()
-    _add_valid_resume_pause(declared_without_pause, 5_000_000_000, 5_005_000_000)
-    declared_without_pause["events"][-1]["clock_sample"]["monotonic_ns"] = 10_005_000_000
-    declared_without_pause["clock"]["drift_ppm"] = float(calculate_drift_ppm(10_005_000_000, 600))
-    assert ErrorCode.SIDECAR_CLOCK_UNRELIABLE in _clock_codes(declared_without_pause)
 
-
-def test_declared_drift_must_match_recomputed_value() -> None:
+def test_overlapping_pause_intervals_stay_rejected() -> None:
     raw = sidecar_dict()
-    _set_stop_qpc_and_declared_drift(raw, 10_000_000_000)
-    raw["clock"]["drift_ppm"] = 0.0011
-    assert ErrorCode.SIDECAR_CLOCK_UNRELIABLE in _clock_codes(raw)
-
-    raw["clock"]["drift_ppm"] = 0.001
-    assert validate_sidecar(raw, _expected_source(raw)).mode == "validated_sidecar_1_1"
-
-
-_DRIFT_BOUNDARY_SPAN = 600
-_DRIFT_BOUNDARY_EXPECTED_NS = 10_000_000_000  # exact QPC time for 600 frames at 60 fps
-
-
-def _stop_ns_at_drift_ppm(ppm: Decimal) -> int:
-    """QPC stop time whose recomputed drift over ``_DRIFT_BOUNDARY_SPAN`` is exactly ``ppm``."""
-    return _DRIFT_BOUNDARY_EXPECTED_NS + int(ppm) * _DRIFT_BOUNDARY_EXPECTED_NS // 1_000_000
-
-
-@pytest.mark.parametrize(
-    ("stop_ns", "valid"),
-    [
-        (_stop_ns_at_drift_ppm(MAX_DRIFT_PPM), True),
-        (_stop_ns_at_drift_ppm(MAX_DRIFT_PPM) + 1, False),
-    ],
-)
-def test_recomputed_drift_max_ppm_boundary(stop_ns: int, valid: bool) -> None:
-    raw = sidecar_dict()
-    raw["events"][-1]["clock_sample"]["monotonic_ns"] = stop_ns
-    actual = calculate_drift_ppm(stop_ns, _DRIFT_BOUNDARY_SPAN)
-    raw["clock"]["drift_ppm"] = float(min(actual, MAX_DRIFT_PPM))
-    result = validate_sidecar(raw, _expected_source(raw))
-    assert (result.mode == "validated_sidecar_1_1") is valid
-    if not valid:
-        assert ErrorCode.SIDECAR_CLOCK_UNRELIABLE in {reason.code for reason in result.reasons}
+    _add_valid_resume_pause(raw, 5_000_000_000, 7_000_000_000)
+    raw["pause_intervals"].append(dict(raw["pause_intervals"][0]))
+    assert _clock_codes(raw)
 
 
 def test_stop_while_paused_and_nonpositive_active_qpc_duration() -> None:
@@ -258,9 +223,13 @@ def test_counter_cross_field_identity_property(counter: int) -> None:
     st.booleans(),
     st.integers(min_value=0, max_value=2_000_000_000),
 )
-def test_joint_qpc_counter_pause_and_declared_drift_property(
+def test_joint_qpc_counter_and_pause_property(
     seconds: int, drift_ppm: int, slower_qpc: bool, pause_ns: int
 ) -> None:
+    # `drift_ppm` steuert hier nur noch, wie weit QPC und Counter auseinander
+    # gelegt werden. Die Zahl selbst wird vom Verbraucher nicht mehr
+    # nachgerechnet; geprüft bleiben Counterspanne, Dauer, Pausenabzug und die
+    # QPC-Reichweite der Events.
     raw = sidecar_dict()
     frames = seconds * 60
     expected_active_ns = seconds * 1_000_000_000
@@ -272,7 +241,7 @@ def test_joint_qpc_counter_pause_and_declared_drift_property(
     raw["events"][-1]["mapped_source_frame"] = frames
     raw["events"][-1]["clock_sample"]["output_frame_count"] = frames
     raw["events"][-1]["clock_sample"]["monotonic_ns"] = active_ns + pause_ns
-    raw["clock"]["drift_ppm"] = float(calculate_drift_ppm(active_ns, frames))
+    raw["clock"]["drift_ppm"] = 0
     if pause_ns:
         pause_id = str(uuid4())
         resume_id = str(uuid4())
@@ -1526,26 +1495,25 @@ def _precise_drift_sidecar(declared: Decimal) -> ObsEventSidecar:
 
 
 @pytest.mark.parametrize(
-    ("declared", "valid"),
+    "declared",
     [
-        (Decimal("0.0009999999999999999999999"), True),
-        (Decimal("0.001"), True),
-        (Decimal("0.0010000000000000000000001"), False),
+        Decimal("0.0009999999999999999999999"),
+        Decimal("0.001"),
+        Decimal("0.0010000000000000000000001"),
     ],
 )
-def test_precise_drift_semantics_survive_json_roundtrip(declared: Decimal, valid: bool) -> None:
+def test_precise_drift_semantics_survive_json_roundtrip(declared: Decimal) -> None:
+    # Die Zahl wird nicht mehr nachgerechnet, ihre Dezimalstellen müssen den
+    # JSON-Weg aber unverändert überstehen: sie ist die einzige Aussage über die
+    # Uhrensteigung, die das Sidecar transportiert.
     before = _precise_drift_sidecar(declared)
     after = ObsEventSidecar.model_validate_json(before.model_dump_json())
-    assert (not _clock_errors(before)) is valid
-    assert (not _clock_errors(after)) is valid
+    assert not _clock_errors(before)
+    assert not _clock_errors(after)
     assert after.clock.drift_ppm == declared
     public_payload = json.loads(after.model_dump_json(), parse_float=Decimal)
     public_result = validate_sidecar(public_payload, _expected_source(public_payload))
-    assert (public_result.mode == "validated_sidecar_1_1") is valid
-    if not valid:
-        assert ErrorCode.SIDECAR_CLOCK_UNRELIABLE in {
-            reason.code for reason in public_result.reasons
-        }
+    assert public_result.mode == "validated_sidecar_1_1"
 
 
 def test_decimal_gate_and_invalid_numeric_inputs_remain_strict() -> None:

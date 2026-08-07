@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Mapping
-from decimal import Decimal
 from typing import Annotated, Literal, Self
 from uuid import UUID
 
@@ -21,11 +20,9 @@ from pydantic import (
 
 from matrix_auto_cutter.calibration import (
     affine_counter_frame,
-    calculate_drift_ppm,
     map_qpc_frame,
     subtract_paused_ns,
 )
-from matrix_auto_cutter.clock_bounds import MAX_DRIFT_PPM
 from matrix_auto_cutter.errors import CoreError, ErrorCode, core_error
 from matrix_auto_cutter.models import (
     CalibrationSample,
@@ -286,7 +283,6 @@ _PAIR_TYPES = {
     "stinger_started": ("stinger", "start"),
     "stinger_ended": ("stinger", "end"),
 }
-_DRIFT_MATCH_TOLERANCE_PPM = Decimal("0.001")
 
 
 def _pair_structure_failures(events: tuple[SidecarEvent, ...]) -> list[str]:
@@ -361,16 +357,27 @@ def _clock_errors(sidecar: ValidatedObsEventSidecar) -> list[CoreError]:
     qpc_start = starts[0].clock_sample.monotonic_ns if len(starts) == 1 else None
     qpc_end = stops[0].clock_sample.monotonic_ns if len(stops) == 1 else None
     if qpc_start is not None and qpc_end is not None:
+        # `drift_ppm` ist eine deklarierte Kennzahl, keine nachrechenbare.
+        # Sie ist die Steigung über die Kalibrierreihe, und diese Reihe steht
+        # nicht im Sidecar — getragen wird nur `calibration_sample_count`.
+        # Der Verbraucher prüft daher nur den Wertebereich, den das Feld
+        # ClockCalibration.drift_ppm ohnehin erzwingt. Genauso wird
+        # `max_calibration_residual_ms` seit jeher behandelt.
+        #
+        # Die frühere Nachrechnung aus Start- und Stop-Event war die einzige
+        # prüfbare Formel, aber sie maß nicht die Uhr: sie maß den
+        # Interleaver-Rückstand im Moment des Stops, normiert auf die
+        # Lauflänge. Aufnahme 89c344e6 vom 07.08.2026 scheiterte daran mit
+        # 1257 ppm, obwohl die Uhr über 411 s exakt lief.
+        #
+        # Geprüft bleibt, dass überhaupt aktive Zeit zwischen Start und Stop
+        # liegt. Das ist eine Aussage über den Lauf, keine über die Uhr, und
+        # war bisher nur ein Nebeneffekt der Driftformel.
         try:
-            active_elapsed_ns = subtract_paused_ns(qpc_start, qpc_end, pauses)
-            actual_drift_ppm = calculate_drift_ppm(active_elapsed_ns, span)
+            if subtract_paused_ns(qpc_start, qpc_end, pauses) <= 0:
+                failures.append("invalid_active_qpc_duration")
         except ValueError:
             failures.append("invalid_active_qpc_duration")
-        else:
-            if actual_drift_ppm > MAX_DRIFT_PPM:
-                failures.append("actual_drift_ppm")
-            if abs(clock.drift_ppm - actual_drift_ppm) > _DRIFT_MATCH_TOLERANCE_PPM:
-                failures.append("declared_drift_mismatch")
     for event in sidecar.events:
         sample = event.clock_sample
         if event.type == "manual_protection" and sample.output_frame_count is None:

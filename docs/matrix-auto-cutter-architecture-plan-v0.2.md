@@ -157,7 +157,7 @@ Ein Sidecar ist nur nutzbar, wenn:
 - `c1 > c0` und `abs((c1 - c0) - N) <= 6` Frames;
 - aktive Kalibrierungsproben höchstens fünf Sekunden auseinanderliegen;
 - die maximale Kalibrierungsabweichung höchstens 50 ms beträgt;
-- die QPC-vs-Counter-Drift nach Abzug der Pausen höchstens 1000 ppm beträgt (Vermerk 07.08.2026: angehoben von 500 ppm, Warnschwelle weiterhin bei 500 ppm; verbindliche Quelle `src\matrix_auto_cutter\clock_bounds.py`);
+- die QPC-vs-Counter-Drift nach Abzug der Pausen höchstens 1000 ppm beträgt, sofern sie überhaupt messbar ist (Vermerk 07.08.2026: angehoben von 500 ppm, Warnschwelle weiterhin bei 500 ppm; verbindliche Quelle `src\matrix_auto_cutter\clock_bounds.py`). Drift ist die *Steigung* des Counterrückstands über die Kalibrierprobenreihe, geschätzt als Theil-Sen-Median aller paarweisen Steigungen, und nicht mehr der Quotient aus Start- und Stopzeitstempel. Der Framecounter ist ganzzahlig; unterhalb von `1e15 / (60 · Schranke)` Nanosekunden aktiver Aufnahme ist ein einzelner Frame Quantisierung größer als die Schranke selbst. Dort ist Drift nicht entscheidbar, wird als nicht messbar ausgewiesen und gatet nicht — bei den geltenden Grenzen unterhalb von 16,7 s für die Ablehnung und 33,3 s für die Warnung;
 - kein schutzrelevantes Event mehr als 250 ms ausgewiesene Unsicherheit besitzt;
 - jeder manuelle Marker einen Framecounterwert besitzt;
 - die finale Dauer zur Counterspanne innerhalb sechs Frames passt.
@@ -286,7 +286,9 @@ Auf Disk sind dies einzelne NDJSON-Zeilen ohne Arrayklammern. Die Arraydarstellu
 
 ### 8.3 Kanonisches Sidecar-JSON-Schema 1.1
 
-*Vermerk (07.08.2026): Die Obergrenze für `drift_ppm` wurde von 500 auf 1000 ppm angehoben, mit einer Warnschwelle bei 500 ppm. Verbindliche Quelle ist `src\matrix_auto_cutter\clock_bounds.py`.*
+*Vermerk (07.08.2026): Die Obergrenze für `drift_ppm` wurde von 500 auf 1000 ppm angehoben, mit einer Warnschwelle bei 500 ppm. Verbindliche Quelle ist `src\matrix_auto_cutter\clock_bounds.py`. Der Wertebereich `[0, 1000]` im Schema bleibt davon unberührt.*
+
+*Vermerk (07.08.2026, abends): `drift_ppm` ist eine deklarierte Kennzahl, keine nachrechenbare. Sie ist die Steigung über die Kalibrierprobenreihe, und diese Reihe steht nicht im Sidecar — getragen wird nur `calibration_sample_count`. Der Verbraucher prüft daher, wie bei `max_calibration_residual_ms` seit jeher, nur den Wertebereich. Die frühere Nachrechnung aus Start- und Stopevent war zwar prüfbar, maß aber nicht die Uhr, sondern den A/V-Interleaver-Rückstand im Moment des Stops, normiert auf die Lauflänge; Aufnahme `89c344e6-df8a-45fe-88ee-1a3910f55bf9` scheiterte daran mit 1257 ppm, obwohl der Counter über 411 s exakt 60,000 fps hielt. Punktueller Frameverlust ist kein Driftfall: er wird absolut in Frames samt Zeitpunkt nach `finalization.warnings` gemeldet und lässt den Lauf nicht scheitern.*
 
 ```json
 {

@@ -319,16 +319,22 @@ def test_builder_phase1_and_protection_postvalidation_failures(fake_port, monkey
 
 
 def test_clock_failures_and_pause_pairing(monkeypatch, caplog) -> None:
-    samples = (
-        CalibrationSample(monotonic_ns=0, output_frame_count=0),
-        CalibrationSample(monotonic_ns=1_000_000_000, output_frame_count=60),
+    # 40 s aktive Aufnahme: lang genug, dass sowohl die Ablehnungs- als auch die
+    # Warnschranke auflösbar sind (16,7 s bzw. 33,3 s, abgeleitet aus
+    # clock_bounds). Kürzere Reihen werden weiter unten eigens geprüft.
+    samples = tuple(
+        CalibrationSample(monotonic_ns=index * 2_000_000_000, output_frame_count=index * 120)
+        for index in range(21)
     )
-    assert isinstance(_clock_values(samples, (), 0, 60, 60), tuple)
+    frames = 20 * 120
+    assert isinstance(_clock_values(samples, samples, (), 0, frames, frames), tuple)
     monkeypatch.setattr(
         "matrix_auto_cutter.phase2.finalizer.sidecar_builder.sample_gaps_valid",
         lambda *args: False,
     )
-    assert isinstance(_clock_values(samples, (), 0, 60, 60), FinalizerFailure)
+    assert isinstance(
+        _clock_values(samples, samples, (), 0, frames, frames), FinalizerFailure
+    )
     monkeypatch.setattr(
         "matrix_auto_cutter.phase2.finalizer.sidecar_builder.sample_gaps_valid",
         lambda *args: True,
@@ -338,12 +344,12 @@ def test_clock_failures_and_pause_pairing(monkeypatch, caplog) -> None:
     # crossing is logged so a run in that band never passes unnoticed.
     above_warning_ppm = DRIFT_WARNING_PPM + 1
     monkeypatch.setattr(
-        "matrix_auto_cutter.phase2.finalizer.sidecar_builder.calculate_drift_ppm",
+        "matrix_auto_cutter.phase2.finalizer.sidecar_builder.estimate_drift_ppm",
         lambda *args: above_warning_ppm,
     )
     with caplog.at_level("WARNING", logger="matrix_auto_cutter.phase2.finalizer.sidecar_builder"):
-        result = _clock_values(samples, (), 0, 60, 60)
-    assert result == (above_warning_ppm, Decimal(0))
+        result = _clock_values(samples, samples, (), 0, frames, frames)
+    assert result == (above_warning_ppm, Decimal(0), ())
     assert len(caplog.records) == 1
     assert str(above_warning_ppm) in caplog.records[0].message
     assert str(DRIFT_WARNING_PPM) in caplog.records[0].message
@@ -352,16 +358,70 @@ def test_clock_failures_and_pause_pairing(monkeypatch, caplog) -> None:
 
     # Above MAX_DRIFT_PPM: still rejected, at the raised boundary.
     monkeypatch.setattr(
-        "matrix_auto_cutter.phase2.finalizer.sidecar_builder.calculate_drift_ppm",
+        "matrix_auto_cutter.phase2.finalizer.sidecar_builder.estimate_drift_ppm",
         lambda *args: MAX_DRIFT_PPM + 1,
     )
-    assert isinstance(_clock_values(samples, (), 0, 60, 60), FinalizerFailure)
+    assert isinstance(
+        _clock_values(samples, samples, (), 0, frames, frames), FinalizerFailure
+    )
 
     monkeypatch.setattr(
         "matrix_auto_cutter.phase2.finalizer.sidecar_builder.map_qpc_frame",
         lambda *args: (_ for _ in ()).throw(ValueError("bad clock")),
     )
-    assert isinstance(_clock_values(samples, (), 0, 60, 60), FinalizerFailure)
+    assert isinstance(
+        _clock_values(samples, samples, (), 0, frames, frames), FinalizerFailure
+    )
+
+
+def test_drift_below_the_measurable_duration_is_never_gated(monkeypatch, caplog) -> None:
+    """Ein Zehnsekundenlauf mit einem Frame Zappeln darf nicht abgelehnt werden.
+
+    Bei zehn Sekunden entspricht ein einzelner Frame Counterquantisierung
+    1667 ppm. Ohne Mindestbeweislage würde ein völlig gesunder kurzer Lauf am
+    1000-ppm-Gate scheitern — genau das ist bei sechs Läufen der Historie der
+    Fall gewesen.
+    """
+    def series(seconds: int) -> tuple[CalibrationSample, ...]:
+        # Ein Frame Rückstand ab der Mitte der Reihe, sonst exakt 60,000 fps.
+        count = seconds // 2 + 1
+        return tuple(
+            CalibrationSample(
+                monotonic_ns=index * 2_000_000_000,
+                output_frame_count=index * 120 - (1 if index >= count // 2 else 0),
+            )
+            for index in range(count)
+        )
+
+    short = series(10)
+    frames = 5 * 120
+    with caplog.at_level("INFO", logger="matrix_auto_cutter.phase2.finalizer.sidecar_builder"):
+        values = _clock_values(short, short, (), 0, frames, frames)
+    assert isinstance(values, tuple)
+    # Der Rohschätzwert läge bei 2083 ppm, also über der Ablehnungsschranke und
+    # sogar außerhalb des zulässigen Wertebereichs des Feldes. Deklariert wird
+    # deshalb null, und der Rohwert steht nur im Log.
+    assert values.drift_ppm == 0
+    assert values.losses == ()
+    assert "not decidable" in caplog.records[-1].message
+    assert "2083" in caplog.records[-1].message
+    caplog.clear()
+
+    # Derselbe eine Frame über 40 s: die längere Basislinie drückt dieselbe
+    # Stufe von 2083 auf 463 ppm, also unter beide Schranken.
+    long_samples = series(40)
+    long_frames = 20 * 120
+    long_values = _clock_values(long_samples, long_samples, (), 0, long_frames, long_frames)
+    assert isinstance(long_values, tuple)
+    assert long_values.drift_ppm < DRIFT_WARNING_PPM
+
+    # Ohne die Mindestbeweislage würde derselbe kurze Lauf abgelehnt. Das Gate
+    # ist also intakt; nur seine Zuständigkeit ist begrenzt.
+    monkeypatch.setattr(
+        "matrix_auto_cutter.phase2.finalizer.sidecar_builder.minimum_measurable_ns",
+        lambda bound: 0,
+    )
+    assert isinstance(_clock_values(short, short, (), 0, frames, frames), FinalizerFailure)
 
     pause = SimpleNamespace(monotonic_ns=1)
     resume = SimpleNamespace(monotonic_ns=2)

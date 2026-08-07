@@ -6,20 +6,26 @@ import json
 import logging
 from decimal import Decimal
 from fractions import Fraction
-from typing import Literal, cast
+from typing import Literal, NamedTuple, cast
 from uuid import UUID
 
 from matrix_auto_cutter.calibration import (
+    FrameLoss,
     affine_counter_frame,
-    calculate_drift_ppm,
     calculate_event_uncertainty_ms,
     calibration_residual_ms,
+    detect_frame_losses,
+    estimate_drift_ppm,
     map_event_to_source_frame,
     map_qpc_frame,
     sample_gaps_valid,
     subtract_paused_ns,
 )
-from matrix_auto_cutter.clock_bounds import DRIFT_WARNING_PPM, MAX_DRIFT_PPM
+from matrix_auto_cutter.clock_bounds import (
+    DRIFT_WARNING_PPM,
+    MAX_DRIFT_PPM,
+    minimum_measurable_ns,
+)
 from matrix_auto_cutter.journal import (
     JournalCalibrationSample,
     JournalEvent,
@@ -178,14 +184,43 @@ def _calibration_samples(
     return tuple(sorted(unique.values(), key=lambda item: item.monotonic_ns))
 
 
+class _ClockValues(NamedTuple):
+    drift_ppm: Decimal
+    residual_ms: Decimal
+    losses: tuple[FrameLoss, ...]
+
+
+def _drift_samples(
+    samples: tuple[CalibrationSample, ...],
+    stop: JournalStop,
+) -> tuple[CalibrationSample, ...]:
+    """Gib die Kalibrierreihe ohne die Stop-Probe zurück.
+
+    Der Adapter verankert den Stop-Zeitstempel auf dem Framecounter, die Probe
+    liegt also per Konstruktion auf der Counterlinie. Sie in die Steigung
+    aufzunehmen wäre zirkulär: sie kann die Schätzung nur in Richtung null
+    ziehen und damit echte Drift verdecken. Bei den kurzen Läufen der Historie
+    verschiebt sie das Ergebnis messbar, etwa von 2754,8 auf 2066,1 ppm.
+    """
+    return tuple(
+        item
+        for item in samples
+        if not (
+            item.monotonic_ns == stop.monotonic_ns
+            and item.output_frame_count == stop.output_frame_count
+        )
+    )
+
+
 def _clock_values(
     samples: tuple[CalibrationSample, ...],
+    drift_series: tuple[CalibrationSample, ...],
     pauses: tuple[PauseMeasurement, ...],
     counter_start: int,
     counter_end: int,
     total_frames: int,
     cancellation: CancellationToken | None = None,
-) -> tuple[Decimal, Decimal] | FinalizerFailure:
+) -> _ClockValues | FinalizerFailure:
     if not sample_gaps_valid(samples, pauses):
         return failure(
             FinalizerErrorCode.JOURNAL_CORRUPT,
@@ -221,7 +256,17 @@ def _clock_values(
             )
         residual = max(residuals, default=Decimal(0))
         active_ns = subtract_paused_ns(samples[0].monotonic_ns, samples[-1].monotonic_ns, pauses)
-        drift = calculate_drift_ppm(active_ns, counter_end - counter_start)
+        measurable = active_ns >= minimum_measurable_ns(MAX_DRIFT_PPM)
+        if len(drift_series) >= 2:
+            measured = estimate_drift_ppm(drift_series, pauses)
+            losses = detect_frame_losses(drift_series, pauses)
+        elif not measurable:
+            # Ein Lauf ohne eigene Kalibrierprobe ist kürzer als ein
+            # Kalibrierintervall und damit weit unterhalb jeder Schranke.
+            measured, losses = Decimal(0), ()
+        else:
+            msg = "Kalibrierreihe fehlt für einen Lauf oberhalb der Driftschranke."
+            raise ValueError(msg)
     except (ArithmeticError, ValueError) as exc:
         return failure(
             FinalizerErrorCode.JOURNAL_CORRUPT,
@@ -230,14 +275,35 @@ def _clock_values(
             str(exc),
             cause=exc,
         )
-    if residual > 50 or drift > MAX_DRIFT_PPM:
+    # Der Framecounter ist ganzzahlig. Unterhalb der aus der jeweiligen Schranke
+    # abgeleiteten Mindestdauer ist ein einzelner Frame Quantisierung größer als
+    # die Schranke selbst; dort ist die Steigung nicht entscheidbar und darf
+    # weder ablehnen noch warnen. Ein Zehnsekundenlauf mit einem Frame Zappeln
+    # misst 1667 ppm, ohne dass die Uhr etwas getan hätte.
+    gate_measurable = measurable
+    warning_measurable = active_ns >= minimum_measurable_ns(DRIFT_WARNING_PPM)
+    if residual > 50 or (gate_measurable and measured > MAX_DRIFT_PPM):
         return failure(
             FinalizerErrorCode.JOURNAL_CORRUPT,
             FinalizerErrorCategory.INTEGRITY,
             "sidecar.clock_gate",
             "Phase-1 residual or drift gate was exceeded",
         )
-    if drift > DRIFT_WARNING_PPM:
+    # Ist die Steigung nicht entscheidbar, wird auch keine deklariert. Das Feld
+    # `drift_ppm` kennt kein "unbekannt", und ein von der Quantisierung
+    # getriebener Schätzwert würde sonst als Messung gelesen — und läge oft
+    # sogar außerhalb des zulässigen Wertebereichs.
+    drift = measured if gate_measurable else Decimal(0)
+    if not gate_measurable:
+        _LOGGER.info(
+            "calibration drift is not decidable over %s ms of active recording: a single frame "
+            "of counter quantisation already exceeds the %s ppm bound, so the drift gate stays "
+            "inactive and the declared value stays 0 instead of the raw %s ppm estimate",
+            active_ns // 1_000_000,
+            MAX_DRIFT_PPM,
+            measured,
+        )
+    elif warning_measurable and drift > DRIFT_WARNING_PPM:
         _LOGGER.warning(
             "calibration drift %s ppm exceeds the %s ppm warning bound and stays below the "
             "%s ppm rejection bound; the resulting frame mapping is correspondingly uncertain",
@@ -245,7 +311,14 @@ def _clock_values(
             DRIFT_WARNING_PPM,
             MAX_DRIFT_PPM,
         )
-    return drift, residual
+    for loss in losses:
+        _LOGGER.warning(
+            "%s frames were lost at %s s of active recording; the recording stays usable and "
+            "the loss is reported in finalization.warnings",
+            loss.frames,
+            round(loss.active_seconds, 1),
+        )
+    return _ClockValues(drift, residual, losses)
 
 
 def _phase1_rejection_message(validated: SidecarValidationResult) -> str:
@@ -302,6 +375,7 @@ def build_sidecar(
         total_frames = intent.source_identity.video_frame_count
         values = _clock_values(
             samples,
+            _drift_samples(samples, stop),
             pause_measurements,
             counter_start,
             counter_end,
@@ -310,9 +384,14 @@ def build_sidecar(
         )
         if isinstance(values, FinalizerFailure):
             return values
-        drift, residual = values
+        drift, residual, losses = values
         events: list[SidecarEventV12] = []
-        warnings: list[str] = []
+        # Ein Frameverlust warnt, er lässt den Lauf nicht scheitern: die Aufnahme
+        # ist bis auf die fehlenden Frames vollständig und bleibt schneidbar.
+        warnings: list[str] = [
+            f"frame_loss: {loss.frames} frames at {round(loss.active_seconds, 1)} s"
+            for loss in losses
+        ]
 
         def mapped_event(
             *,

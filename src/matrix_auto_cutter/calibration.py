@@ -117,6 +117,117 @@ def calculate_drift_ppm(active_elapsed_ns: int, counter_frames: int) -> Decimal:
     return _decimal(drift)
 
 
+def _counter_lag_ns(
+    samples: tuple[CalibrationSample, ...],
+    pauses: tuple[PauseMeasurement, ...],
+) -> list[tuple[int, Fraction]]:
+    """Bilde je Probe (aktive Zeit, Rückstand des Counters) in Nanosekunden.
+
+    Der Rückstand ist die aktive QPC-Zeit seit der ersten Probe minus der Zeit,
+    die der Framecounter in derselben Spanne behauptet. Er wächst linear mit der
+    echten Uhrendrift und springt, wenn Frames verloren gehen.
+    """
+    ordered = sorted(samples, key=lambda item: item.monotonic_ns)
+    origin = ordered[0]
+    series: list[tuple[int, Fraction]] = []
+    for sample in ordered:
+        active = subtract_paused_ns(origin.monotonic_ns, sample.monotonic_ns, pauses)
+        counted = Fraction(
+            (sample.output_frame_count - origin.output_frame_count) * 1_000_000_000, 60
+        )
+        series.append((active, Fraction(active) - counted))
+    return series
+
+
+def estimate_drift_ppm(
+    samples: tuple[CalibrationSample, ...],
+    pauses: tuple[PauseMeasurement, ...] = (),
+) -> Decimal:
+    """Schätze die QPC-vs-Counter-Drift als Steigung über die Kalibrierreihe.
+
+    Verwendet wird der Theil-Sen-Schätzer: der Median aller paarweisen
+    Steigungen des Rückstands. Ein punktueller Frameverlust verfälscht nur die
+    Paare, die ihn überspannen — bei einem einzelnen Sprung höchstens die Hälfte
+    aller Paare, unabhängig von seiner Größe. Der Median übersteht das, ein
+    Endpunktquotient und eine Ausgleichsgerade nicht.
+
+    Der Median über *benachbarte* Intervalle wäre nicht brauchbar: bei zwei
+    Sekunden Abstand trägt ein Intervall 120 Frames, ein Frame Unterschied sind
+    dort 8264 ppm. Erst lange Basislinien lösen den Bereich um 500 ppm auf.
+    """
+    series = _counter_lag_ns(samples, pauses)
+    if len(series) < 2:
+        msg = "Driftschätzung benötigt mindestens zwei Kalibrierungsproben."
+        raise ValueError(msg)
+    slopes: list[Fraction] = []
+    for index, (first_ns, first_lag) in enumerate(series):
+        for second_ns, second_lag in series[index + 1 :]:
+            if second_ns == first_ns:
+                continue
+            slopes.append((second_lag - first_lag) / (second_ns - first_ns))
+    if not slopes:
+        msg = "Driftschätzung benötigt zwei Proben mit verschiedener aktiver Zeit."
+        raise ValueError(msg)
+    slopes.sort()
+    middle = len(slopes) // 2
+    median = (
+        slopes[middle]
+        if len(slopes) % 2
+        else (slopes[middle - 1] + slopes[middle]) / 2
+    )
+    return _decimal(abs(median) * 1_000_000)
+
+
+# Normale Zappelei des A/V-Interleavers liegt bei ein bis zwei Frames. Erst ab
+# diesem Sprung ist ein Verlust von der Zappelei zu unterscheiden.
+_FRAME_LOSS_THRESHOLD = 5
+
+
+class FrameLoss(CanonicalModel):
+    """Ein punktueller Frameverlust, gemessen am Sprung des Counterrückstands."""
+
+    active_seconds: Decimal
+    frames: int
+
+
+def detect_frame_losses(
+    samples: tuple[CalibrationSample, ...],
+    pauses: tuple[PauseMeasurement, ...] = (),
+) -> tuple[FrameLoss, ...]:
+    """Erkenne punktuelle Frameverluste am Sprung des Counterrückstands.
+
+    Betrachtet wird ein Fenster von zwei Intervallen, weil ein Verlust an einem
+    Szenenwechsel sich auf die beiden angrenzenden Proben verteilen kann: bei
+    Aufnahme ff2618be lagen 5 und 37 Frames in zwei benachbarten Intervallen.
+
+    Gemeldet wird die letzte unauffällige Probe vor dem steilsten Einzelschritt
+    des Fensters. Der Verlust liegt zwischen ihr und der folgenden Probe; von
+    beiden Grenzen ist sie die einzige, die noch gesund gemessen wurde.
+    """
+    series = _counter_lag_ns(samples, pauses)
+    frames = [(active, lag * 60 / 1_000_000_000) for active, lag in series]
+    losses: list[FrameLoss] = []
+    index = 0
+    while index < len(frames) - 1:
+        window = min(index + 2, len(frames) - 1)
+        step = frames[window][1] - frames[index][1]
+        if step >= _FRAME_LOSS_THRESHOLD:
+            steepest = max(
+                range(index, window),
+                key=lambda position: frames[position + 1][1] - frames[position][1],
+            )
+            losses.append(
+                FrameLoss(
+                    active_seconds=_decimal(Fraction(frames[steepest][0], 1_000_000_000)),
+                    frames=_round_half_up(step),
+                )
+            )
+            index = window
+        else:
+            index += 1
+    return tuple(losses)
+
+
 def calibration_residual_ms(predicted_frame: Fraction, observed_frame: Fraction) -> Decimal:
     """Berechne eine Frameabweichung bei 60 FPS in Millisekunden."""
     return _decimal(abs(predicted_frame - observed_frame) * Fraction(1000, 60))
