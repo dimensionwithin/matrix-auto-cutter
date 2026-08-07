@@ -6,16 +6,17 @@ import argparse
 import json
 import msvcrt
 import os
+import re
 import secrets
 import sys
 import threading
 import webbrowser
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Protocol
 from urllib.parse import urlsplit
 
 from matrix_auto_cutter.approval import (
@@ -26,6 +27,7 @@ from matrix_auto_cutter.approval import (
 from matrix_auto_cutter.cut_proposal import ProposalFailed, load_proposal
 from matrix_auto_cutter.product_runner import (
     default_log_directory,
+    default_state_directory,
     load_runner_status,
     runner_health,
     tail_runner_log,
@@ -44,6 +46,155 @@ from matrix_auto_cutter.selection import (
     ensure_selection,
     update_selection,
 )
+
+# Padding of the single outer content frame, needed twice: once when the frame
+# is built and once when the control row's width is turned into a window width.
+_FRAME_PADDING = 16
+# Height of the scrollable cut list in text lines. The list is the only part of
+# the window that gives way, so it carries both numbers: what it asks for when
+# the window opens, and how little it may be squeezed to before the window
+# refuses to shrink further. Neither depends on how many cuts a recording has -
+# a tk.Text never sizes itself to its content.
+_LIST_DEFAULT_LINES = 18
+_LIST_MINIMUM_LINES = 4
+_WINDOW_STATE_FILENAME = "review-window.json"
+_GEOMETRY_PATTERN = re.compile(r"(\d+)x(\d+)([+-]\d+)([+-]\d+)")
+
+
+@dataclass(frozen=True, slots=True)
+class WindowGeometry:
+    """One Tk window box: size plus position, in pixels."""
+
+    width: int
+    height: int
+    x: int
+    y: int
+
+    def as_geometry(self) -> str:
+        """Render the box in Tk's own ``WxH+X+Y`` notation."""
+        return f"{self.width}x{self.height}+{self.x}+{self.y}"
+
+    @classmethod
+    def parse(cls, value: str) -> WindowGeometry | None:
+        """Read Tk's ``WxH+X+Y`` notation, rejecting anything else."""
+        match = _GEOMETRY_PATTERN.fullmatch(value.strip())
+        if match is None:
+            return None
+        width, height = int(match.group(1)), int(match.group(2))
+        if width <= 0 or height <= 0:
+            return None
+        return cls(width=width, height=height, x=int(match.group(3)), y=int(match.group(4)))
+
+    def fitted(
+        self,
+        *,
+        minimum: tuple[int, int],
+        screen: tuple[int, int],
+    ) -> WindowGeometry:
+        """Clamp a remembered box so it stays usable on the current screen.
+
+        A box saved on a second monitor, or before the controls grew, must never
+        put the window off screen or below the size at which the lower controls
+        are cut off again.
+        """
+        width = max(minimum[0], min(self.width, screen[0]))
+        height = max(minimum[1], min(self.height, screen[1]))
+        return WindowGeometry(
+            width=width,
+            height=height,
+            x=min(max(self.x, 0), max(screen[0] - width, 0)),
+            y=min(max(self.y, 0), max(screen[1] - height, 0)),
+        )
+
+
+def review_window_state_path(directory: Path | None = None) -> Path:
+    """Return the window-box file next to the other review state files."""
+    return (directory if directory is not None else default_state_directory()) / (
+        _WINDOW_STATE_FILENAME
+    )
+
+
+def load_window_geometry(path: Path) -> WindowGeometry | None:
+    """Read a remembered window box, treating every defect as "not remembered"."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    values = []
+    for key in ("width", "height", "x", "y"):
+        value = payload.get(key)
+        if not isinstance(value, int) or isinstance(value, bool):
+            return None
+        values.append(value)
+    width, height, x, y = values
+    if width <= 0 or height <= 0:
+        return None
+    return WindowGeometry(width=width, height=height, x=x, y=y)
+
+
+def store_window_geometry(path: Path, geometry: WindowGeometry) -> None:
+    """Persist the window box; a failed convenience must never break the review."""
+    with suppress(OSError, ValueError):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f"{path.name}.tmp")
+        temporary.write_text(
+            json.dumps(
+                {
+                    "width": geometry.width,
+                    "height": geometry.height,
+                    "x": geometry.x,
+                    "y": geometry.y,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+
+
+class _Measurable(Protocol):
+    """The slice of the Tk widget API the size derivation actually uses."""
+
+    def winfo_reqwidth(self) -> int: ...
+
+    def winfo_reqheight(self) -> int: ...
+
+
+class _Root(_Measurable, Protocol):
+    def update_idletasks(self) -> None: ...
+
+
+def measure_window_bounds(
+    root: _Root,
+    controls: _Measurable,
+    set_list_lines: Callable[[int], object],
+    padding: int = _FRAME_PADDING,
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Derive the smallest and the preferred window box from the real widgets.
+
+    The width floor comes from the control block alone, because that is what has
+    to stay readable: its buttons carry fixed captions, so the number is stable
+    across recordings. The height floor is the whole window measured while the
+    cut list is squeezed to ``_LIST_MINIMUM_LINES`` - everything above and below
+    the list has a fixed line count, so what remains is exactly the space the
+    labels and the lower controls need.
+
+    The preferred box is the same window with the list back at its full height.
+    Both numbers are read off the widgets, so they follow captions, fonts and
+    display scaling instead of being guessed once and going stale.
+    """
+    set_list_lines(_LIST_MINIMUM_LINES)
+    root.update_idletasks()
+    minimum = (controls.winfo_reqwidth() + 2 * padding, root.winfo_reqheight())
+    set_list_lines(_LIST_DEFAULT_LINES)
+    root.update_idletasks()
+    preferred = (
+        max(root.winfo_reqwidth(), minimum[0]),
+        max(root.winfo_reqheight(), minimum[1]),
+    )
+    return minimum, preferred
 
 
 @dataclass(frozen=True, slots=True)
@@ -412,10 +563,8 @@ def run_review(proposal_path: Path) -> int:
 
     root = tk.Tk()
     root.title(f"Matrix Auto Cutter Review - {proposal.source_identity.file_name}")
-    root.geometry("980x720")
-    root.minsize(760, 520)
 
-    frame = ttk.Frame(root, padding=16)
+    frame = ttk.Frame(root, padding=_FRAME_PADDING)
     frame.pack(fill="both", expand=True)
     ttk.Label(frame, text="Schnittvorschlag prüfen", font=("Segoe UI", 18, "bold")).pack(anchor="w")
     ttk.Label(
@@ -539,7 +688,13 @@ def run_review(proposal_path: Path) -> int:
     )
     ttk.Label(frame, textvariable=render_var, justify="left").pack(anchor="w", pady=(0, 8))
     ttk.Label(frame, textvariable=runner_var, justify="left").pack(anchor="w", pady=(0, 8))
-    text = tk.Text(frame, wrap="word", height=18)
+    # The controls claim their parcel from the bottom edge before the cut list is
+    # packed, so pack hands the list only what is left over. Shrinking the window
+    # therefore eats into the list and never into the buttons below it - which is
+    # how the lower two blocks used to disappear on open.
+    controls = ttk.Frame(frame)
+    controls.pack(side="bottom", fill="x")
+    text = tk.Text(frame, wrap="word", height=_LIST_DEFAULT_LINES)
     text.pack(fill="both", expand=True)
     if proposal.proposed_cuts:
         for index, item in enumerate(proposal.proposed_cuts, start=1):
@@ -565,7 +720,7 @@ def run_review(proposal_path: Path) -> int:
             text.insert("end", f"  {rejection.reason}: {rejection.count}\n")
     text.configure(state="disabled")
 
-    selection_box = ttk.LabelFrame(frame, text="Selektive Cut-Auswahl", padding=8)
+    selection_box = ttk.LabelFrame(controls, text="Selektive Cut-Auswahl", padding=8)
     selection_box.pack(fill="x", pady=(8, 0))
     ttk.Label(selection_box, textvariable=selection_var, justify="left").pack(anchor="w")
     ttk.Label(selection_box, textvariable=selection_summary_var, justify="left").pack(anchor="w")
@@ -627,7 +782,7 @@ def run_review(proposal_path: Path) -> int:
     )
     all_disabled_button.pack(side="left")
 
-    buttons = ttk.Frame(frame)
+    buttons = ttk.Frame(controls)
     buttons.pack(fill="x", pady=(12, 0))
 
     def open_html() -> None:
@@ -774,7 +929,7 @@ def run_review(proposal_path: Path) -> int:
         text="Ausgewählte Schnitte freigeben",
         command=lambda: decide_selected("selected_cuts_approved"),
     ).pack(side="right", padx=8)
-    render_controls = ttk.Frame(frame)
+    render_controls = ttk.Frame(controls)
     render_controls.pack(fill="x", pady=(10, 0))
     render_button = ttk.Button(
         render_controls,
@@ -797,7 +952,44 @@ def run_review(proposal_path: Path) -> int:
         state="disabled",
     )
     open_folder_button.pack(side="left")
+    # Fill every label before measuring: the render block alone is eleven lines
+    # and is empty until the first refresh, so measuring earlier would floor the
+    # window below the height its own contents need.
     refresh_status()
+    minimum, preferred = measure_window_bounds(
+        root, controls, lambda lines: text.configure(height=lines)
+    )
+    root.minsize(*minimum)
+    screen = (root.winfo_screenwidth(), root.winfo_screenheight())
+    state_path = review_window_state_path()
+    remembered = load_window_geometry(state_path)
+    if remembered is not None:
+        root.geometry(remembered.fitted(minimum=minimum, screen=screen).as_geometry())
+    else:
+        # No stored box yet: open at the size the content asks for, capped by the
+        # screen. Position stays with the window manager.
+        root.geometry(
+            f"{max(min(preferred[0], screen[0]), minimum[0])}"
+            f"x{max(min(preferred[1], screen[1]), minimum[1])}"
+        )
+
+    def remember_window() -> None:
+        with suppress(tk.TclError):
+            store_window_geometry(
+                state_path,
+                WindowGeometry(
+                    width=root.winfo_width(),
+                    height=root.winfo_height(),
+                    x=root.winfo_x(),
+                    y=root.winfo_y(),
+                ),
+            )
+
+    def close_review() -> None:
+        remember_window()
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", close_review)
     root.after(750, poll_render)
     root.mainloop()
     bridge.close()
