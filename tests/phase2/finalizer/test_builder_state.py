@@ -16,6 +16,7 @@ from tests.phase2.finalizer.conftest import (
     source_identity,
 )
 
+from matrix_auto_cutter.clock_bounds import DRIFT_WARNING_PPM, MAX_DRIFT_PPM
 from matrix_auto_cutter.models import CalibrationSample, PauseMeasurement
 from matrix_auto_cutter.phase2 import CancellationToken
 from matrix_auto_cutter.phase2.finalizer import JournalInputPaths
@@ -317,7 +318,7 @@ def test_builder_phase1_and_protection_postvalidation_failures(fake_port, monkey
     assert isinstance(build_sidecar(journal, intent), FinalizerFailure)
 
 
-def test_clock_failures_and_pause_pairing(monkeypatch) -> None:
+def test_clock_failures_and_pause_pairing(monkeypatch, caplog) -> None:
     samples = (
         CalibrationSample(monotonic_ns=0, output_frame_count=0),
         CalibrationSample(monotonic_ns=1_000_000_000, output_frame_count=60),
@@ -332,11 +333,30 @@ def test_clock_failures_and_pause_pairing(monkeypatch) -> None:
         "matrix_auto_cutter.phase2.finalizer.sidecar_builder.sample_gaps_valid",
         lambda *args: True,
     )
+
+    # Above DRIFT_WARNING_PPM but at or below MAX_DRIFT_PPM: accepted, and the
+    # crossing is logged so a run in that band never passes unnoticed.
+    above_warning_ppm = DRIFT_WARNING_PPM + 1
     monkeypatch.setattr(
         "matrix_auto_cutter.phase2.finalizer.sidecar_builder.calculate_drift_ppm",
-        lambda *args: Decimal("501"),
+        lambda *args: above_warning_ppm,
+    )
+    with caplog.at_level("WARNING", logger="matrix_auto_cutter.phase2.finalizer.sidecar_builder"):
+        result = _clock_values(samples, (), 0, 60, 60)
+    assert result == (above_warning_ppm, Decimal(0))
+    assert len(caplog.records) == 1
+    assert str(above_warning_ppm) in caplog.records[0].message
+    assert str(DRIFT_WARNING_PPM) in caplog.records[0].message
+    assert str(MAX_DRIFT_PPM) in caplog.records[0].message
+    caplog.clear()
+
+    # Above MAX_DRIFT_PPM: still rejected, at the raised boundary.
+    monkeypatch.setattr(
+        "matrix_auto_cutter.phase2.finalizer.sidecar_builder.calculate_drift_ppm",
+        lambda *args: MAX_DRIFT_PPM + 1,
     )
     assert isinstance(_clock_values(samples, (), 0, 60, 60), FinalizerFailure)
+
     monkeypatch.setattr(
         "matrix_auto_cutter.phase2.finalizer.sidecar_builder.map_qpc_frame",
         lambda *args: (_ for _ in ()).throw(ValueError("bad clock")),

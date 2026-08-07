@@ -25,6 +25,7 @@ from matrix_auto_cutter.calibration import (
     map_qpc_frame,
     subtract_paused_ns,
 )
+from matrix_auto_cutter.clock_bounds import MAX_DRIFT_PPM
 from matrix_auto_cutter.errors import CoreError, ErrorCode, core_error
 from matrix_auto_cutter.models import (
     CalibrationSample,
@@ -366,7 +367,7 @@ def _clock_errors(sidecar: ValidatedObsEventSidecar) -> list[CoreError]:
         except ValueError:
             failures.append("invalid_active_qpc_duration")
         else:
-            if actual_drift_ppm > 500:
+            if actual_drift_ppm > MAX_DRIFT_PPM:
                 failures.append("actual_drift_ppm")
             if abs(clock.drift_ppm - actual_drift_ppm) > _DRIFT_MATCH_TOLERANCE_PPM:
                 failures.append("declared_drift_mismatch")

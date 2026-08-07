@@ -11,6 +11,7 @@ import pytest
 from pydantic import ValidationError
 
 from conftest import STOP_ID, event, hard_protection, soft_protection
+from matrix_auto_cutter.clock_bounds import MAX_DRIFT_PPM
 from matrix_auto_cutter.errors import ErrorCode
 from matrix_auto_cutter.journal import validate_journal
 from matrix_auto_cutter.models import (
@@ -363,7 +364,7 @@ def test_source_duration_within_one_frame_is_accepted(
     ("clock_field", "invalid"),
     [
         ("max_calibration_residual_ms", 50.0001),
-        ("drift_ppm", 500.0001),
+        ("drift_ppm", float(MAX_DRIFT_PPM) + 0.0001),
         ("max_event_uncertainty_ms", 250.0001),
     ],
 )

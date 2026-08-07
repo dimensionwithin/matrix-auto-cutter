@@ -23,6 +23,7 @@ import matrix_auto_cutter.models as models_module
 from conftest import START_ID, event, sidecar_dict, soft_protection
 from matrix_auto_cutter.atomic import ProtectionRangesDocument, write_protection_ranges
 from matrix_auto_cutter.calibration import calculate_drift_ppm, subtract_paused_ns
+from matrix_auto_cutter.clock_bounds import MAX_DRIFT_PPM
 from matrix_auto_cutter.errors import ErrorCode
 from matrix_auto_cutter.journal import JournalEvent, JournalHeader, validate_journal
 from matrix_auto_cutter.models import (
@@ -190,15 +191,27 @@ def test_declared_drift_must_match_recomputed_value() -> None:
     assert validate_sidecar(raw, _expected_source(raw)).mode == "validated_sidecar_1_1"
 
 
+_DRIFT_BOUNDARY_SPAN = 600
+_DRIFT_BOUNDARY_EXPECTED_NS = 10_000_000_000  # exact QPC time for 600 frames at 60 fps
+
+
+def _stop_ns_at_drift_ppm(ppm: Decimal) -> int:
+    """QPC stop time whose recomputed drift over ``_DRIFT_BOUNDARY_SPAN`` is exactly ``ppm``."""
+    return _DRIFT_BOUNDARY_EXPECTED_NS + int(ppm) * _DRIFT_BOUNDARY_EXPECTED_NS // 1_000_000
+
+
 @pytest.mark.parametrize(
     ("stop_ns", "valid"),
-    [(10_005_000_000, True), (10_005_000_001, False)],
+    [
+        (_stop_ns_at_drift_ppm(MAX_DRIFT_PPM), True),
+        (_stop_ns_at_drift_ppm(MAX_DRIFT_PPM) + 1, False),
+    ],
 )
-def test_recomputed_drift_500_ppm_boundary(stop_ns: int, valid: bool) -> None:
+def test_recomputed_drift_max_ppm_boundary(stop_ns: int, valid: bool) -> None:
     raw = sidecar_dict()
     raw["events"][-1]["clock_sample"]["monotonic_ns"] = stop_ns
-    actual = calculate_drift_ppm(stop_ns, 600)
-    raw["clock"]["drift_ppm"] = float(min(actual, Decimal(500)))
+    actual = calculate_drift_ppm(stop_ns, _DRIFT_BOUNDARY_SPAN)
+    raw["clock"]["drift_ppm"] = float(min(actual, MAX_DRIFT_PPM))
     result = validate_sidecar(raw, _expected_source(raw))
     assert (result.mode == "validated_sidecar_1_1") is valid
     if not valid:
@@ -1218,7 +1231,7 @@ def test_exported_sidecar_schema_contains_canonical_numeric_and_string_constrain
     assert source["file_name"]["pattern"] == r"^[^/\\]+\.mp4$"
     assert lifecycle["finalized_at"]["format"] == "date-time"
     assert clock["drift_ppm"] == {
-        "maximum": 500,
+        "maximum": int(MAX_DRIFT_PPM),
         "minimum": 0,
         "title": "Drift Ppm",
         "type": "number",
@@ -1537,7 +1550,9 @@ def test_precise_drift_semantics_survive_json_roundtrip(declared: Decimal, valid
 
 def test_decimal_gate_and_invalid_numeric_inputs_remain_strict() -> None:
     with pytest.raises(ValidationError):
-        ClockCalibration.model_validate(_clock_payload(Decimal("500.0000000000000000001")))
+        ClockCalibration.model_validate(
+            _clock_payload(MAX_DRIFT_PPM + Decimal("0.0000000000000000001"))
+        )
     for invalid in ("0.001", True, Decimal("NaN"), Decimal("Infinity")):
         payload = _clock_payload(Decimal("0"))
         payload["drift_ppm"] = invalid

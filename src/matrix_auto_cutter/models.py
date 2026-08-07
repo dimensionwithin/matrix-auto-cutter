@@ -23,6 +23,8 @@ from pydantic import (
 )
 from pydantic.main import IncEx
 
+from matrix_auto_cutter.clock_bounds import MAX_DRIFT_PPM
+
 
 def _decimal_json_lexeme(value: Decimal) -> str:
     if not value.is_finite():
@@ -490,11 +492,11 @@ def _strict_decimal_input(value: object) -> object:
     return value
 
 
-DecimalMax500 = Annotated[
+DriftPpmDecimal = Annotated[
     Decimal,
     BeforeValidator(_strict_decimal_input),
-    Field(ge=0, le=500),
-    WithJsonSchema({"type": "number", "minimum": 0, "maximum": 500}),
+    Field(ge=0, le=MAX_DRIFT_PPM),
+    WithJsonSchema({"type": "number", "minimum": 0, "maximum": int(MAX_DRIFT_PPM)}),
 ]
 DecimalMax50 = Annotated[
     Decimal,
@@ -660,7 +662,7 @@ class ClockCalibration(CanonicalModel):
     mapping: Literal["obs_output_frame_counter_calibrated_to_final_video_frames"]
     counter_start: int = Field(ge=0)
     counter_end: int = Field(ge=1)
-    drift_ppm: DecimalMax500
+    drift_ppm: DriftPpmDecimal
     max_calibration_residual_ms: DecimalMax50
     max_event_uncertainty_ms: DecimalMax250
     calibration_sample_count: int = Field(ge=2)

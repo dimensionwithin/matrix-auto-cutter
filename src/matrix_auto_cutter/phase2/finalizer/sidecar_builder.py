@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from decimal import Decimal
 from fractions import Fraction
 from typing import Literal, cast
@@ -18,6 +19,7 @@ from matrix_auto_cutter.calibration import (
     sample_gaps_valid,
     subtract_paused_ns,
 )
+from matrix_auto_cutter.clock_bounds import DRIFT_WARNING_PPM, MAX_DRIFT_PPM
 from matrix_auto_cutter.journal import (
     JournalCalibrationSample,
     JournalEvent,
@@ -55,8 +57,11 @@ from matrix_auto_cutter.sidecar import (
     ObsEventSidecarV12,
     SidecarCapabilities,
     SidecarEventV12,
+    SidecarValidationResult,
     validate_sidecar,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class _ConstructionCancelled(RuntimeError):
@@ -225,14 +230,49 @@ def _clock_values(
             str(exc),
             cause=exc,
         )
-    if residual > 50 or drift > 500:
+    if residual > 50 or drift > MAX_DRIFT_PPM:
         return failure(
             FinalizerErrorCode.JOURNAL_CORRUPT,
             FinalizerErrorCategory.INTEGRITY,
             "sidecar.clock_gate",
             "Phase-1 residual or drift gate was exceeded",
         )
+    if drift > DRIFT_WARNING_PPM:
+        _LOGGER.warning(
+            "calibration drift %s ppm exceeds the %s ppm warning bound and stays below the "
+            "%s ppm rejection bound; the resulting frame mapping is correspondingly uncertain",
+            drift,
+            DRIFT_WARNING_PPM,
+            MAX_DRIFT_PPM,
+        )
     return drift, residual
+
+
+def _phase1_rejection_message(validated: SidecarValidationResult) -> str:
+    # The validator reports the offending check and its measured values in
+    # technical_context. Carrying that into the message keeps the finalizer
+    # failure as diagnosable as the pydantic error it replaces; without it the
+    # caller only learns that some unnamed Phase-1 check said no.
+    # Read defensively: this renders a failure message, so it must never raise
+    # and mask the failure it is describing.
+    reasons = tuple(getattr(validated, "reasons", ()))
+    shown = reasons[:8]
+    parts = [
+        f"{reason.code.value} "
+        f"{json.dumps(reason.technical_context, default=str, sort_keys=True, ensure_ascii=False)}"
+        for reason in shown
+    ]
+    if len(reasons) > len(shown):
+        parts.append(f"(+{len(reasons) - len(shown)} further reasons)")
+    if not parts:
+        parts.append(
+            "validator reported no reason; the re-parsed sidecar differs from the "
+            "constructed object"
+        )
+    return (
+        f"constructed sidecar failed the complete Phase-1 validator "
+        f"(mode={validated.mode}): {'; '.join(parts)}"
+    )
 
 
 def build_sidecar(
@@ -475,7 +515,7 @@ def build_sidecar(
             FinalizerErrorCode.JOURNAL_CORRUPT,
             FinalizerErrorCategory.INTEGRITY,
             "sidecar.phase1_validation",
-            "constructed sidecar failed the complete Phase-1 validator",
+            _phase1_rejection_message(validated),
             underlying=validated,
         )
     if cancellation is not None and cancellation.is_cancelled:

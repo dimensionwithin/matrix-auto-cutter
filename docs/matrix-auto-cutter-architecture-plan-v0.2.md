@@ -157,7 +157,7 @@ Ein Sidecar ist nur nutzbar, wenn:
 - `c1 > c0` und `abs((c1 - c0) - N) <= 6` Frames;
 - aktive Kalibrierungsproben höchstens fünf Sekunden auseinanderliegen;
 - die maximale Kalibrierungsabweichung höchstens 50 ms beträgt;
-- die QPC-vs-Counter-Drift nach Abzug der Pausen höchstens 500 ppm beträgt;
+- die QPC-vs-Counter-Drift nach Abzug der Pausen höchstens 1000 ppm beträgt (Vermerk 07.08.2026: angehoben von 500 ppm, Warnschwelle weiterhin bei 500 ppm; verbindliche Quelle `src\matrix_auto_cutter\clock_bounds.py`);
 - kein schutzrelevantes Event mehr als 250 ms ausgewiesene Unsicherheit besitzt;
 - jeder manuelle Marker einen Framecounterwert besitzt;
 - die finale Dauer zur Counterspanne innerhalb sechs Frames passt.
@@ -286,6 +286,8 @@ Auf Disk sind dies einzelne NDJSON-Zeilen ohne Arrayklammern. Die Arraydarstellu
 
 ### 8.3 Kanonisches Sidecar-JSON-Schema 1.1
 
+*Vermerk (07.08.2026): Die Obergrenze für `drift_ppm` wurde von 500 auf 1000 ppm angehoben, mit einer Warnschwelle bei 500 ppm. Verbindliche Quelle ist `src\matrix_auto_cutter\clock_bounds.py`.*
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -342,7 +344,7 @@ Auf Disk sind dies einzelne NDJSON-Zeilen ohne Arrayklammern. Die Arraydarstellu
         "mapping": {"const": "obs_output_frame_counter_calibrated_to_final_video_frames"},
         "counter_start": {"type": "integer", "minimum": 0},
         "counter_end": {"type": "integer", "minimum": 1},
-        "drift_ppm": {"type": "number", "minimum": 0, "maximum": 500},
+        "drift_ppm": {"type": "number", "minimum": 0, "maximum": 1000},
         "max_calibration_residual_ms": {"type": "number", "minimum": 0, "maximum": 50},
         "max_event_uncertainty_ms": {"type": "number", "minimum": 0, "maximum": 250},
         "calibration_sample_count": {"type": "integer", "minimum": 2}
