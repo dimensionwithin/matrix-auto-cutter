@@ -346,8 +346,10 @@ Shorts-Schritt herausfallen? Nur Zeitfenster / plus 16:9-Clips / fertige
 
 ### 6.4 Stinger neu rendern
 
-Siehe Abschnitt 5. Vorher die getesteten Zwischendateien in OBS einsetzen —
-das nimmt den Druck raus.
+Siehe Abschnitt 5. Die getesteten Zwischendateien sind am 7.8. in OBS
+eingesetzt; der Druck ist damit raus. Offen bleibt hier nur noch das
+Neurendern. Abnahmebedingung unverändert: letzter Videoframe =
+Containerlänge, Matte am Ende vollständig zurückgezogen, konstante 60 fps.
 
 ### 6.5 Kleinkram
 
