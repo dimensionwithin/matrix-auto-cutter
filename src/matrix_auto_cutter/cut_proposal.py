@@ -28,6 +28,14 @@ from pydantic import (
     model_validator,
 )
 
+from matrix_auto_cutter.intro import (
+    INTRO_FLOW_PROTECTED_FRAMES,
+    IntroCandidateEvidence,
+    IntroResolutionEvidence,
+    IntroResolvedStatus,
+    is_resolved,
+    resolve_intro,
+)
 from matrix_auto_cutter.models import (
     CanonicalModel,
     MaterializedFrameRange,
@@ -119,12 +127,15 @@ class ProposedCut(CanonicalModel):
     start_timecode: str = Field(pattern=r"^[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}$")
     end_timecode: str = Field(pattern=r"^[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}$")
     duration_ms: int = Field(gt=0)
-    reason: Literal["conservative_silence_dead_air", "outro_excess_tail"]
+    reason: Literal["conservative_silence_dead_air", "outro_excess_tail", "intro_lead_in"]
     audio_evidence: AudioEvidence | None = None
     outro_evidence: OutroCandidateEvidence | None = None
+    intro_evidence: IntroCandidateEvidence | None = None
     applied_handles: AppliedHandles | None = None
     protection_result: Literal[
-        "clear_no_blocking_overlap", "outro_tail_after_hard_protection"
+        "clear_no_blocking_overlap",
+        "outro_tail_after_hard_protection",
+        "intro_lead_in_overrides_protection",
     ]
 
     @model_validator(mode="after")
@@ -132,7 +143,7 @@ class ProposedCut(CanonicalModel):
         """Keep the artifact interval contract explicit."""
         if any(
             name in self.model_fields_set and getattr(self, name) is None
-            for name in ("audio_evidence", "outro_evidence", "applied_handles")
+            for name in ("audio_evidence", "outro_evidence", "intro_evidence", "applied_handles")
         ):
             raise ValueError("candidate evidence fields may not be explicit null")
         if self.start_frame >= self.end_frame:
@@ -141,25 +152,38 @@ class ProposedCut(CanonicalModel):
             self.audio_evidence is None
             or self.applied_handles is None
             or self.outro_evidence is not None
+            or self.intro_evidence is not None
             or self.protection_result != "clear_no_blocking_overlap"
         ):
             raise ValueError("silence cut evidence is incomplete")
         if self.reason == "outro_excess_tail" and (
             self.outro_evidence is None
             or self.audio_evidence is not None
+            or self.intro_evidence is not None
             or self.applied_handles is not None
             or self.protection_result != "outro_tail_after_hard_protection"
             or self.start_frame != self.outro_evidence.tail_start_frame
             or self.end_frame != self.outro_evidence.total_source_frames
         ):
             raise ValueError("outro tail evidence is incomplete")
+        if self.reason == "intro_lead_in" and (
+            self.intro_evidence is None
+            or self.audio_evidence is not None
+            or self.outro_evidence is not None
+            or self.applied_handles is not None
+            or self.protection_result != "intro_lead_in_overrides_protection"
+            or self.start_frame != 0
+            or self.end_frame != self.intro_evidence.intro_start_frame
+            or self.duration_ms != self.intro_evidence.removed_ms
+        ):
+            raise ValueError("intro lead-in evidence is incomplete")
         return self
 
     @model_serializer(mode="wrap")
     def omit_missing_evidence(self, handler: SerializerFunctionWrapHandler) -> object:
         """Keep legacy silence bytes unchanged by omitting absent typed evidence."""
         serialized: dict[str, object] = handler(self)
-        for name in ("audio_evidence", "outro_evidence", "applied_handles"):
+        for name in ("audio_evidence", "outro_evidence", "intro_evidence", "applied_handles"):
             if getattr(self, name) is None:
                 serialized.pop(name, None)
         return serialized
@@ -173,6 +197,8 @@ RejectionReason = Literal[
     "minimum_keep_island",
     "outside_source_timeline",
     "superseded_by_outro_tail",
+    "superseded_by_intro_lead_in",
+    "intro_flow_protected",
 ]
 
 
@@ -218,6 +244,7 @@ class CutProposalContent(CanonicalModel):
     total_proposed_savings_ms: int = Field(ge=0)
     generated_at: AwareDatetime
     outro_resolution: OutroResolutionEvidence | None = None
+    intro_resolution: IntroResolutionEvidence | None = None
 
     @model_validator(mode="after")
     def internally_consistent(self) -> CutProposalContent:
@@ -238,12 +265,19 @@ class CutProposalContent(CanonicalModel):
             raise ValueError("ready proposal requires at least one cut")
         if self.status == "no_cuts" and self.proposed_cuts:
             raise ValueError("no_cuts proposal cannot contain cuts")
-        if self.schema_version == "1.0" and self.outro_resolution is not None:
-            raise ValueError("proposal-1.0 cannot contain outro resolution")
+        if self.schema_version == "1.0" and (
+            self.outro_resolution is not None or self.intro_resolution is not None
+        ):
+            raise ValueError("proposal-1.0 cannot contain outro or intro resolution")
+        # ``intro_resolution`` was added to Proposal-1.1 in place instead of via a
+        # new schema version, so 1.1 bytes published before the field existed must
+        # keep loading; their canonical bytes and digest omit it either way.
         if self.schema_version == "1.1" and self.outro_resolution is None:
             raise ValueError("proposal-1.1 requires typed outro resolution")
         if "outro_resolution" in self.model_fields_set and self.outro_resolution is None:
             raise ValueError("outro_resolution may not be explicit null")
+        if "intro_resolution" in self.model_fields_set and self.intro_resolution is None:
+            raise ValueError("intro_resolution may not be explicit null")
         previous_end = -1
         for item in self.proposed_cuts:
             if item.start_frame < previous_end or item.end_frame > self.source_frame_count:
@@ -257,10 +291,12 @@ class CutProposalContent(CanonicalModel):
 
     @model_serializer(mode="wrap")
     def omit_missing_outro_resolution(self, handler: SerializerFunctionWrapHandler) -> object:
-        """Preserve canonical Proposal-1.0 bytes when the field is absent."""
+        """Preserve canonical Proposal-1.0 bytes when the fields are absent."""
         serialized: dict[str, object] = handler(self)
         if self.outro_resolution is None:
             serialized.pop("outro_resolution", None)
+        if self.intro_resolution is None:
+            serialized.pop("intro_resolution", None)
         return serialized
 
 
@@ -755,6 +791,7 @@ def _proposal_id(
     ffmpeg: FfmpegIdentity,
     parameters: AnalysisParameters,
     outro_resolution: OutroResolutionEvidence,
+    intro_resolution: IntroResolutionEvidence,
 ) -> str:
     payload = "\0".join(
         (
@@ -764,6 +801,7 @@ def _proposal_id(
             ffmpeg.sha256,
             parameters.model_dump_json(),
             outro_resolution.model_dump_json(),
+            intro_resolution.model_dump_json(),
         )
     ).encode("utf-8")
     return f"proposal-{hashlib.sha256(payload).hexdigest()[:32]}"
@@ -813,7 +851,14 @@ def generate_proposal(
         binding_path=binding_path,
         collection_file=collection_file,
     )
-    proposal_id = _proposal_id(source_digest, sidecar_sha256, binary, rules, outro_resolution)
+    intro_resolution = resolve_intro(
+        sidecar,
+        sidecar_sha256=sidecar_sha256,
+        outro_tail_start_frame=outro_resolution.tail_start_frame,
+    )
+    proposal_id = _proposal_id(
+        source_digest, sidecar_sha256, binary, rules, outro_resolution, intro_resolution
+    )
     target = artifacts_root / recording_id / "proposals" / proposal_id / PROPOSAL_FILE_NAME
     if target.exists():
         reused = load_proposal(target)
@@ -829,6 +874,7 @@ def generate_proposal(
             and proposal.ffmpeg == binary
             and proposal.analysis_parameters == rules
             and proposal.outro_resolution == outro_resolution
+            and proposal.intro_resolution == intro_resolution
         )
         if not expected:
             return ProposalFailed(
@@ -923,6 +969,95 @@ def generate_proposal(
             else:
                 kept.append(item)
         proposed = (*kept, tail)
+    if is_resolved(intro_resolution):
+        assert intro_resolution.binding_basis is not None
+        assert intro_resolution.scene_event_id is not None
+        assert intro_resolution.intro_start_frame is not None
+        assert intro_resolution.removed_frames is not None
+        assert intro_resolution.removed_ms is not None
+        resolved_status: IntroResolvedStatus = (
+            "resolved_first_of_multiple"
+            if intro_resolution.status == "resolved_first_of_multiple"
+            else "resolved"
+        )
+        lead_in = ProposedCut(
+            candidate_id=_candidate_id(
+                proposal_id + "\0intro_lead_in",
+                0,
+                intro_resolution.intro_start_frame,
+            ),
+            start_frame=0,
+            end_frame=intro_resolution.intro_start_frame,
+            start_timecode=_timecode(0),
+            end_timecode=_timecode(_duration_ms(intro_resolution.intro_start_frame)),
+            duration_ms=_duration_ms(intro_resolution.intro_start_frame),
+            reason="intro_lead_in",
+            intro_evidence=IntroCandidateEvidence(
+                sidecar_sha256=sidecar_sha256,
+                binding_basis=intro_resolution.binding_basis,
+                scene_event_id=intro_resolution.scene_event_id,
+                scene_uuid=intro_resolution.scene_uuid,
+                scene_name=intro_resolution.scene_name,
+                intro_start_frame=intro_resolution.intro_start_frame,
+                removed_frames=intro_resolution.removed_frames,
+                removed_ms=intro_resolution.removed_ms,
+                matching_scene_event_count=intro_resolution.matching_scene_event_count,
+                total_source_frames=sidecar.source.video_frame_count,
+                resolution_status=resolved_status,
+            ),
+            protection_result="intro_lead_in_overrides_protection",
+        )
+        # The lead-in introduces a new cut boundary that ``build_cut_candidates``
+        # never saw, so the existing minimum-keep-island rule is re-applied across
+        # it.  Without this the renderer would refuse the whole proposal over a
+        # micro segment between the lead-in and the first surviving silence.
+        minimum_island_frames = max(1, math.ceil(rules.minimum_keep_island_ms * 60 / 1000))
+        # Halboffene Einstiegszone ``[lead_in.end_frame, flow_end)``: ein
+        # Kandidat, der davor beginnt, fällt ganz weg, auch wenn er weit darüber
+        # hinausreicht — gekürzt wird nicht, sonst fiele der Schnitt doch noch
+        # in eine bewusst gesetzte Pause.  Ein Kandidat, der genau auf
+        # ``flow_end`` beginnt, liegt schon außerhalb und bleibt.
+        flow_end = lead_in.end_frame + INTRO_FLOW_PROTECTED_FRAMES
+        retained: list[ProposedCut] = []
+        for item in proposed:
+            if item.start_frame < lead_in.end_frame and lead_in.start_frame < item.end_frame:
+                assert item.audio_evidence is not None
+                rejected = (*rejected,
+                    RejectedCandidate(
+                        candidate_id=item.candidate_id,
+                        raw_silence_start_ms=item.audio_evidence.raw_silence_start_ms,
+                        raw_silence_end_ms=item.audio_evidence.raw_silence_end_ms,
+                        reason="superseded_by_intro_lead_in",
+                    ),
+                )
+            elif item.audio_evidence is not None and item.start_frame < flow_end:
+                # Beginnt in der Einstiegszone: der gestaltete Einstieg bleibt
+                # am Stück. Ab ``flow_end`` arbeitet der Cutter unverändert.
+                rejected = (
+                    *rejected,
+                    RejectedCandidate(
+                        candidate_id=item.candidate_id,
+                        raw_silence_start_ms=item.audio_evidence.raw_silence_start_ms,
+                        raw_silence_end_ms=item.audio_evidence.raw_silence_end_ms,
+                        reason="intro_flow_protected",
+                    ),
+                )
+            elif (
+                item.audio_evidence is not None
+                and not retained
+                and item.start_frame - lead_in.end_frame < minimum_island_frames
+            ):
+                rejected = (*rejected,
+                    RejectedCandidate(
+                        candidate_id=item.candidate_id,
+                        raw_silence_start_ms=item.audio_evidence.raw_silence_start_ms,
+                        raw_silence_end_ms=item.audio_evidence.raw_silence_end_ms,
+                        reason="minimum_keep_island",
+                    ),
+                )
+            else:
+                retained.append(item)
+        proposed = (lead_in, *retained)
     counts = Counter(item.reason for item in rejected)
     content = CutProposalContent(
         artifact_type="matrix_auto_cutter_cut_proposal",
@@ -949,6 +1084,7 @@ def generate_proposal(
         total_proposed_savings_ms=sum(item.duration_ms for item in proposed),
         generated_at=now(),
         outro_resolution=outro_resolution,
+        intro_resolution=intro_resolution,
     )
     proposal = _proposal_from_content(content)
     data = proposal_bytes(proposal)

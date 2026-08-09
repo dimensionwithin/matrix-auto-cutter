@@ -51,3 +51,27 @@ Audiobitrate und `volumedetect` vor jedem Stapellauf pruefen:
 ## Tests
 
 Immer `uv run python -m pytest`, niemals `uv run pytest`.
+
+## Product Runner nach jeder Codeaenderung neu starten
+
+Der Product Runner laeuft als Hintergrundprozess und laedt den Code beim Start.
+Nach jeder Codeaenderung muss er **gestoppt und neu gestartet** werden, sonst
+laeuft der alte Stand weiter. `START-ALLES` meldet in diesem Fall nur „Product
+Runner laeuft bereits" und startet nichts neu.
+
+Am 8.8.2026 hat das eine Fehlersuche ueber Stunden verursacht: Der Runner
+erzeugte ein Proposal mit Altcode, das frisch gestartete Review-Fenster las es
+mit neuem Code und wies es als ungueltig ab. Der Fehler sah wie ein
+Schemaproblem aus und war ein Prozessproblem.
+
+## Animierte OBS-Quellen brauchen zwei Haekchen
+
+Browserquellen mit Animation -- „TruthPill Rotator", „EndCart" und
+vergleichbare -- brauchen in ihren Eigenschaften beides:
+
+- **Deaktivieren, wenn Quelle nicht sichtbar ist**
+- **Browser bei Szenenaktivierung aktualisieren**
+
+Ohne diese Haekchen laeuft die Animation im Hintergrund weiter, und der
+Szenenwechsel trifft sie an zufaelliger Stelle. Das sah zweimal wie ein Fehler
+im Cutter aus und war keiner.

@@ -154,6 +154,13 @@ Ergebnis: `89c344e6` von 1257,4 auf 0,0 ppm mit Vermerk „44 Frames bei 42,3 s"
 `ff2618be` von 16,1 auf 0,0 mit „42 Frames bei 994,2 s". Kein Lauf, der vorher
 durchging, fällt heraus.
 
+**Korrektur vom 9.8.:** `89c344e6` galt damit als gerettet — war es aber nicht.
+Die Aussage stimmt nur für die Drifthälfte des Gates. Der Lauf wurde weiterhin
+abgelehnt, auf der **Residualhälfte**, mit 283,3 ms gegen 50 ms. Erst der
+Gate-Fix vom 9.8. (Abschnitt 3a) lässt ihn tatsächlich durchlaufen. Wer die
+Wirkung eines Gate-Eingriffs prüft, muss **beide** Teilbedingungen nachrechnen;
+die Fehlermeldung `sidecar.clock_gate` nennt keine von beiden.
+
 **Preis, bewusst bezahlt:** Der Verbraucher rechnet `drift_ppm` nicht mehr nach
 (Weg B). Es ist jetzt eine deklarierte Kennzahl wie
 `max_calibration_residual_ms`. Sieben Audit-Tests entfielen oder wurden
@@ -196,6 +203,60 @@ Fenstergröße und -position werden in
 `…\product-runner\review-window.json` gemerkt und beim Öffnen geklemmt
 wiederhergestellt. Unabhängig von der Schnittanzahl (gegen 0, 1, 3, 40 und 250
 Schnitte geprüft).
+
+---
+
+## 3a. Nachtrag 9.8. — Clock-Gate und Proposal-Schema
+
+### 3a.1 Die Stop-Probe ist kein Messpunkt mehr
+
+Lauf `382a196c` vom 8.8. scheiterte mit `finalizer/E_JOURNAL_CORRUPT`,
+`sidecar.clock_gate`, obwohl die Uhr einwandfrei war (Theil-Sen 155,9 ppm, unter
+der Quantisierungsschwelle dieses Laufs).
+
+Ursache: Der `stop`-Record kann seinen QPC-Tick mit der letzten
+`calibration_sample` teilen — bei `382a196c` tragen seq 103 und seq 104
+denselben `monotonic_ns` 199.933.325.336, der Counter steht beim Stop 29 Frames
+weiter. `map_qpc_frame` findet per `bisect_left` die Kalibrierprobe und
+interpoliert den Stop auf **deren** Counter. Gemessen wurde damit die
+Stop-Latenz des A/V-Interleavers, nicht die Uhr: **483,3 ms** gegen die
+50-ms-Schranke. `89c344e6` traf es mit 17 Frames und **283,3 ms**.
+
+Es war kein Grenzfall, sondern ein Münzwurf: 17 der 19 finalisierbaren Journale
+haben ihren Stop in einem eigenen Tick und messen 0,00 ms — auch bei
+Stop-Latenzen von 3 bis 121 Frames. Nachgemessen: mit eigenem Tick akzeptierte
+der alte Code sogar 3000 Frames Vorsprung mit 0,00 ms. Die Schranke griff also
+nur bei Tickkollision.
+
+Die Stop-Probe ist jetzt aus der **Residualschleife** heraus — mit derselben
+Begründung, mit der `_samples_without_stop` sie schon aus der Driftschätzung
+nahm: Der Adapter verankert ihren Zeitstempel auf dem Framecounter, ihr Residual
+gegen dieselbe Counterlinie zu halten ist zirkulär. **Sie bleibt Stützstelle der
+Interpolation**, sie ist nur kein Messpunkt. Die **50-ms-Schranke und
+`MAX_DRIFT_PPM` sind unverändert**, es gibt keinen Sonderfall für kollidierende
+Ticks und keine Toleranzerhöhung. Alle 19 Journale messen danach 0,00 ms.
+
+Was dabei entfällt und nirgends ersetzt wird: eine Obergrenze für den
+Counterzuwachs im letzten Intervall (siehe 6.6 b). Sie war nie eine Prüfung,
+sondern eine Nebenwirkung der Tickkollision.
+
+### 3a.2 Proposal-Schema 1.1 hat zwei Gestalten
+
+`intro_resolution` wurde **in 1.1 hineingelegt**, ohne die Schemaversion zu
+bumpen. Damit gilt: **Wer 1.1 liest, darf das Feld nicht voraussetzen.** Es gibt
+1.1-Bytes mit und ohne `intro_resolution`, und beide sind gültig — sechs
+Proposals auf der Platte tragen es nicht.
+
+Der schärfere Validator („1.1 braucht Outro *und* Intro") hatte am 8.8. genau
+das gebrochen: Das Review-Fenster wies sein eigenes Artefakt ab, weil ein noch
+laufender Alt-Runner es ohne das Feld geschrieben hatte. Der 1.1-Zweig fordert
+jetzt wieder nur die Outro-Resolution; frisch erzeugte Proposals tragen das
+Intro-Feld ohnehin immer. Der saubere Weg wäre eine 1.2 mit eigener
+Digest-Domain gewesen, wie damals beim Outro (siehe 6.6 c).
+
+**Merksatz aus dem Fall:** Ein Feld nachträglich in eine bestehende
+Schemaversion zu legen macht jedes bereits veröffentlichte Artefakt dieser
+Version unlesbar, sobald der Validator es fordert.
 
 ---
 
@@ -285,9 +346,49 @@ widerlegt; es sind Einzelereignisse unter Last.
 
 ## 6. Offene Punkte — nach Wert geordnet
 
-### 6.1 Intro-Cut bei „Intro with Cam"
+### 6.1 Intro-Cut bei „Intro with Cam" — **gebaut am 9.8.**
 
-Vollständig spezifiziert, wartet nur darauf, gebaut zu werden. Der Wert steht im
+**Erledigt.** `intro.py` ist neu, `cut_proposal.py` bindet ihn ein. Umgesetzt
+wie unten festgelegt: auf der **Frameachse** über `mapped_source_frame`, mit
+Bindung an das Label und der `scene_uuid` als Rückfallebene, und mit dem
+Zweig `no_matching_scene_event` als dem häufigeren Fall.
+
+Zwei Zahlen kamen aus den Läufen vom 8. und 9.8. dazu, beide als Konstanten in
+`intro.py` und beide dort mit ihrer Herkunft kommentiert:
+
+- **`INTRO_CUT_OFFSET_FRAMES = 148`** — der Schnitt liegt *hinter* der
+  Szenenmarke, nicht auf ihr. OBS schreibt `scene_changed` im Moment des
+  Umschaltens, der Stinger wischt danach noch. 35 Frames waren der gemessene
+  Rest der Vorszene (30 gemessen + 5 Sicherheit); damit begann das Video aber
+  auf dem Blackscreen am Anfang des Übergangs. Plus die gemessene Stingerlänge
+  von 1,877 s = 113 Frames ergibt 148 Frames = 2,467 s. Damit fällt der ganze
+  Übergang weg und der erste sichtbare Frame ist das Intro.
+  **Ein neu gerenderter Stinger verschiebt diese 148** (siehe 6.4) — die Zahl
+  wandert mit seiner Länge.
+- **`INTRO_FLOW_PROTECTED_FRAMES = 450`** — feste Einstiegszone von 7,5 s hinter
+  dem Schnitt, halboffen `[intro_start, intro_start + 450)`. Jeder
+  Stille-Kandidat, der **darin beginnt**, wird **ganz verworfen**
+  (`intro_flow_protected`), nicht gekürzt: ein bei 450 angesetzter Restschnitt
+  fiele wieder in den bewusst gestalteten Einstieg. Ab Frame 450 arbeitet der
+  Cutter unverändert.
+
+Die Zone war zuerst aus den `silencedetect`-Daten *abgeleitet* (Ende der ersten
+Pause hinter dem Schnitt). Der Lauf vom 9.8. hat das widerlegt: Hinter dem
+Schnitt läuft das Intro **mit Musik**, es gibt dort keine erkannte Stille, und
+die eigentliche Pause vor dem ersten Wort lag außerhalb jeder Ableitung — der
+Cutter nahm alles bis zum ersten Wort weg. silencedetect trennt laut von leise,
+nicht Intro von Gespräch. Eine feste Länge trifft den gestalteten Einstieg
+zuverlässiger als jede Ableitung daraus. Beide Zahlen werden am Ergebnis
+nachjustiert, nicht hergeleitet.
+
+Der Nebeneffekt unten gilt unverändert: Der Intro-Cut verschiebt die gerenderte
+Zeitachse, Short-Kandidaten weiterhin aus dem Rohvideo notieren.
+
+---
+
+*Die ursprüngliche Spezifikation, zur Nachvollziehbarkeit:*
+
+Der Wert steht im
 Journal als `scene_changed` mit Label „Intro with Cam". Am 7.8. vormittags lag
 er bei **51,633 s Rohzeit**.
 
@@ -365,6 +466,47 @@ Containerlänge, Matte am Ende vollständig zurückgezogen, konstante 60 fps.
   `review_app.py:484`, im Repo nicht erzwungen.
 - **Logitech G Plugin** in OBS aktiv — vermutlich ungenutzt. Nicht
   deinstallieren, im Zweifel nur das Häkchen entfernen (reversibel).
+
+### 6.6 Uhrenmetrik und Proposal-Schema — vier offene Punkte vom 9.8.
+
+Keiner davon ist dringend, alle vier sind belegt und keiner ist ein Bug im
+laufenden Betrieb.
+
+**(a) Die Mindestbeweislage rechnet gegen die falsche Basis.**
+`minimum_measurable_ns` leitet 16,667 s daraus ab, dass ein einzelner Frame über
+die **Gesamtdauer** unter 1000 ppm bleibt. Theil-Sen nimmt seinen Median aber
+über die **Paarbasen**, und deren Median liegt bei rund einem Drittel der
+Laufzeit. Die Quantisierungsschwelle sinkt deshalb erst ab ca. **50 s** unter
+1000 ppm und erst ab ca. **100 s** unter 500 ppm — nicht ab 16,7 bzw. 33,3 s.
+Zwischen ca. 17 s und 50 s ist das Gate also schärfer als beabsichtigt.
+Belege aus der Historie: `172c0fa3` (16,53 s) misst 2754,8 ppm, exakt ein Frame
+über seine mediane Paarbasis von 6,05 s — und entkam nur, weil es 0,14 s zu kurz
+war. `66f24f53` (30,75 s) war gate-aktiv bei einer Quantisierungsschwelle von
+1652,9 ppm und landete rein zufällig bei 0,0. Die Warnung bei `78ac253f`
+(516,5 ppm) ist etwa ein halber Frame. Fix wäre, die Schwelle an die mediane
+Paarbasis zu binden statt an die Gesamtdauer.
+
+**(b) Keine Obergrenze für den Counterzuwachs im letzten Intervall.**
+Seit 3a.1 bindet den Stop nur noch `sample_gaps_valid`: aktiver Abstand ≤ 5 s und
+nicht fallender Counter. Wie weit der Stop-Counter der letzten Kalibrierprobe
+vorauslaufen darf, prüft nichts mehr. Vorher tat das auch nichts — die alte
+Prüfung griff nur bei Tickkollision, also bei 2 von 19 Läufen nach Zufall. Wer
+die Grenze will, baut sie als **eigene explizite Prüfung gegen die letzte
+Probe**, die dann für **alle** Läufe gilt.
+
+**(c) Proposal-1.2 statt der gelockerten 1.1-Regel.**
+Sauber wäre ein Bump auf 1.2 mit eigener Digest-Domain, analog zur
+Outro-Einführung, die damals 1.0 → 1.1 ging und die Altbytes im 1.0-Zweig
+gültig ließ. Berührt `_DIGEST_DOMAIN_*`, das `Literal["1.0","1.1"]`,
+`review_app` und `docs\`. Danach dürfte 1.2 `intro_resolution` wieder fordern.
+
+**(d) `minimum_keep_island` ist im Normalbetrieb nicht mehr erreichbar.**
+Die 450-Frame-Zone deckt die 30-Frame-Inselgrenze (500 ms) vollständig ab: Was
+die Inselregel hinter dem Lead-in verwerfen würde, ist längst
+`intro_flow_protected`. Die Regel bleibt als Rückversicherung stehen und greift
+erst, wenn `minimum_keep_island_ms` über 7,5 s gesetzt wird — der zugehörige
+Test tut genau das, um sie überhaupt noch prüfen zu können. Beim Nachjustieren
+der 450 im Blick behalten.
 
 ---
 

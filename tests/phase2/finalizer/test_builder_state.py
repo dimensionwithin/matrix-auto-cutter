@@ -27,6 +27,7 @@ from matrix_auto_cutter.phase2.finalizer.sidecar_builder import (
     _automatic_policy,
     _clock_values,
     _pauses,
+    _samples_without_stop,
     build_sidecar,
 )
 from matrix_auto_cutter.phase2.finalizer.state_machine import (
@@ -428,6 +429,120 @@ def test_drift_below_the_measurable_duration_is_never_gated(monkeypatch, caplog)
     assert PauseMeasurement(start_ns=1, end_ns=2)
     assert _pauses(()) == ((), ())
     del pause, resume
+
+
+# 382a196c-bfb7-4c38-b6ba-69f941a5d89a vom 08.08.2026: seq 103
+# (calibration_sample, Counter 11933) und seq 104 (stop, Counter 11962) tragen
+# denselben monotonic_ns 199933325336.
+_COLLIDING_STOP_LAG_FRAMES = 29
+
+
+def _even_series(count: int) -> tuple[CalibrationSample, ...]:
+    """Exakt 60,000 fps, eine Probe alle zwei Sekunden."""
+    return tuple(
+        CalibrationSample(monotonic_ns=index * 2_000_000_000, output_frame_count=index * 120)
+        for index in range(count)
+    )
+
+
+def test_a_stop_in_the_tick_of_the_last_sample_is_no_residual() -> None:
+    """Die Stop-Probe ist Stützstelle der Interpolation, aber kein Messpunkt.
+
+    Fällt der Stop in den QPC-Tick der letzten Kalibrierprobe, findet
+    ``map_qpc_frame`` per ``bisect_left`` diese Probe und interpoliert den Stop
+    auf deren Counter. Gemessen wird dann die Stop-Latenz des A/V-Interleavers,
+    nicht die Uhr: 382a196c kam so auf 29 Frames = 483,33 ms gegen die
+    50-ms-Schranke, 89c344e6 auf 17 Frames = 283,33 ms. Beide Läufe hatten eine
+    einwandfreie Uhr, und beide Kollisionen deckte bisher kein Test ab.
+    """
+    series = _even_series(21)
+    last = series[-1]
+    stop = SimpleNamespace(
+        monotonic_ns=last.monotonic_ns,
+        output_frame_count=last.output_frame_count + _COLLIDING_STOP_LAG_FRAMES,
+    )
+    samples = (
+        *series,
+        CalibrationSample(
+            monotonic_ns=stop.monotonic_ns, output_frame_count=stop.output_frame_count
+        ),
+    )
+    frames = stop.output_frame_count
+
+    without_stop = _samples_without_stop(samples, stop)
+    assert without_stop == series
+
+    values = _clock_values(samples, without_stop, (), 0, frames, frames)
+    assert isinstance(values, tuple), values
+    assert values.residual_ms == 0
+    assert values.drift_ppm == 0
+    assert values.losses == ()
+
+    # Gegenprobe zur Ursache: nimmt man die Stop-Probe als Messpunkt hinzu,
+    # scheitert exakt derselbe gesunde Lauf am Gate. Die 50-ms-Schranke ist
+    # dabei unverändert; nur ihr Zuständigkeitsbereich war zu weit.
+    rejected = _clock_values(samples, samples, (), 0, frames, frames)
+    assert isinstance(rejected, FinalizerFailure)
+    assert rejected.phase == "sidecar.clock_gate"
+    assert rejected.code is FinalizerErrorCode.JOURNAL_CORRUPT
+
+
+def test_a_real_calibration_sample_beyond_the_bound_still_fails_the_gate() -> None:
+    """Die 50-ms-Schranke bleibt wirksam, sie gilt nur nicht mehr für den Stop.
+
+    Hier kollidiert eine *echte* Kalibrierprobe mit ihrem Vorgänger, um dieselben
+    29 Frames. Der Stop kollidiert zusätzlich mit der letzten Probe und wird wie
+    vorgesehen ignoriert — abgelehnt wird trotzdem, wegen der echten Probe.
+    """
+    series = _even_series(21)
+    offender = CalibrationSample(
+        monotonic_ns=series[10].monotonic_ns,
+        output_frame_count=series[10].output_frame_count + _COLLIDING_STOP_LAG_FRAMES,
+    )
+    last = series[-1]
+    stop = SimpleNamespace(
+        monotonic_ns=last.monotonic_ns,
+        output_frame_count=last.output_frame_count + _COLLIDING_STOP_LAG_FRAMES,
+    )
+    samples = (
+        *series[:11],
+        offender,
+        *series[11:],
+        CalibrationSample(
+            monotonic_ns=stop.monotonic_ns, output_frame_count=stop.output_frame_count
+        ),
+    )
+    frames = stop.output_frame_count
+
+    without_stop = _samples_without_stop(samples, stop)
+    assert len(without_stop) == len(samples) - 1
+    assert offender in without_stop
+
+    rejected = _clock_values(samples, without_stop, (), 0, frames, frames)
+    assert isinstance(rejected, FinalizerFailure)
+    assert rejected.phase == "sidecar.clock_gate"
+    assert rejected.code is FinalizerErrorCode.JOURNAL_CORRUPT
+
+
+def test_builder_finalizes_a_recording_whose_stop_shares_the_last_tick(fake_port) -> None:
+    """Derselbe Fall vollständig durch ``build_sidecar``, wie im Produktivlauf."""
+    total_frames = 20 * 120 + _COLLIDING_STOP_LAG_FRAMES
+    records = journal_records(
+        output_frame_count=total_frames,
+        stop_monotonic_ns=20 * 2_000_000_000,
+        calibration_samples=tuple((index * 2_000_000_000, index * 120) for index in range(1, 21)),
+    )
+    journal = _loaded(fake_port, records)
+    source = source_identity().model_copy(
+        update={"duration_ms": total_frames * 1000 // 60, "video_frame_count": total_frames}
+    )
+    sidecar = build_sidecar(journal, make_intent(journal, source=source))
+    assert isinstance(sidecar, ObsEventSidecarV12), sidecar
+    assert sidecar.clock.max_calibration_residual_ms == 0
+    assert sidecar.clock.drift_ppm == 0
+    # Start, 20 Proben und der Stop: die deklarierte Probenzahl bleibt die volle
+    # Reihe, nur gemessen wird gegen den Stop nicht mehr.
+    assert sidecar.clock.calibration_sample_count == 22
 
 
 def test_state_machine_exact_transitions_and_terminals() -> None:

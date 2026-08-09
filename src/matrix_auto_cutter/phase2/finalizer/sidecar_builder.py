@@ -190,7 +190,7 @@ class _ClockValues(NamedTuple):
     losses: tuple[FrameLoss, ...]
 
 
-def _drift_samples(
+def _samples_without_stop(
     samples: tuple[CalibrationSample, ...],
     stop: JournalStop,
 ) -> tuple[CalibrationSample, ...]:
@@ -201,6 +201,9 @@ def _drift_samples(
     aufzunehmen wäre zirkulär: sie kann die Schätzung nur in Richtung null
     ziehen und damit echte Drift verdecken. Bei den kurzen Läufen der Historie
     verschiebt sie das Ergebnis messbar, etwa von 2754,8 auf 2066,1 ppm.
+
+    Aus demselben Grund misst auch das Residual nicht gegen die Stop-Probe; die
+    Reihe trägt deshalb beide Kennzahlen. Siehe ``_clock_values``.
     """
     return tuple(
         item
@@ -214,7 +217,7 @@ def _drift_samples(
 
 def _clock_values(
     samples: tuple[CalibrationSample, ...],
-    drift_series: tuple[CalibrationSample, ...],
+    without_stop: tuple[CalibrationSample, ...],
     pauses: tuple[PauseMeasurement, ...],
     counter_start: int,
     counter_end: int,
@@ -230,7 +233,18 @@ def _clock_values(
         )
     try:
         residuals: list[Decimal] = []
-        for sample in samples:
+        # Gemessen wird gegen jede Probe außer der Stop-Probe — dieselbe
+        # Begründung wie bei der Driftschätzung in `_samples_without_stop`: der
+        # Adapter verankert den Stop-Zeitstempel auf dem Framecounter, ihr
+        # Residual gegen dieselbe Counterlinie zu halten ist zirkulär. Fällt der
+        # Stop in den QPC-Tick der letzten Kalibrierprobe, interpoliert
+        # `map_qpc_frame` ihn zudem über `bisect_left` auf deren Counter und das
+        # Residual misst die Stop-Latenz des A/V-Interleavers statt der Uhr:
+        # Lauf 382a196c vom 08.08.2026 kam so auf 483,33 ms aus 29 Frames,
+        # 89c344e6 auf 283,33 ms aus 17 Frames, wo alle 19 Journale der Historie
+        # ohne die Stop-Probe exakt 0,00 ms messen. Die Stop-Probe bleibt
+        # Stützstelle der Interpolation, sie ist nur kein Messpunkt.
+        for sample in without_stop:
             _check_cancelled(cancellation)
             residuals.append(
                 calibration_residual_ms(
@@ -257,9 +271,9 @@ def _clock_values(
         residual = max(residuals, default=Decimal(0))
         active_ns = subtract_paused_ns(samples[0].monotonic_ns, samples[-1].monotonic_ns, pauses)
         measurable = active_ns >= minimum_measurable_ns(MAX_DRIFT_PPM)
-        if len(drift_series) >= 2:
-            measured = estimate_drift_ppm(drift_series, pauses)
-            losses = detect_frame_losses(drift_series, pauses)
+        if len(without_stop) >= 2:
+            measured = estimate_drift_ppm(without_stop, pauses)
+            losses = detect_frame_losses(without_stop, pauses)
         elif not measurable:
             # Ein Lauf ohne eigene Kalibrierprobe ist kürzer als ein
             # Kalibrierintervall und damit weit unterhalb jeder Schranke.
@@ -375,7 +389,7 @@ def build_sidecar(
         total_frames = intent.source_identity.video_frame_count
         values = _clock_values(
             samples,
-            _drift_samples(samples, stop),
+            _samples_without_stop(samples, stop),
             pause_measurements,
             counter_start,
             counter_end,

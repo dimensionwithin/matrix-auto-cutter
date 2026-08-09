@@ -698,14 +698,29 @@ def run_review(proposal_path: Path) -> int:
     text.pack(fill="both", expand=True)
     if proposal.proposed_cuts:
         for index, item in enumerate(proposal.proposed_cuts, start=1):
-            evidence = (
-                f"Konservative Stille; Evidence "
-                f"{item.audio_evidence.raw_silence_start_ms / 1000:.3f} bis "
-                f"{item.audio_evidence.raw_silence_end_ms / 1000:.3f} s bei "
-                f"{item.audio_evidence.threshold_db} dB; Protection frei."
-                if item.audio_evidence is not None
-                else "Exakter Outro-Tail nach 900 geschützten Sourceframes."
-            )
+            # Drei Schnittarten, drei Zeilen. Der Intro-Lead-in trägt wie der
+            # Outro-Tail kein audio_evidence und stand deshalb bis zum 09.08.2026
+            # fälschlich unter der Outro-Beschriftung. Der Szenenname kommt als
+            # freier Text aus OBS und wird deshalb über !r gesetzt: das klammert
+            # ihn sichtbar ein und neutralisiert Steuerzeichen, die die Zeile
+            # sonst im Text-Widget zerreißen würden.
+            if item.audio_evidence is not None:
+                evidence = (
+                    f"Konservative Stille; Evidence "
+                    f"{item.audio_evidence.raw_silence_start_ms / 1000:.3f} bis "
+                    f"{item.audio_evidence.raw_silence_end_ms / 1000:.3f} s bei "
+                    f"{item.audio_evidence.threshold_db} dB; Protection frei."
+                )
+            elif item.intro_evidence is not None:
+                marker = item.intro_evidence.scene_name or "Intro-Szene (UUID-Bindung)"
+                evidence = (
+                    f"Intro-Lead-in vor der Szenenmarke {marker!r}; "
+                    f"{item.intro_evidence.removed_ms / 1000:.3f} s entfernt "
+                    f"({item.intro_evidence.removed_frames} Frames) bis Sourceframe "
+                    f"{item.intro_evidence.intro_start_frame}."
+                )
+            else:
+                evidence = "Exakter Outro-Tail nach 900 geschützten Sourceframes."
             text.insert(
                 "end",
                 f"{index}. {item.start_timecode} bis {item.end_timecode} "
