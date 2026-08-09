@@ -28,6 +28,7 @@ from pydantic import (
     model_validator,
 )
 
+from matrix_auto_cutter.atomic import replace_atomically
 from matrix_auto_cutter.intro import (
     INTRO_FLOW_PROTECTED_FRAMES,
     IntroCandidateEvidence,
@@ -407,7 +408,7 @@ def _atomic_create(path: Path, data: bytes) -> bool:
             stream.flush()
             os.fsync(stream.fileno())
         try:
-            os.rename(temporary, path)
+            replace_atomically(temporary, path, create_only=True)
         except FileExistsError:
             return False
         return True

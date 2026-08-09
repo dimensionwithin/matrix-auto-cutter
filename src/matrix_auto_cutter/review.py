@@ -9,6 +9,7 @@ from contextlib import suppress
 from pathlib import Path
 
 from matrix_auto_cutter.approval import ApprovalGateResult, inspect_approval_state
+from matrix_auto_cutter.atomic import replace_atomically
 from matrix_auto_cutter.cut_proposal import CutProposal, ProposalFailed, load_proposal
 from matrix_auto_cutter.selection import SelectionReady, ensure_selection
 
@@ -399,7 +400,9 @@ def write_review(proposal_path: Path, *, api_prefix: str | None = None) -> Path:
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, target)
+        # review.html haelt der Browser offen; ohne Wiederholung scheitert das
+        # Neuschreiben, waehrend die Seite angezeigt wird.
+        replace_atomically(temporary, target)
     finally:
         with suppress(OSError):
             temporary.unlink(missing_ok=True)

@@ -10,6 +10,7 @@ from typing import Literal
 
 from pydantic import Field, model_validator
 
+from matrix_auto_cutter.atomic import replace_atomically
 from matrix_auto_cutter.models import CanonicalModel
 from matrix_auto_cutter.repeat.boundary import (
     BoundaryDetectionParams,
@@ -289,7 +290,7 @@ def write_diagnostics(
             handle.write(_deterministic_json(document))
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, target)
+        replace_atomically(temporary, target)
         temporary = None
     except OSError as exc:
         error = str(exc)

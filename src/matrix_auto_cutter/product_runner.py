@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import warnings
 from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
@@ -31,6 +32,7 @@ from matrix_auto_cutter.approval import (
     ensure_pending_approval,
     inspect_approval_state,
 )
+from matrix_auto_cutter.atomic import open_shared, read_bytes_shared, replace_atomically
 from matrix_auto_cutter.cut_proposal import (
     ProposalFailed,
     ProposalReady,
@@ -407,8 +409,10 @@ class RunnerLogSink(io.TextIOBase):
                 with suppress(FileNotFoundError):
                     source.unlink()
             elif source.exists():
-                os.replace(source, target)
-        os.replace(self.path, self.path.with_name(f"{self.path.name}.1"))
+                replace_atomically(source, target)
+        # Das Protokollfenster liest ``runner.log`` im Sekundentakt; ohne
+        # Wiederholung scheitert die Rotation, solange es offen ist.
+        replace_atomically(self.path, self.path.with_name(f"{self.path.name}.1"))
 
     def _write_fallback(self, line: str) -> None:
         """Erhalte zumindest eine begrenzte lokale Fehlerspur, wenn das Hauptlog ausfaellt."""
@@ -435,7 +439,9 @@ def load_runner_status(state_directory: Path | None = None) -> RunnerStatus | No
     """Lade ausschliesslich die kleine, lokale Statusdatei ohne Fehlerweitergabe."""
     path = (state_directory or default_state_directory()) / "status.json"
     try:
-        return RunnerStatus.model_validate_json(path.read_bytes())
+        # Geteilt öffnen, damit das pollende Review-Fenster den Runner nicht
+        # daran hindert, seine eigene Statusdatei zu ersetzen.
+        return RunnerStatus.model_validate_json(read_bytes_shared(path))
     except (OSError, UnicodeError, ValidationError, ValueError):
         return None
 
@@ -497,7 +503,9 @@ def tail_runner_log(log_directory: Path | None = None, *, maximum_bytes: int = 1
     path = (directory / "runner.log").resolve(strict=False)
     try:
         path.relative_to(directory)
-        with path.open("rb") as stream:
+        # Geteilt öffnen: sonst scheitert die Logrotation des Runners, solange
+        # das Protokollfenster offen ist.
+        with open_shared(path) as stream:
             stream.seek(0, os.SEEK_END)
             size = stream.tell()
             stream.seek(max(0, size - maximum_bytes), os.SEEK_SET)
@@ -751,11 +759,11 @@ def _atomic_bytes(path: Path, data: bytes, *, create_only: bool) -> bool:
             os.fsync(stream.fileno())
         if create_only:
             try:
-                os.rename(temporary, path)
+                replace_atomically(temporary, path, create_only=True)
             except FileExistsError:
                 return False
         else:
-            os.replace(temporary, path)
+            replace_atomically(temporary, path)
     finally:
         with suppress(OSError):
             temporary.unlink(missing_ok=True)
@@ -946,7 +954,26 @@ class ProductRunner:
             return
         refreshed = status.model_copy(update={"last_heartbeat_at": self.dependencies.now()})
         self._last_status = refreshed
-        _atomic_bytes(self.status_path, _model_bytes(refreshed), create_only=False)
+        self._write_status_file(refreshed)
+
+    def _write_status_file(self, status: RunnerStatus) -> bool:
+        """Schreibe die Betriebsansicht; ihr Ausfall darf den Runner nie beenden.
+
+        ``status.json`` ist Anzeige, nicht Ergebnis.  Bleibt sie trotz
+        Wiederholung gesperrt — etwa weil das Review-Fenster sie gerade liest —,
+        wird gewarnt statt geworfen; der nächste Takt schreibt erneut.
+        """
+        try:
+            _atomic_bytes(self.status_path, _model_bytes(status), create_only=False)
+        except OSError as error:
+            warnings.warn(
+                f"Runnerstatus {self.status_path} konnte nicht geschrieben werden: "
+                f"{type(error).__name__}: {error}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return False
+        return True
 
     def stop_requested(self) -> bool:
         """Pruefe den lokalen Stop-Request ohne Netzwerk oder Prozessmanipulation."""
@@ -1229,7 +1256,10 @@ class ProductRunner:
             render_id=render_id,
         )
         self._last_status = status
-        _atomic_bytes(self.status_path, _model_bytes(status), create_only=False)
+        if not self._write_status_file(status):
+            # Entprellung zurücknehmen, sonst bliebe die Datei bis zum nächsten
+            # *anderen* Status veraltet stehen.
+            self._last_status_by_subject.pop(subject, None)
         if self.diagnostics is not None:
             self.diagnostics.status(status)
         timestamp = status.updated_at.astimezone().strftime("%Y-%m-%d %H:%M:%S")

@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import threading
 import time
+import warnings
 from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
@@ -27,6 +28,7 @@ from matrix_auto_cutter.approval import (
     SelectiveProposalApproval,
     check_render_authorization,
 )
+from matrix_auto_cutter.atomic import read_bytes_shared, replace_atomically
 from matrix_auto_cutter.cut_proposal import (
     CutProposal,
     FfmpegIdentity,
@@ -712,10 +714,10 @@ def _atomic_write(path: Path, data: bytes, *, replace: bool) -> bool:
             stream.flush()
             os.fsync(stream.fileno())
         if replace:
-            os.replace(temporary, path)
+            replace_atomically(temporary, path)
             return True
         try:
-            os.rename(temporary, path)
+            replace_atomically(temporary, path, create_only=True)
             return True
         except FileExistsError:
             return False
@@ -726,7 +728,9 @@ def _atomic_write(path: Path, data: bytes, *, replace: bool) -> bool:
 
 def _load_model(path: Path, model_type: type[CanonicalModel]) -> CanonicalModel | None:
     try:
-        data = path.read_bytes()
+        # Geteilt öffnen: das Review-Fenster liest diese Dateien im Sekundentakt,
+        # während der Render sie ersetzt.  Ein Leser darf den Tausch nicht sperren.
+        data = read_bytes_shared(path)
         if not data or len(data) > MAX_JSON_BYTES:
             return None
         model = model_type.model_validate_json(data)
@@ -748,7 +752,7 @@ def _load_versioned(
 ) -> CanonicalModel | None:
     """Select a strict canonical reader from the explicit schema marker only."""
     try:
-        document = json.loads(path.read_bytes())
+        document = json.loads(read_bytes_shared(path))
         version = document.get("schema_version") if isinstance(document, dict) else None
     except (OSError, UnicodeError, json.JSONDecodeError):
         return None
@@ -765,14 +769,30 @@ def load_render_status(proposal_path: Path) -> RenderStatusModel | None:
     return loaded if isinstance(loaded, RenderStatus | RenderStatusV11) else None
 
 
-def write_render_status(proposal_path: Path, status: RenderStatusModel) -> None:
-    """Atomically replace the UI status only on a material transition."""
+def write_render_status(proposal_path: Path, status: RenderStatusModel) -> bool:
+    """Atomically replace the UI status only on a material transition.
+
+    Der Status ist Anzeige, nicht Ergebnis.  Bleibt die Datei trotz Wiederholung
+    gesperrt, wird gewarnt und ``False`` zurückgegeben — ein laufender Render
+    darf daran nie sterben.  Der nächste Fortschrittstakt schreibt ohnehin
+    erneut.
+    """
     existing = load_render_status(proposal_path)
     if existing is not None and existing.model_dump(exclude={"updated_at"}) == status.model_dump(
         exclude={"updated_at"}
     ):
-        return
-    _atomic_write(render_status_path(proposal_path), _canonical_bytes(status), replace=True)
+        return True
+    path = render_status_path(proposal_path)
+    try:
+        _atomic_write(path, _canonical_bytes(status), replace=True)
+    except OSError as error:
+        warnings.warn(
+            f"Renderstatus {path} konnte nicht geschrieben werden: {type(error).__name__}: {error}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return False
+    return True
 
 
 def target_path_for(proposal: CutProposal, target_directory: Path) -> Path:

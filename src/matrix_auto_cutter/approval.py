@@ -14,6 +14,7 @@ from typing import Literal
 
 from pydantic import AwareDatetime, Field, ValidationError, model_validator
 
+from matrix_auto_cutter.atomic import replace_atomically
 from matrix_auto_cutter.cut_proposal import (
     CutProposal,
     ProposalFailed,
@@ -166,11 +167,11 @@ def _atomic_write(path: Path, data: bytes, *, create_only: bool) -> bool:
             os.fsync(stream.fileno())
         if create_only:
             try:
-                os.rename(temporary, path)
+                replace_atomically(temporary, path, create_only=True)
             except FileExistsError:
                 return False
         else:
-            os.replace(temporary, path)
+            replace_atomically(temporary, path)
         return True
     finally:
         with suppress(OSError):

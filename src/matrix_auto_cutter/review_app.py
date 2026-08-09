@@ -24,6 +24,7 @@ from matrix_auto_cutter.approval import (
     inspect_approval_state,
     record_selected_decision,
 )
+from matrix_auto_cutter.atomic import replace_atomically
 from matrix_auto_cutter.cut_proposal import ProposalFailed, load_proposal
 from matrix_auto_cutter.product_runner import (
     default_log_directory,
@@ -151,7 +152,7 @@ def store_window_geometry(path: Path, geometry: WindowGeometry) -> None:
             ),
             encoding="utf-8",
         )
-        temporary.replace(path)
+        replace_atomically(temporary, path)
 
 
 class _Measurable(Protocol):
