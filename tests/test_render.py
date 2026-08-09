@@ -754,6 +754,311 @@ def test_encoder_arguments_are_explicit_and_attempt_specific(
     assert nvenc[-1] != x264[-1] and "-ar" in nvenc and "48000" in nvenc
 
 
+MEASUREMENT_REPORT = (
+    b'[Parsed_loudnorm_0 @ 0]\n{\n"input_i" : "-30.96",\n"input_lra" : "8.00",\n'
+    b'"input_tp" : "-0.55",\n"input_thresh" : "-41.76",\n"target_offset" : "0.54"\n}\n'
+)
+
+
+def _report(**values: str) -> bytes:
+    body = ",\n".join(f'"{key}" : "{value}"' for key, value in values.items())
+    return f"[Parsed_loudnorm_0 @ 0]\n{{\n{body}\n}}\n".encode()
+
+
+class LoudnessScriptedRender(ScriptedRender):
+    """Answer pass 1, the render's own report and the acceptance measurement."""
+
+    def __init__(
+        self,
+        *,
+        cancelled: bool = False,
+        applied: str = "dynamic",
+        achieved_i: str = "-14.34",
+        achieved_tp: str = "-1.19",
+        achieved_lra: str = "6.60",
+    ) -> None:
+        super().__init__()
+        self.cancelled = cancelled
+        self.applied = applied
+        self.achieved = _report(
+            input_i=achieved_i,
+            input_lra=achieved_lra,
+            input_tp=achieved_tp,
+            input_thresh="-25.89",
+            target_offset="0.10",
+        )
+        self.measurement_calls = 0
+        self.acceptance_calls = 0
+
+    def __call__(
+        self, arguments: object, timeout: int, cancellation: threading.Event
+    ) -> ProcessResult:
+        values = tuple(arguments)  # type: ignore[arg-type]
+        if "-vn" in values:
+            self.measurement_calls += 1
+            if self.cancelled:
+                return ProcessResult(-9, cancelled=True)
+            return ProcessResult(0, b"", MEASUREMENT_REPORT)
+        if "-af" in values:
+            self.acceptance_calls += 1
+            return ProcessResult(0, b"", self.achieved)
+        rendered = super().__call__(arguments, timeout, cancellation)
+        if "-progress" not in values:
+            return rendered
+        return ProcessResult(
+            rendered.exit_code, rendered.stdout, _report(normalization_type=self.applied)
+        )
+
+
+def test_cancelled_measurement_stops_the_run_before_any_encoding(
+    tmp_path: Path, raw_sidecar: dict[str, object]
+) -> None:
+    _source, ready, accepted = _approved_request(tmp_path, raw_sidecar)
+    process = LoudnessScriptedRender(cancelled=True)
+    outcome = execute_approved_render(
+        ready.proposal_path,
+        accepted.request,
+        _binary("ffmpeg"),
+        _binary("ffprobe"),
+        process_runner=process,
+        now=lambda: NOW,
+        uuid_factory=lambda: RENDER_UUID,
+    )
+    assert isinstance(outcome, RenderFailed)
+    assert outcome.code == "E_RENDER_CANCELLED"
+    assert process.render_calls == 0
+    assert not Path(accepted.request.target_path).exists()
+
+
+def test_measured_values_are_reused_and_the_result_is_logged_not_warned(
+    tmp_path: Path, raw_sidecar: dict[str, object]
+) -> None:
+    from matrix_auto_cutter.render import LOUDNESS_LOG_FILE_NAME
+
+    _source, ready, accepted = _approved_request(tmp_path, raw_sidecar)
+    process = LoudnessScriptedRender(applied="dynamic")
+    outcome = execute_approved_render(
+        ready.proposal_path,
+        accepted.request,
+        _binary("ffmpeg"),
+        _binary("ffprobe"),
+        process_runner=process,
+        now=lambda: NOW,
+        uuid_factory=lambda: RENDER_UUID,
+    )
+    assert isinstance(outcome, RenderSucceeded)
+    assert process.measurement_calls == 1 and process.acceptance_calls == 1
+    graph = outcome.plan.filtergraph
+    assert "measured_I=-30.96:measured_LRA=8:measured_TP=-0.55" in graph
+    assert "linear=true" in graph and "alimiter=limit=-1.5dB:level=false" in graph
+    status = load_render_status(ready.proposal_path)
+    assert status is not None
+    # dynamic ist der Normalfall und steht im Protokoll, nicht in einer Warnung.
+    assert "loudnorm dynamic" in status.message_de
+    assert "I -14.34 LUFS · TP -1.19 dBTP · LRA 6.60 LU" in status.message_de
+    assert "Warnung" not in status.message_de
+    log = outcome.plan_path.with_name(LOUDNESS_LOG_FILE_NAME)
+    assert log.read_bytes() == MEASUREMENT_REPORT
+
+
+@pytest.mark.parametrize(
+    ("achieved", "expected"),
+    [
+        ({"achieved_i": "-16.10"}, "weicht um -2.10 dB"),
+        ({"achieved_tp": "-0.20"}, "True Peak -0.20 dBTP liegt über -0.5 dBTP"),
+        ({"achieved_lra": "3.10"}, "Lautheitsumfang 3.10 LU liegt unter 4 LU"),
+    ],
+)
+def test_a_missed_acceptance_bound_becomes_visible(
+    tmp_path: Path,
+    raw_sidecar: dict[str, object],
+    achieved: dict[str, str],
+    expected: str,
+) -> None:
+    _source, ready, accepted = _approved_request(tmp_path, raw_sidecar)
+    outcome = execute_approved_render(
+        ready.proposal_path,
+        accepted.request,
+        _binary("ffmpeg"),
+        _binary("ffprobe"),
+        process_runner=LoudnessScriptedRender(**achieved),
+        now=lambda: NOW,
+        uuid_factory=lambda: RENDER_UUID,
+    )
+    assert isinstance(outcome, RenderSucceeded)
+    status = load_render_status(ready.proposal_path)
+    assert status is not None and expected in status.message_de
+    assert status.message_de.count("Warnung:") == 1
+
+
+def test_failed_measurement_warns_and_still_renders_single_pass(
+    tmp_path: Path, raw_sidecar: dict[str, object]
+) -> None:
+    _source, ready, accepted = _approved_request(tmp_path, raw_sidecar)
+    outcome = execute_approved_render(
+        ready.proposal_path,
+        accepted.request,
+        _binary("ffmpeg"),
+        _binary("ffprobe"),
+        process_runner=ScriptedRender(),
+        now=lambda: NOW,
+        uuid_factory=lambda: RENDER_UUID,
+    )
+    assert isinstance(outcome, RenderSucceeded)
+    graph = outcome.plan.filtergraph
+    assert "measured_" not in graph and "linear=true" not in graph
+    assert "loudnorm=I=-14:TP=-1:LRA=11:print_format=json" in graph
+    status = load_render_status(ready.proposal_path)
+    assert status is not None
+    assert "Lautheitsmessung (Durchgang 1) fehlgeschlagen" in status.message_de
+
+
+def test_audio_only_graph_cuts_exactly_like_the_render(
+    tmp_path: Path, raw_sidecar: dict[str, object]
+) -> None:
+    from matrix_auto_cutter.render import build_audio_filtergraph
+
+    _source, _sidecar, ready = _proposal(tmp_path, raw_sidecar)
+    keeps = build_keep_segments(ready.proposal)
+    audio_only = build_audio_filtergraph(keeps, audio_index=7)
+    full = build_filtergraph(keeps, video_index=3, audio_index=7)
+    for segment in ("start=0.000000000:end=2.350000000", "start=3.650000000:end=6.000000000"):
+        assert f"[0:7]atrim={segment}" in audio_only
+        assert f"[0:7]atrim={segment}" in full
+    assert "]trim=" not in audio_only and "[v" not in audio_only
+    assert audio_only.endswith("[a0][a1]concat=n=2:v=0:a=1[aout]")
+    with pytest.raises(ValueError, match="at least one"):
+        build_audio_filtergraph(())
+
+
+def test_loudness_chain_is_appended_behind_concat_in_both_graphs(
+    tmp_path: Path, raw_sidecar: dict[str, object]
+) -> None:
+    from matrix_auto_cutter.render import build_audio_filtergraph
+
+    _source, _sidecar, ready = _proposal(tmp_path, raw_sidecar)
+    keeps = build_keep_segments(ready.proposal)
+    full = build_filtergraph(keeps, audio_chain="volume=2")
+    audio_only = build_audio_filtergraph(keeps, audio_chain="volume=2")
+    assert "concat=n=2:v=1:a=1[vout][acut];[acut]volume=2[aout]" in full
+    assert audio_only.endswith("concat=n=2:v=0:a=1[acut];[acut]volume=2[aout]")
+    # Ohne Kette bleibt der Graph byte-gleich zu dem, den der Renderer immer baute.
+    assert build_filtergraph(keeps).endswith("concat=n=2:v=1:a=1[vout][aout]")
+
+
+def test_measurement_pass_is_audio_only_and_writes_no_file(
+    tmp_path: Path, raw_sidecar: dict[str, object]
+) -> None:
+    from matrix_auto_cutter.render import _measurement_arguments
+
+    _source, _sidecar, ready = _proposal(tmp_path, raw_sidecar)
+    arguments = _measurement_arguments(_binary("ffmpeg"), ready.proposal, "graph")
+    assert arguments[-4:] == ("[aout]", "-f", "null", "-")
+    assert "-vn" in arguments and "-filter_complex" in arguments
+    assert "-loglevel" in arguments and "info" in arguments and "-nostats" in arguments
+    assert "-progress" not in arguments
+
+
+def test_render_arguments_keep_the_loudnorm_report_readable(
+    tmp_path: Path, raw_sidecar: dict[str, object]
+) -> None:
+    from matrix_auto_cutter.render import _render_arguments
+
+    _source, _sidecar, ready = _proposal(tmp_path, raw_sidecar)
+    streams = StreamSelection(
+        video_index=0,
+        audio_index=1,
+        width=160,
+        height=90,
+        fps_num=60,
+        fps_den=1,
+        audio_sample_rate=48_000,
+    )
+    arguments = _render_arguments(
+        _binary("ffmpeg"),
+        ready.proposal,
+        streams,
+        build_filtergraph((KeepSegment(start_frame=0, end_frame=60),)),
+        "libx264",
+        tmp_path / "x264.partial.mp4",
+    )
+    # loudnorm druckt seinen Bericht auf AV_LOG_INFO; mit "error" bliebe die
+    # Pflichtprüfung auf normalization_type blind.
+    assert "error" not in arguments
+    assert arguments[arguments.index("-loglevel") + 1] == "info"
+    assert "-nostats" in arguments and "-ar" in arguments and "48000" in arguments
+
+
+@pytest.mark.parametrize(
+    ("warnings", "expected"),
+    [
+        ((), "Basis"),
+        (("eins", "zwei"), "Basis · Warnung: eins · zwei"),
+    ],
+)
+def test_warnings_reach_the_status_message(warnings: tuple[str, ...], expected: str) -> None:
+    from matrix_auto_cutter.render import _with_warnings
+
+    assert _with_warnings("Basis", warnings) == expected
+    assert len(_with_warnings("Basis", ("x" * 4000,))) == 2000
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        ProcessResult(1, b"", b"{\n\t\"input_i\" : \"-30.96\"\n}"),
+        ProcessResult(0, b"", b"", timed_out=True),
+        ProcessResult(0, b"", b"kein JSON"),
+        ProcessResult(0, b"", b"{\n\t\"input_i\" : \"-30.96\"\n}"),
+    ],
+)
+def test_measurement_without_usable_values_is_reported_as_absent(result: ProcessResult) -> None:
+    from matrix_auto_cutter.render import _parse_measurement
+
+    assert _parse_measurement(result) is None
+
+
+def test_measurement_returns_the_five_reused_values() -> None:
+    from matrix_auto_cutter.loudness import LoudnessMeasurement
+    from matrix_auto_cutter.render import _parse_measurement
+
+    stderr = (
+        b'{\n"input_i" : "-30.96",\n"input_lra" : "8.00",\n"input_tp" : "-0.55",\n'
+        b'"input_thresh" : "-41.76",\n"target_offset" : "0.54"\n}'
+    )
+    assert _parse_measurement(ProcessResult(0, b"", stderr)) == LoudnessMeasurement(
+        input_i=-30.96,
+        input_lra=8.0,
+        input_tp=-0.55,
+        input_thresh=-41.76,
+        target_offset=0.54,
+    )
+
+
+@pytest.mark.parametrize(
+    ("stderr", "expected"),
+    [
+        (b'{"normalization_type" : "linear"}', "linear"),
+        (b'{"normalization_type" : "dynamic"}', "dynamic"),
+        (b"nichts", None),
+    ],
+)
+def test_applied_mode_is_read_for_the_protocol(stderr: bytes, expected: str | None) -> None:
+    from matrix_auto_cutter.render import _applied_mode
+
+    assert _applied_mode(ProcessResult(0, b"", stderr)) == expected
+
+
+def test_acceptance_measurement_reads_the_finished_file(tmp_path: Path) -> None:
+    from matrix_auto_cutter.render import _result_arguments
+
+    arguments = _result_arguments(_binary("ffmpeg"), tmp_path / "x.partial.mp4")
+    assert arguments[-5:] == ("-af", "loudnorm=print_format=json", "-f", "null", "-")
+    assert "-map" in arguments and "0:a:0" in arguments
+    assert str(tmp_path / "x.partial.mp4") in arguments
+    assert "-loglevel" in arguments and "info" in arguments
+
+
 def test_status_v11_is_canonical_and_review_projects_dedicated_fields(
     tmp_path: Path, raw_sidecar: dict[str, object]
 ) -> None:

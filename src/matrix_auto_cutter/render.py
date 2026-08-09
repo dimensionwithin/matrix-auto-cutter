@@ -21,6 +21,7 @@ from uuid import UUID, uuid4
 
 from pydantic import AwareDatetime, Field, ValidationError, model_validator
 
+from matrix_auto_cutter import loudness
 from matrix_auto_cutter.approval import (
     ApprovalArtifact,
     SelectiveProposalApproval,
@@ -41,12 +42,16 @@ RENDER_PLAN_FILE_NAME = "render-plan.json"
 RENDER_RESULT_FILE_NAME = "render-result.json"
 RENDER_ATTEMPTS_FILE_NAME = "render-attempts.json"
 NVENC_CAPABILITY_FILE_NAME = "nvenc-capability.json"
+LOUDNESS_LOG_FILE_NAME = "loudness-measurement.log"
 RENDER_SCHEMA_VERSION: Literal["1.0"] = "1.0"
 DEFAULT_RENDER_DIRECTORY = Path(r"F:\MatrixMarketAutoEdit\Rendered")
 MAX_JSON_BYTES = 16 * 1024 * 1024
 MAX_PROCESS_OUTPUT_BYTES = 2 * 1024 * 1024
 RENDER_TIMEOUT_SECONDS = 6 * 60 * 60
 VERIFY_TIMEOUT_SECONDS = 30 * 60
+# Durchgang 1 dekodiert nur den Ton; ein 90-Minuten-Original braucht dafür
+# wenige Minuten.  Die Stunde ist eine Notbremse, keine Erwartung.
+LOUDNESS_TIMEOUT_SECONDS = 60 * 60
 
 RenderState = Literal[
     "render_not_authorized",
@@ -879,13 +884,13 @@ def build_keep_segments(
     return tuple(keeps)
 
 
-def build_filtergraph(
+def _trim_chains(
     segments: Sequence[KeepSegment],
     *,
-    video_index: int = 0,
-    audio_index: int = 1,
-) -> str:
-    """Build one deterministic video/audio trim and concat graph."""
+    video_index: int | None,
+    audio_index: int,
+) -> tuple[list[str], list[str]]:
+    """Build the per-segment trim chains and their concat input labels."""
     if not segments:
         raise ValueError("at least one keep segment is required")
     chains: list[str] = []
@@ -895,15 +900,63 @@ def build_filtergraph(
         end = Decimal(segment.end_frame) / Decimal(60)
         start_text = format(start.quantize(Decimal("0.000000001")), "f")
         end_text = format(end.quantize(Decimal("0.000000001")), "f")
-        chains.append(
-            f"[0:{video_index}]trim=start={start_text}:end={end_text},setpts=PTS-STARTPTS[v{index}]"
-        )
+        if video_index is not None:
+            chains.append(
+                f"[0:{video_index}]trim=start={start_text}:end={end_text},"
+                f"setpts=PTS-STARTPTS[v{index}]"
+            )
+            inputs.append(f"[v{index}][a{index}]")
+        else:
+            inputs.append(f"[a{index}]")
         chains.append(
             f"[0:{audio_index}]atrim=start={start_text}:end={end_text},"
             f"asetpts=PTS-STARTPTS[a{index}]"
         )
-        inputs.append(f"[v{index}][a{index}]")
-    chains.append(f"{''.join(inputs)}concat=n={len(segments)}:v=1:a=1[vout][aout]")
+    return chains, inputs
+
+
+def _audio_output(audio_chain: str | None) -> tuple[str, list[str]]:
+    """Return the concat audio label and any trailing chain producing ``[aout]``."""
+    if audio_chain is None:
+        return "[aout]", []
+    return "[acut]", [f"[acut]{audio_chain}[aout]"]
+
+
+def build_filtergraph(
+    segments: Sequence[KeepSegment],
+    *,
+    video_index: int = 0,
+    audio_index: int = 1,
+    audio_chain: str | None = None,
+) -> str:
+    """Build one deterministic video/audio trim and concat graph.
+
+    Without ``audio_chain`` the graph is byte-identical to the one this renderer
+    has always produced; the loudness chain is appended behind ``concat``.
+    """
+    chains, inputs = _trim_chains(segments, video_index=video_index, audio_index=audio_index)
+    label, tail = _audio_output(audio_chain)
+    chains.append(f"{''.join(inputs)}concat=n={len(segments)}:v=1:a=1[vout]{label}")
+    chains.extend(tail)
+    return ";".join(chains)
+
+
+def build_audio_filtergraph(
+    segments: Sequence[KeepSegment],
+    *,
+    audio_index: int = 1,
+    audio_chain: str | None = None,
+) -> str:
+    """Build the same cuts audio-only, for the measurement pass.
+
+    The measurement has to run through exactly the cuts the render runs through:
+    removing silence moves the integrated value (+0,36 dB on run
+    2026-08-09 08-43-22), so measuring the uncut source measures the wrong file.
+    """
+    chains, inputs = _trim_chains(segments, video_index=None, audio_index=audio_index)
+    label, tail = _audio_output(audio_chain)
+    chains.append(f"{''.join(inputs)}concat=n={len(segments)}:v=0:a=1{label}")
+    chains.extend(tail)
     return ";".join(chains)
 
 
@@ -1256,8 +1309,13 @@ def _render_arguments(
         "-hide_banner",
         "-nostdin",
         "-n",
+        # ``loudnorm`` prints its report at AV_LOG_INFO, so ``error`` would hide the
+        # mandatory ``normalization_type`` check.  ``-nostats`` keeps the per-frame
+        # statistics out; progress is read from ``-progress`` on stdout anyway.
+        # Measured on a complete run: 26 stderr lines.
+        "-nostats",
         "-loglevel",
-        "error",
+        "info",
         "-progress",
         "pipe:1",
         "-i",
@@ -1308,6 +1366,76 @@ def _render_arguments(
             str(partial),
         )
     )
+
+
+def _measurement_arguments(
+    ffmpeg_path: Path,
+    proposal: CutProposal,
+    filtergraph: str,
+) -> tuple[str, ...]:
+    """Build pass 1: audio only, through the render's own cuts, writing no file."""
+    return (
+        str(ffmpeg_path),
+        "-hide_banner",
+        "-nostdin",
+        "-nostats",
+        "-loglevel",
+        "info",
+        "-i",
+        proposal.source_path,
+        "-vn",
+        "-filter_complex",
+        filtergraph,
+        "-map",
+        "[aout]",
+        "-f",
+        "null",
+        "-",
+    )
+
+
+def _parse_measurement(result: ProcessResult) -> loudness.LoudnessMeasurement | None:
+    """Read pass 1's measured values, or report that there are none to reuse."""
+    if result.exit_code != 0 or result.timed_out:
+        return None
+    report = loudness.parse_report(result.stderr)
+    if report is None:
+        return None
+    return loudness.measurement_from_report(report)
+
+
+def _applied_mode(rendered: ProcessResult) -> str | None:
+    """Read which mode loudnorm ran in; this belongs in the log, not in a warning."""
+    report = loudness.parse_report(rendered.stderr)
+    return loudness.normalization_type(report) if report is not None else None
+
+
+def _result_arguments(ffmpeg_path: Path, partial: Path) -> tuple[str, ...]:
+    """Measure the finished output's own loudness; this writes no file."""
+    return (
+        str(ffmpeg_path),
+        "-hide_banner",
+        "-nostdin",
+        "-nostats",
+        "-loglevel",
+        "info",
+        "-i",
+        str(partial),
+        "-map",
+        "0:a:0",
+        "-af",
+        "loudnorm=print_format=json",
+        "-f",
+        "null",
+        "-",
+    )
+
+
+def _with_warnings(message: str, warnings: Sequence[str]) -> str:
+    """Append bounded loudness warnings so they reach the UI and runner.log."""
+    if not warnings:
+        return message
+    return f"{message} · Warnung: {' · '.join(warnings)}"[:2000]
 
 
 def _status(
@@ -1760,10 +1888,68 @@ def execute_approved_render(
         return _persist_failure(
             proposal_path, attempt_directory, proposal, request, result, now, status_callback
         )
+    _publish_status(
+        proposal_path,
+        _status(
+            proposal,
+            "render_running",
+            "Durchgang 1 von 2: Lautheit wird durch dieselben Schnitte gemessen.",
+            now,
+            request=request,
+            render_id=render_id,
+            progress_percent=0,
+        ),
+        status_callback,
+    )
+    measurement = runner(
+        _measurement_arguments(
+            ffmpeg_path,
+            proposal,
+            build_audio_filtergraph(
+                keep_segments,
+                audio_index=streams.audio_index,
+                audio_chain=loudness.measurement_chain(),
+            ),
+        ),
+        LOUDNESS_TIMEOUT_SECONDS,
+        stopped,
+    )
+    _atomic_write(
+        attempt_directory / LOUDNESS_LOG_FILE_NAME,
+        measurement.stderr[-MAX_PROCESS_OUTPUT_BYTES:],
+        replace=True,
+    )
+    if measurement.cancelled or stopped.is_set():
+        result = _failure_result(
+            render_id=render_id,
+            request=request,
+            started_at=started_at,
+            ended_at=now(),
+            target=target,
+            phase="render",
+            code="E_RENDER_CANCELLED",
+            message="Lautheitsmessung wurde abgebrochen.",
+            interrupted=True,
+        )
+        return _persist_failure(
+            proposal_path, attempt_directory, proposal, request, result, now, status_callback
+        )
+    measured = _parse_measurement(measurement)
+    loudness_warnings: list[str] = []
+    if measured is None:
+        # Vorbild ist der Frameverlust im Journal: er warnt, er lässt den Lauf
+        # nicht scheitern.  Erst das Video herausbekommen.
+        loudness_warnings.append(
+            "Lautheitsmessung (Durchgang 1) fehlgeschlagen, es läuft ein einziger "
+            f"loudnorm-Durchgang (Exitcode {measurement.exit_code})."
+        )
+    # Einmal gemessen, bei jedem Encoderversuch dieselbe Kette: der
+    # libx264-Wiederholungslauf baut seine Argumente aus genau diesem Graphen.
     filtergraph = build_filtergraph(
         keep_segments,
         video_index=streams.video_index,
         audio_index=streams.audio_index,
+        audio_chain=loudness.render_chain(measured),
     )
     arguments = _render_arguments(ffmpeg_path, proposal, streams, filtergraph, encoder, partial)
     preferred_encoder = encoder
@@ -2134,7 +2320,9 @@ def execute_approved_render(
         _status(
             proposal,
             "render_verifying",
-            "Partialausgabe wird vollständig technisch verifiziert.",
+            _with_warnings(
+                "Partialausgabe wird vollständig technisch verifiziert.", loudness_warnings
+            ),
             now,
             request=request,
             render_id=render_id,
@@ -2216,6 +2404,18 @@ def execute_approved_render(
             proposal_path, attempt_directory, proposal, request, result, now, status_callback
         )
     assert profile is not None
+    # Abnahme am fertig kodierten Ergebnis, nicht am Innenleben des Filters.
+    # Eigener Durchgang statt eines Filters im Decode-Test darüber: der
+    # Decode-Test ist ein Tor, diese Messung ist eine Warnung und darf den Lauf
+    # unter keinen Umständen scheitern lassen.
+    achieved = _parse_measurement(
+        runner(_result_arguments(ffmpeg_path, partial), LOUDNESS_TIMEOUT_SECONDS, stopped)
+    )
+    loudness_protocol = loudness.protocol_line(achieved, _applied_mode(rendered))
+    if achieved is None:
+        loudness_warnings.append("Abnahmemessung des Ergebnisses war nicht lesbar.")
+    else:
+        loudness_warnings.extend(loudness.acceptance_warnings(achieved))
     final_gate = check_render_authorization(proposal_path)
     if not final_gate.authorized:
         _write_attempt_evidence(
@@ -2361,9 +2561,12 @@ def execute_approved_render(
         _status(
             proposal,
             "render_succeeded",
-            f"Encoder: {'NVIDIA NVENC' if encoder == 'h264_nvenc' else 'CPU / libx264'} · "
-            f"Fallback: {'nein' if fallback_reason is None else fallback_reason} · "
-            f"100% · {result.message_de}",
+            _with_warnings(
+                f"Encoder: {'NVIDIA NVENC' if encoder == 'h264_nvenc' else 'CPU / libx264'} · "
+                f"Fallback: {'nein' if fallback_reason is None else fallback_reason} · "
+                f"100% · {loudness_protocol} · {result.message_de}",
+                loudness_warnings,
+            ),
             now,
             request=request,
             render_id=render_id,
