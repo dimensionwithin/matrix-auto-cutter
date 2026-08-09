@@ -44,6 +44,8 @@ Zwei Konstanten, beide in `intro.py`, beide am Ergebnis nachjustiert:
 - **`INTRO_CUT_OFFSET_FRAMES = 148`** — 35 Frames Rest der Vorszene (gemessen)
   plus 113 Frames Stingerlänge (`Stinger_synchron.webm`, gemessen 1,877 s).
   Ergibt 2,467 s. **Ein neu gerenderter Stinger verschiebt diese Zahl.**
+  → **Überholt. Seit dem 9.8. abends 85, und die Herleitung war falsch;
+  siehe Abschnitt 3.3.**
 - **`INTRO_FLOW_PROTECTED_FRAMES = 450`** — 7,5 s feste Einstiegszone hinter dem
   Schnitt, halboffen `[intro_start, intro_start+450)`. Stille-Kandidaten, die
   darin *beginnen*, werden **ganz verworfen**, nicht gekürzt. Der Nutzer
@@ -51,7 +53,8 @@ Zwei Konstanten, beide in `intro.py`, beide am Ergebnis nachjustiert:
 
 Zeitachse ist die **Frameachse** über `mapped_source_frame`, nicht `monotonic_ns`
 — die beiden Uhren liegen rund 283 ms auseinander (Startversatz zwischen
-Ausgangssignal und erstem Videoframe).
+Ausgangssignal und erstem Videoframe). → **Der Startversatz ist keine
+Konstante: gemessen 267 ms bis 1050 ms. Siehe Abschnitt 3.3.**
 
 Bindung über das Label „Intro with Cam", Rückfallebene `scene_uuid`
 `df50e171-befb-4d89-b9e9-66a29dd0865e`. Erstes Vorkommen gewinnt. Fehlt das
@@ -104,7 +107,8 @@ Regel fordert wieder nur die Outro-Resolution; frisch erzeugte Proposals tragen
 
 **Merksatz: Wer Proposal-1.1 liest, darf `intro_resolution` nicht
 voraussetzen.** Der sauberere Weg wäre ein Bump auf 1.2 mit eigener
-Digest-Domain, siehe offene Punkte.
+Digest-Domain, siehe offene Punkte. → **Am 9.8. abends gebaut, siehe
+Abschnitt 3.3.**
 
 ---
 
@@ -236,6 +240,76 @@ Zwei Dinge zum Merken:
 
 ---
 
+### 3.3 Nachtrag 9.8. abends — Taktkorrektur, Offset 85, Proposal 1.2
+
+Der Intro-Schnitt saß wieder falsch. Die Analyse (`INTRO-CUT-BEFUND-2026-08-09.md`,
+17 Läufe) zeigte eine Streuung von 121 Frames, die in zwei Teile zerfällt.
+
+**Der Takt-Versatz — jetzt gerechnet statt eingebacken.** `mapped_source_frame`
+ist `output_frame_counter - 1`; der Zähler, den der Adapter beim
+Frontend-Callback abgreift, hinkt dem Compositor um die Tiefe der Ausgabepipeline
+hinterher — und die *ist* die Anlaufzeit, die `recording_started` misst. Jede
+Szenenmarke liegt deshalb um diesen Betrag zu früh. Er schwankt laufabhängig
+zwischen **16 und 63 Frames** (267 ms bis 1050 ms) und steht im Sidecar.
+
+Neu: `src\matrix_auto_cutter\event_lag.py` mit `pipeline_lag_frames(sidecar)`.
+Angewandt in `intro.py`, `outro.py` und `protection.py`. **Nicht** in der
+Sidecar-Abbildung — die ist an beiden Enden verankert und wird beim Einlesen
+nachgerechnet; eine geänderte Formel machte jedes vorhandene Sidecar ungültig.
+
+**Nur Frontend-Marken wandern.** `scene_changed` und `manual_protection` ja;
+`recording_started`, `recording_stopped`, Pause und Resume nie — sie sind an der
+Ausgabe verankert und exakt. Der Schutzblock am Aufnahmeanfang muss auf Frame 0
+stehen bleiben, sonst gäbe er die erste Sekunde frei.
+
+**`INTRO_CUT_OFFSET_FRAMES = 85` statt 148**, und die Bezugsgröße ist neu:
+*Marke + Lag + Konstante* statt *Marke + Konstante*. Die 85 sind der Vorlauf von
+`intro-sting-sovereign-1440p.webm` bis zum **Anfang der Chart-Animation, rund
+5 % der Linie** — ausdrücklich nicht bis zur stehenden Karte, die liegt bei
+Stingframe 187 und wäre viel zu spät.
+
+Gerechnet gegen die echten Journale:
+
+| Lauf | Marke | Lag | neu | alt (Marke+148) | ab sichtbarem Szenenanfang |
+|---|---:|---:|---:|---:|---:|
+| 16-50-21 | 517 | 63 | **665** | 665 | 85 |
+| 17-45-21 | 252 | 16 | **353** | 400 | 85 |
+| 17-52-38 | 565 | 16 | **666** | 713 | 85 |
+
+Der als richtig abgenommene Lauf wird framegleich reproduziert, die zu späten
+wandern um 47 Frames vor, und alle landen auf demselben Abstand.
+
+**Proposal 1.2** mit eigener Digest-Domäne
+(`matrix-auto-cutter/cut-proposal/1.2`). `pipeline_lag_frames` ist ab 1.2 in
+jeder vorhandenen Resolution Pflicht und in 1.0/1.1 verboten, damit ältere Bytes
+kanonisch bleiben. Grund für das Feld: eine nicht nachrechenbare Zahl im
+Proposal war der Grund, dass die falsche 148 so lange unentdeckt blieb.
+
+**Abgenommen am echten Lauf:** 18-51-29 (Lag 17) und 18-54-14 (Lag 16), beide
+mit dem Einstieg am Anfang der Chart-Animation. Vorher lagen genau diese Läufe
+bei rund 70 % der Linie.
+
+> **OFFEN — Gegenprobe bei Lag 63.** Beide Abnahmeläufe hatten kleinen Lag. Für
+> den großen Lag ist die 47-Frame-Korrektur nur **rechnerisch** belegt, nicht am
+> Bild. **Beim nächsten Lauf mit `monotonic_ns` um 1 049 999 958 nachholen** und
+> das Ergebnis in `TAKTKORREKTUR-UND-INTRO-OFFSET-2026-08-09.md` eintragen.
+
+Zwei weitere Punkte bleiben offen: `protection.py` ist richtig verdrahtet, wirkt
+aber auf heutigen Daten nicht (die betroffenen Ereignistypen setzt der Producer
+nie ab), und ein Frameverlust vor der Marke wird nicht korrigiert — selten
+(1 von 17 Läufen), dann aber 45 Frames. Beides per Test dokumentiert.
+
+**Ebenfalls unerklärt geblieben:** der Regime-Bruch am 9.8. zwischen 6:36 und
+7:27 Uhr, der die Sting-Phase um rund 70 Frames verschob. Rechnerneustart,
+Treiber, OBS-, Browser- und Pluginstand, Encoder und die Sting-Datei sind
+ausgeschlossen; übrig bleibt die Szenensammlung, für die es keine Historie gibt.
+Springt die Phase zurück, wandert `INTRO_CUT_OFFSET_FRAMES` mit — der Lag nicht,
+der ist jetzt gerechnet.
+
+Details: `TAKTKORREKTUR-UND-INTRO-OFFSET-2026-08-09.md`.
+
+---
+
 ## 4. Offene Punkte — nach Wert geordnet
 
 ### 4.1 `loudnorm` — erledigt
@@ -275,9 +349,12 @@ Der Wisch endet unvollendet, also mit hartem Schnitt. Das behebt nur ein
 Neurendern. Abnahmebedingung: letzter Videoframe = Containerlänge, Matte am Ende
 vollständig zurückgezogen, konstante 60 fps.
 
-**Achtung, neue Kopplung:** Ein neu gerenderter Stinger ändert
-`INTRO_CUT_OFFSET_FRAMES`. Die 148 setzen sich aus 35 plus der Stingerlänge
-zusammen; bei anderer Länge muss die Konstante nachgezogen werden.
+**Diese Kopplung gibt es nicht.** Sie stand hier, weil die Herleitung der 148
+falsch war: beim Intro-Wechsel schaltet die Sammlung mit „Schnitt" (100 ms),
+einen Stingerwisch gibt es dort nicht. `INTRO_CUT_OFFSET_FRAMES` hängt an
+`intro-sting-sovereign-1440p.webm`, nicht an `Stinger_synchron.webm`. Ein neu
+gerenderter **Stinger** lässt die Konstante unberührt; ein neu gerenderter
+**Intro-Sting** verschiebt sie. Siehe Abschnitt 3.3.
 
 ### 4.4 Nachlese zum Clock-Gate
 
@@ -370,7 +447,12 @@ gehört nicht ins Repository, `rm ./-` entfernt sie).
 
 **Nachtrag 9.8. abends:** Der Block oben beschreibt den Stand am Vormittag. Der
 `loudnorm`-Commit aus 3.1 setzt HEAD weiter und bringt die Suite auf
-1788 passed, 1 skipped.
+1788 passed, 1 skipped. Danach `787eb72` (atomares Ersetzen, siehe
+`PERMISSIONERROR-ATOMARES-SCHREIBEN-2026-08-09.md`) auf 1818 und die
+Taktkorrektur aus 3.3 auf **1845 passed, 1 skipped**.
+
+Zur Datei `-`: sie liegt weiterhin untracked im Wurzelverzeichnis und ist bei
+keinem dieser Commits mitgefahren.
 
 ---
 

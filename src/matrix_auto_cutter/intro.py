@@ -36,30 +36,41 @@ from pydantic import (
     model_validator,
 )
 
+from matrix_auto_cutter.event_lag import pipeline_lag_frames
 from matrix_auto_cutter.models import CanonicalModel, CanonicalUuid4, Sha256
 from matrix_auto_cutter.sidecar import SidecarEvent, SidecarEventV12, ValidatedObsEventSidecar
 
 INTRO_SCENE_LABEL = "Intro with Cam"
 INTRO_SCENE_UUID = UUID("df50e171-befb-4d89-b9e9-66a29dd0865e")
 
-# OBS schreibt ``scene_changed`` im Moment des Umschaltens; der Stinger wischt
-# danach noch, das neue Bild steht erst am Ende des Wischs vollständig.  Der
-# Schnitt liegt deshalb hinter der Marke, nicht auf ihr — es wird bewusst mehr
-# weggenommen, denn zu viel geht vom Stinger ab, zu wenig bleibt als Rest der
-# Vorszene sichtbar.
+# Abstand vom *sichtbaren* Szenenanfang bis zum Schnitt, in Frames bei 60 FPS.
 #
-# Der erste echte Lauf vom 08.08.2026 zeigte rund 30 Frames Rest der Vorszene,
-# plus 5 Frames Sicherheit sind das 35 Frames.  Damit begann das gerenderte
-# Video auf dem Blackscreen am Anfang des Übergangs: die 35 Frames überspringen
-# nur den Rest der Vorszene, nicht den Übergang selbst.  Stinger_synchron.webm
-# ist gemessen 1,877 s lang, also 113 Frames bei 60 FPS; 35 + 113 = 148 Frames
-# oder 2,467 s.  Damit fällt der gesamte Übergang weg und der erste sichtbare
-# Frame ist das Intro.
+# Die Bezugsgröße ist bewusst nicht mehr die Journalmarke, sondern der Frame, an
+# dem die Szene wirklich im Bild steht: ``marker + pipeline_lag_frames``.  Der
+# Lag schwankt laufabhängig zwischen 16 und 63 Frames und wird seit dieser
+# Fassung gerechnet statt in diese Konstante eingebacken (siehe
+# :mod:`matrix_auto_cutter.event_lag`).  Genau diese Vermischung war der Fehler:
+# eine feste Zahl kann eine laufabhängige Größe nicht treffen.
 #
-# Wird der Stinger neu gerendert, ändert sich diese Zahl mit seiner Länge.  Sie
-# ist eine Messung, keine Ableitung, und wird nachjustiert, indem man sich den
-# Anfang des gerenderten Videos ansieht.
-INTRO_CUT_OFFSET_FRAMES = 148
+# Was hier übersprungen wird, ist der Vorlauf von
+# ``intro-sting-sovereign-1440p.webm``.  Die Datei liegt als Medienquelle in der
+# Szene „Intro with Cam" und startet mit ihrer Aktivierung: erst tippt sich die
+# Kopfzeile ein, dann zeichnet sich die Chartlinie, ab ihrem Frame 187 steht die
+# Karte.  Der Zielpunkt ist **der Anfang der Chart-Animation, rund 5 % der
+# Linie** — nicht die stehende Karte, die wäre viel zu spät.
+#
+# Am 09.08.2026 abends an drei Läufen gemessen, Schnitt jeweils bei Marke + 148,
+# der Abstand zum sichtbaren Szenenanfang ist damit 148 - Lag:
+#
+#   16-50-21   Lag 63   ->   85 Frames   -> vom Nutzer als richtig abgenommen
+#   17-45-21   Lag 16   ->  132 Frames   -> zu spät, Chart zu rund 70 % gezeichnet
+#   17-52-38   Lag 16   ->  132 Frames   -> dito
+#
+# Die Zahl hängt am Sting, nicht an einem Szenenübergang: die Sammlung schaltet
+# mit „Schnitt" (100 ms), einen Stingerwisch gibt es an dieser Stelle nicht.
+# Wird der Sting neu gerendert, wandert sie mit seiner Animation und wird am
+# Anfang des gerenderten Videos nachjustiert.
+INTRO_CUT_OFFSET_FRAMES = 85
 
 # Geschützte Einstiegszone hinter dem Intro-Schnitt (7,5 s bei 60 FPS).  Der
 # Nutzer gestaltet den Einstieg bewusst; in diesem Fenster wird nicht
@@ -101,6 +112,10 @@ class IntroResolutionEvidence(CanonicalModel):
     removed_ms: int | None = Field(default=None, ge=0)
     matching_scene_event_count: int = Field(default=0, ge=0)
     total_source_frames: int = Field(ge=1)
+    # Nachrechenbar machen, was den Schnitt verschiebt: ohne dieses Feld stünde
+    # im Proposal wieder eine Zahl, die niemand gegen das Journal prüfen kann.
+    # Abwesend in Proposal-1.1-Bytes, gesetzt ab 1.2.
+    pipeline_lag_frames: int | None = Field(default=None, ge=0)
 
     @model_serializer(mode="wrap")
     def omit_unavailable_fields(self, handler: SerializerFunctionWrapHandler) -> object:
@@ -114,6 +129,7 @@ class IntroResolutionEvidence(CanonicalModel):
             "intro_start_frame",
             "removed_frames",
             "removed_ms",
+            "pipeline_lag_frames",
         ):
             if getattr(self, name) is None:
                 serialized.pop(name, None)
@@ -203,9 +219,11 @@ def resolve_intro(
 ) -> IntroResolutionEvidence:
     """Resolve the first bound intro scene event, or report why no cut is made."""
     total = sidecar.source.video_frame_count
+    lag = pipeline_lag_frames(sidecar)
     common: dict[str, object] = {
         "sidecar_sha256": sidecar_sha256,
         "total_source_frames": total,
+        "pipeline_lag_frames": lag,
     }
     scenes = [event for event in sidecar.events if event.type == "scene_changed"]
     basis: IntroBindingBasis = "scene_name"
@@ -231,10 +249,13 @@ def resolve_intro(
         bound["scene_name"] = scene_name
     marker = event.mapped_source_frame
     if marker == 0:
-        # Ohne Vorlauf gibt es keine Vorszene, aus der der Stinger wischen
-        # könnte; der Versatz würde hier echtes Intromaterial abschneiden.
+        # Die Szene lag beim Aufnahmestart schon im Programm; es gibt keine
+        # Vorszene und damit keinen Vorlauf, den man wegnehmen könnte.  Geprüft
+        # wird die rohe Marke: der Lag verschiebt den sichtbaren Anfang, nicht
+        # die Tatsache, dass davor nichts liegt.
         return _resolution({"status": "nothing_before_intro", "intro_start_frame": 0, **bound})
-    start = marker + INTRO_CUT_OFFSET_FRAMES
+    # Sichtbarer Szenenanfang, dann der gemessene Vorlauf des Stings.
+    start = marker + lag + INTRO_CUT_OFFSET_FRAMES
     if start >= total:
         # Deckt beides ab: eine Marke jenseits der Quelle und eine so späte
         # Marke, dass erst der Versatz über das Ende hinausreicht.

@@ -56,7 +56,9 @@ def _binding_and_collection(tmp_path: Path) -> tuple[Path, Path]:
     return binding_path, collection
 
 
-def _sidecar(raw_sidecar: dict[str, object], *, start: int, total: int) -> ObsEventSidecarV12:
+def _sidecar(
+    raw_sidecar: dict[str, object], *, start: int, total: int, start_ns: int = 0
+) -> ObsEventSidecarV12:
     raw = deepcopy(raw_sidecar)
     source = raw["source"]
     clock = raw["clock"]
@@ -75,6 +77,8 @@ def _sidecar(raw_sidecar: dict[str, object], *, start: int, total: int) -> ObsEv
     clock["counter_end"] = total
     for event in events:
         assert isinstance(event, dict)
+        if event["type"] == "recording_started":
+            event["clock_sample"]["monotonic_ns"] = start_ns
         if event["type"] == "recording_stopped":
             event["mapped_source_frame"] = total
             sample = event["clock_sample"]
@@ -316,3 +320,78 @@ def test_tail_candidate_flows_through_immutable_proposal_and_selection(
     assert isinstance(selection, SelectionReady)
     assert selection.selection.candidates[-1].candidate_id == tail[0].candidate_id
     assert selection.selection.candidates[-1].enabled
+
+
+# Anlaufzeit 1,033 s = 62 Frames; gemessen in 2026-08-09 07-54-23.
+SLOW_START_NS = 1_033_333_292
+SLOW_START_FRAMES = 62
+
+
+def test_the_protected_block_follows_the_visible_scene_start(
+    tmp_path: Path, raw_sidecar: dict[str, object]
+) -> None:
+    """Ohne Korrektur deckten die 900 Frames nur 900 minus Lag echtes Outro ab."""
+    binding_path, collection = _binding_and_collection(tmp_path)
+    quick = resolve_outro(
+        _sidecar(raw_sidecar, start=1000, total=4000),
+        sidecar_sha256="a" * 64,
+        binding_path=binding_path,
+        collection_file=collection,
+    )
+    slow = resolve_outro(
+        _sidecar(raw_sidecar, start=1000, total=4000, start_ns=SLOW_START_NS),
+        sidecar_sha256="a" * 64,
+        binding_path=binding_path,
+        collection_file=collection,
+    )
+    assert quick.status == "resolved" and slow.status == "resolved"
+    assert quick.pipeline_lag_frames == 0
+    assert slow.pipeline_lag_frames == SLOW_START_FRAMES
+    assert slow.outro_start_frame == 1000 + SLOW_START_FRAMES
+    assert slow.protected_end_frame == 1000 + SLOW_START_FRAMES + 900
+    assert slow.tail_start_frame == 1000 + SLOW_START_FRAMES + 900
+    # Der Schnitt wandert nach hinten, entfernt also weniger, nicht mehr.
+    assert quick.tail_start_frame is not None and slow.tail_start_frame is not None
+    assert slow.tail_start_frame - quick.tail_start_frame == SLOW_START_FRAMES
+
+
+def test_the_lag_can_consume_the_last_margin_before_the_file_end(
+    tmp_path: Path, raw_sidecar: dict[str, object]
+) -> None:
+    """Randlage aus der Gegenprobe: der knappste Lauf hatte 60 Frames Luft.
+
+    Ohne Korrektur bliebe ein Tailschnitt übrig, mit ihr reicht der Schutzblock
+    über das Dateiende — dann gibt es keinen Tail, aber auch keinen falschen.
+    """
+    binding_path, collection = _binding_and_collection(tmp_path)
+    total = 1000 + 900 + 30
+    quick = resolve_outro(
+        _sidecar(raw_sidecar, start=1000, total=total),
+        sidecar_sha256="a" * 64,
+        binding_path=binding_path,
+        collection_file=collection,
+    )
+    slow = resolve_outro(
+        _sidecar(raw_sidecar, start=1000, total=total, start_ns=SLOW_START_NS),
+        sidecar_sha256="a" * 64,
+        binding_path=binding_path,
+        collection_file=collection,
+    )
+    assert quick.tail_start_frame == 1900
+    assert slow.status == "resolved"
+    assert slow.tail_start_frame is None
+    assert slow.protected_end_frame == total
+
+
+def test_an_unresolved_outro_still_reports_the_lag(
+    tmp_path: Path, raw_sidecar: dict[str, object]
+) -> None:
+    """Der Lag hängt am Journal, nicht an der Bindung, und fehlt deshalb nie."""
+    resolution = resolve_outro(
+        _sidecar(raw_sidecar, start=1000, total=4000, start_ns=SLOW_START_NS),
+        sidecar_sha256="a" * 64,
+        binding_path=tmp_path / "gibt-es-nicht.json",
+        collection_file=tmp_path / "auch-nicht.json",
+    )
+    assert resolution.status == "binding_missing"
+    assert resolution.pipeline_lag_frames == SLOW_START_FRAMES

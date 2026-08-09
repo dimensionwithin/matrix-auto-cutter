@@ -18,6 +18,7 @@ from pydantic import (
     model_validator,
 )
 
+from matrix_auto_cutter.event_lag import pipeline_lag_frames
 from matrix_auto_cutter.models import CanonicalModel, CanonicalUuid4, Sha256
 from matrix_auto_cutter.sidecar import ObsEventSidecarV12, ValidatedObsEventSidecar
 
@@ -80,6 +81,10 @@ class OutroResolutionEvidence(CanonicalModel):
     tail_start_frame: int | None = Field(default=None, ge=0)
     total_source_frames: int = Field(ge=1)
     protection_length_frames: Literal[900] = 900
+    # Wie beim Intro: der Betrag, um den die Journalmarke nach hinten korrigiert
+    # wurde, damit im Proposal nachrechenbar bleibt, worauf sich die 900 Frames
+    # beziehen.  Abwesend in Proposal-1.1-Bytes, gesetzt ab 1.2.
+    pipeline_lag_frames: int | None = Field(default=None, ge=0)
 
     @model_serializer(mode="wrap")
     def omit_unavailable_fields(self, handler: SerializerFunctionWrapHandler) -> object:
@@ -95,6 +100,7 @@ class OutroResolutionEvidence(CanonicalModel):
             "protected_start_frame",
             "protected_end_frame",
             "tail_start_frame",
+            "pipeline_lag_frames",
         ):
             if getattr(self, name) is None:
                 serialized.pop(name, None)
@@ -217,28 +223,28 @@ def resolve_outro(
 ) -> OutroResolutionEvidence:
     """Resolve exactly one final, source-bound scene event or fail closed."""
     total = sidecar.source.video_frame_count
+    lag = pipeline_lag_frames(sidecar)
+    # Der Lag hängt allein am Journal und steht auch dann fest, wenn die Bindung
+    # fehlt; er gehört deshalb in jede Rückgabe, nicht nur in die aufgelöste.
+    unbound: dict[str, object] = {
+        "sidecar_sha256": sidecar_sha256,
+        "total_source_frames": total,
+        "pipeline_lag_frames": lag,
+    }
     if not isinstance(sidecar, ObsEventSidecarV12):
-        return _resolution(
-            {
-                "status": "sidecar_missing_scene_uuid",
-                "sidecar_sha256": sidecar_sha256,
-                "total_source_frames": total,
-            }
-        )
+        return _resolution({"status": "sidecar_missing_scene_uuid", **unbound})
     binding = load_binding(binding_path)
     if binding is None:
         return _resolution(
             {
                 "status": "binding_missing" if not binding_path.exists() else "binding_invalid",
-                "sidecar_sha256": sidecar_sha256,
-                "total_source_frames": total,
+                **unbound,
             }
         )
     common = {
         "binding_digest": binding.binding_digest,
         "binding_file_sha256": binding_file_sha256(binding),
-        "sidecar_sha256": sidecar_sha256,
-        "total_source_frames": total,
+        **unbound,
     }
     if not collection_file.is_file():
         return _resolution({"status": "scene_collection_missing", **common})
@@ -257,7 +263,11 @@ def resolve_outro(
     event = matching[0]
     if event.scene_name != binding.scene_name:
         return _resolution({"status": "scene_name_mismatch", **common})
-    if event.mapped_source_frame >= total:
+    # Der sichtbare Szenenanfang, nicht die Journalmarke: der Schutzblock von
+    # 900 Frames deckte sonst nur 900 minus Lag echte Outroframes ab und der
+    # Tailschnitt läge um denselben Betrag zu früh.
+    corrected_start = event.mapped_source_frame + lag
+    if corrected_start >= total:
         return _resolution({"status": "event_out_of_bounds", **common})
     if any(
         other.event_id != event.event_id
@@ -265,7 +275,7 @@ def resolve_outro(
         if other.clock_sample.monotonic_ns >= event.clock_sample.monotonic_ns
     ):
         return _resolution({"status": "ambiguous_scene_events", **common})
-    start = event.mapped_source_frame
+    start = corrected_start
     protected_end = min(start + 900, total)
     tail_start = start + 900 if start + 900 < total else None
     return _resolution(

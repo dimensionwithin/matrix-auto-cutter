@@ -9,6 +9,11 @@ from typing import Literal
 from uuid import UUID
 
 from matrix_auto_cutter.errors import CoreError, ErrorCode, core_error
+from matrix_auto_cutter.event_lag import (
+    corrected_end_source_frame,
+    corrected_source_frame,
+    pipeline_lag_frames,
+)
 from matrix_auto_cutter.models import (
     CanonicalModel,
     MaterializedFrameRange,
@@ -61,16 +66,14 @@ def _union_policy(events: tuple[SidecarEvent, ...]) -> ProtectionPolicy:
     )
 
 
-def _event_range(event: SidecarEvent, total_frames: int) -> _RawRange | None:
+def _event_range(event: SidecarEvent, total_frames: int, lag_frames: int) -> _RawRange | None:
     uncertainty = _uncertainty_padding(event)
     before = _ceil_frames(event.protection.buffer_before_ms)
     after = _ceil_frames(event.protection.buffer_after_ms)
-    start = max(0, event.mapped_source_frame - uncertainty - before)
-    anchor_end = (
-        event.end_mapped_source_frame
-        if isinstance(event.end_mapped_source_frame, int)
-        else event.mapped_source_frame + 1
-    )
+    anchor_start = corrected_source_frame(event, lag_frames, total_frames)
+    start = max(0, anchor_start - uncertainty - before)
+    corrected_end = corrected_end_source_frame(event, lag_frames, total_frames)
+    anchor_end = corrected_end if corrected_end is not None else anchor_start + 1
     end = min(total_frames, anchor_end + uncertainty + after)
     if start >= end:
         return None
@@ -88,6 +91,7 @@ def _pair_range(
     start_event: SidecarEvent | None,
     end_event: SidecarEvent | None,
     total_frames: int,
+    lag_frames: int,
 ) -> _RawRange | None:
     events = tuple(event for event in (start_event, end_event) if event is not None)
     start = 0
@@ -95,14 +99,14 @@ def _pair_range(
     if start_event is not None:
         start = max(
             0,
-            start_event.mapped_source_frame
+            corrected_source_frame(start_event, lag_frames, total_frames)
             - _uncertainty_padding(start_event)
             - _ceil_frames(start_event.protection.buffer_before_ms),
         )
     if end_event is not None:
         end = min(
             total_frames,
-            end_event.mapped_source_frame
+            corrected_source_frame(end_event, lag_frames, total_frames)
             + _uncertainty_padding(end_event)
             + _ceil_frames(end_event.protection.buffer_after_ms),
         )
@@ -179,7 +183,15 @@ def normalize_ranges(
 
 
 def materialize_protection(sidecar: ValidatedObsEventSidecar) -> ProtectionResolutionResult:
-    """Paare Events konservativ, puffere, clamp und partitioniere alle Policies."""
+    """Paare Events konservativ, puffere, clamp und partitioniere alle Policies.
+
+    Die Schutzfenster liegen um den *sichtbaren* Zeitpunkt eines Ereignisses,
+    nicht um die rohe Journalmarke — eine Zone um den rohen Frame schützt sonst
+    die falsche Stelle.  Verschoben wird nach der Regel aus
+    :mod:`matrix_auto_cutter.event_lag`: nur Frontend-Marken, niemals die an der
+    Ausgabe verankerten Ereignisse.  Der Schutzblock am Aufnahmeanfang muss auf
+    Frame 0 stehen bleiben, sonst gäbe er die erste Sekunde frei.
+    """
     pair_failures = _pair_structure_failures(sidecar.events)
     if pair_failures:
         return ProtectionResolutionResult(
@@ -192,6 +204,7 @@ def materialize_protection(sidecar: ValidatedObsEventSidecar) -> ProtectionResol
                 ),
             ),
         )
+    lag = pipeline_lag_frames(sidecar)
     grouped: dict[tuple[str, UUID], list[SidecarEvent]] = {}
     for event in sidecar.events:
         pair_id = event.pair_id
@@ -207,6 +220,7 @@ def materialize_protection(sidecar: ValidatedObsEventSidecar) -> ProtectionResol
             starts[0] if starts else None,
             ends[0] if ends else None,
             sidecar.source.video_frame_count,
+            lag,
         )
         if paired is not None:
             raw_ranges.append(paired)
@@ -221,7 +235,7 @@ def materialize_protection(sidecar: ValidatedObsEventSidecar) -> ProtectionResol
             "scene_changed",
         }:
             continue
-        item = _event_range(event, sidecar.source.video_frame_count)
+        item = _event_range(event, sidecar.source.video_frame_count, lag)
         if item is not None:
             raw_ranges.append(item)
     return ProtectionResolutionResult(

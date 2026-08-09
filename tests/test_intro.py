@@ -13,6 +13,7 @@ import pytest
 from pydantic import ValidationError
 
 from matrix_auto_cutter.cut_proposal import (
+    _DIGEST_DOMAINS,
     PROPOSAL_FILE_NAME,
     AnalysisParameters,
     CutProposal,
@@ -218,7 +219,7 @@ def test_label_binds_the_intro_on_the_frame_axis(raw_sidecar: dict[str, object])
     assert resolution.binding_basis == "scene_name"
     assert resolution.intro_start_frame == FF2618BE_CUT
     assert resolution.removed_frames == FF2618BE_CUT
-    assert resolution.removed_ms == 53_800
+    assert resolution.removed_ms == 52_750
     assert resolution.matching_scene_event_count == 1
 
 
@@ -238,9 +239,9 @@ def test_the_stinger_offset_moves_the_cut_behind_the_marker(
     )
     resolution = resolve_intro(sidecar, sidecar_sha256=SIDECAR_SHA)
     assert resolution.status == "resolved"
-    assert INTRO_CUT_OFFSET_FRAMES == 148
+    assert INTRO_CUT_OFFSET_FRAMES == 85
     assert resolution.intro_start_frame == 1500 + INTRO_CUT_OFFSET_FRAMES
-    assert resolution.removed_frames == 1648
+    assert resolution.removed_frames == 1585
     assert resolution.removed_frames > 1500
 
 
@@ -297,7 +298,7 @@ def test_scene_uuid_is_the_fallback_layer(raw_sidecar: dict[str, object]) -> Non
     assert resolution.status == "resolved"
     assert resolution.binding_basis == "scene_uuid"
     assert resolution.scene_name == "Umbenannt"
-    assert resolution.intro_start_frame == 1048
+    assert resolution.intro_start_frame == 985
 
 
 def test_scene_uuid_fallback_survives_a_scene_event_without_any_name(
@@ -354,7 +355,7 @@ def test_first_occurrence_wins_and_is_its_own_status(raw_sidecar: dict[str, obje
     resolution = resolve_intro(sidecar, sidecar_sha256=SIDECAR_SHA)
     assert resolution.status == "resolved_first_of_multiple"
     assert resolution.matching_scene_event_count == 3
-    assert resolution.intro_start_frame == 1648
+    assert resolution.intro_start_frame == 1585
 
 
 def test_missing_label_is_a_normal_run(raw_sidecar: dict[str, object]) -> None:
@@ -431,7 +432,7 @@ def test_lead_in_flows_through_the_immutable_proposal_and_selection(
     assert len(lead_in) == 1
     assert (lead_in[0].start_frame, lead_in[0].end_frame) == (0, FF2618BE_CUT)
     assert lead_in[0].start_timecode == "00:00:00.000"
-    assert lead_in[0].end_timecode == "00:00:53.800"
+    assert lead_in[0].end_timecode == "00:00:52.750"
     assert lead_in[0].duration_ms == removed_milliseconds(FF2618BE_CUT)
     evidence = lead_in[0].intro_evidence
     assert evidence is not None
@@ -522,10 +523,17 @@ def test_missing_label_leaves_the_generated_proposal_untouched(
 
 
 def _without_intro_resolution(ready: ProposalReady, target: Path) -> Path:
-    """Rebuild the exact 1.1 bytes a build without intro support published."""
+    """Rebuild the exact 1.1 bytes a build without intro support published.
+
+    Ein 1.1-Stand kannte weder ``intro_resolution`` noch die Taktkorrektur;
+    beides muss deshalb aus den Bytes verschwinden, sonst entsteht ein Artefakt,
+    das es nie gegeben hat.
+    """
     payload = json.loads(ready.proposal_path.read_bytes())
     del payload["proposal_digest"]
     assert payload.pop("intro_resolution")["status"] == "no_matching_scene_event"
+    payload["schema_version"] = "1.1"
+    payload["outro_resolution"].pop("pipeline_lag_frames", None)
     content = CutProposalContent.model_validate_json(json.dumps(payload))
     payload["proposal_digest"] = proposal_content_digest(content)
     legacy = CutProposal.model_validate_json(json.dumps(payload))
@@ -627,15 +635,15 @@ def test_a_micro_island_behind_the_lead_in_is_dropped_so_the_render_stays_possib
     ready = _proposal(
         tmp_path,
         raw,
-        # Der Schnitt liegt bei 3148, die Zone endet auf 3598. Der Kandidat
+        # Der Schnitt liegt bei 3085, die Zone endet auf 3535. Der Kandidat
         # beginnt auf 3600 und ist damit nicht geschützt; zur Lead-in-Grenze
-        # bleiben 452 Frames, unter der hier gesetzten Inselgrenze von 600.
+        # bleiben 515 Frames, unter der hier gesetzten Inselgrenze von 600.
         silences=b"silence_start: 59.65\nsilence_end: 65.0 | silence_duration: 5.35\n",
         parameters=AnalysisParameters(minimum_keep_island_ms=10_000),
     )
     assert [item.reason for item in ready.proposal.proposed_cuts] == ["intro_lead_in"]
     assert [item.reason for item in ready.proposal.rejected_candidates] == ["minimum_keep_island"]
-    assert build_keep_segments(ready.proposal) == (KeepSegment(start_frame=3148, end_frame=6000),)
+    assert build_keep_segments(ready.proposal) == (KeepSegment(start_frame=3085, end_frame=6000),)
 
 
 def test_intro_and_outro_apply_in_the_same_run_without_touching_the_outro(
@@ -687,8 +695,8 @@ def test_intro_and_outro_apply_in_the_same_run_without_touching_the_outro(
         previous_end = item.end_frame
 
 
-# Marke 600 plus Versatz: der Intro-Schnitt endet auf Frame 748, die feste
-# Einstiegszone reicht damit bis ausschließlich Frame 1198.
+# Marke 600 plus Versatz: der Intro-Schnitt endet auf Frame 685, die feste
+# Einstiegszone reicht damit bis ausschließlich Frame 1135.
 FLOW_MARKER = 600
 FLOW_CUT = FLOW_MARKER + INTRO_CUT_OFFSET_FRAMES
 FLOW_END = FLOW_CUT + INTRO_FLOW_PROTECTED_FRAMES
@@ -712,13 +720,13 @@ def test_the_pause_after_a_musical_intro_is_protected(
     ready = _proposal(
         tmp_path,
         raw,
-        # 12,0-13,5 s ist der leise Ausklang des Stingers rund um den Schnitt;
-        # danach läuft die Intromusik. 15,0-17,0 s ist die Pause vor dem ersten
-        # Wort — unter der Ableitung endete die Zone auf Frame 810 und dieser
-        # Kandidat (921 bis 999) wurde geschnitten. 25,0-30,0 s liegt hinter der
-        # Zone und wird normal geschnitten.
+        # 10,0-11,5 s ist der leise Ausklang des Stingers rund um den Schnitt
+        # auf Frame 685; danach läuft die Intromusik. 15,0-17,0 s ist die Pause
+        # vor dem ersten Wort — unter der Ableitung endete die Zone auf Frame
+        # 810 und dieser Kandidat (921 bis 999) wurde geschnitten. 25,0-30,0 s
+        # liegt hinter der Zone und wird normal geschnitten.
         silences=(
-            b"silence_start: 12.0\nsilence_end: 13.5 | silence_duration: 1.5\n"
+            b"silence_start: 10.0\nsilence_end: 11.5 | silence_duration: 1.5\n"
             b"silence_start: 15.0\nsilence_end: 17.0 | silence_duration: 2.0\n"
             b"silence_start: 25.0\nsilence_end: 30.0 | silence_duration: 5.0\n"
         ),
@@ -776,25 +784,25 @@ def test_the_zone_boundary_is_half_open(tmp_path: Path, raw_sidecar: dict[str, o
         total=6000,
         scenes=(_scene_event(FLOW_MARKER, scene_name=INTRO_SCENE_LABEL),),
     )
-    # 19,6 s ergibt nach den Handles Startframe 1197, einen vor der Grenze.
+    # 18,54 s ergibt nach den Handles Startframe 1134, einen vor der Grenze.
     inside = _proposal(
         tmp_path / "inside",
         raw,
-        silences=b"silence_start: 19.6\nsilence_end: 25.0 | silence_duration: 5.4\n",
+        silences=b"silence_start: 18.54\nsilence_end: 25.0 | silence_duration: 6.46\n",
     )
     assert [item.reason for item in inside.proposal.rejected_candidates] == ["intro_flow_protected"]
     assert [item.reason for item in inside.proposal.proposed_cuts] == ["intro_lead_in"]
 
-    # 19,61 s ergibt Startframe 1198, also genau die Grenze: bleibt erhalten.
+    # 18,56 s ergibt Startframe 1135, also genau die Grenze: bleibt erhalten.
     outside = _proposal(
         tmp_path / "outside",
         raw,
-        silences=b"silence_start: 19.61\nsilence_end: 25.0 | silence_duration: 5.39\n",
+        silences=b"silence_start: 18.56\nsilence_end: 25.0 | silence_duration: 6.44\n",
     )
     assert [item.reason for item in outside.proposal.rejected_candidates] == []
     kept = outside.proposal.proposed_cuts[1]
     assert kept.reason == "conservative_silence_dead_air"
-    assert kept.start_frame == FLOW_END == 1198
+    assert kept.start_frame == FLOW_END == 1135
     assert isinstance(load_proposal(outside.proposal_path), ProposalReady)
 
 
@@ -818,3 +826,79 @@ def test_proposal_identity_separates_two_different_intro_resolutions(
         ),
     )
     assert with_label.proposal.proposal_id != without_label.proposal.proposal_id
+
+
+def test_proposal_1_2_carries_the_lag_and_has_its_own_digest_domain(
+    tmp_path: Path, raw_sidecar: dict[str, object]
+) -> None:
+    """Der Betrag, der den Schnitt verschiebt, muss im Proposal nachrechenbar sein.
+
+    Eine nicht nachrechenbare Zahl war der Grund, dass der falsche Intro-Versatz
+    so lange unentdeckt blieb.
+    """
+    binding_path, _collection = _outro_binding(tmp_path)
+    raw = _raw(
+        raw_sidecar,
+        total=6000,
+        scenes=(
+            _scene_event(1500, scene_name=INTRO_SCENE_LABEL),
+            _scene_event(4500, scene_name="Outro", scene_uuid=OUTRO_UUID),
+        ),
+    )
+    ready = _proposal(tmp_path, raw, outro_binding=binding_path)
+    proposal = ready.proposal
+    assert proposal.schema_version == "1.2"
+    assert proposal.intro_resolution is not None
+    assert proposal.outro_resolution is not None
+    assert proposal.intro_resolution.pipeline_lag_frames == 0
+    assert proposal.outro_resolution.pipeline_lag_frames == 0
+    payload = json.loads(ready.proposal_path.read_bytes())
+    assert payload["intro_resolution"]["pipeline_lag_frames"] == 0
+    assert payload["outro_resolution"]["pipeline_lag_frames"] == 0
+
+    # Eigene Digest-Domaene: dieselben Inhaltsbytes muessen unter 1.1 und 1.2
+    # verschieden hashen, sonst waere eine 1.1-Signatur fuer 1.2-Bytes gueltig.
+    assert len(set(_DIGEST_DOMAINS.values())) == 3
+    content = CutProposalContent.model_validate_json(
+        proposal.model_dump_json(exclude={"proposal_digest"})
+    )
+    body = content.model_dump_json().encode("utf-8")
+    assert proposal.proposal_digest == hashlib.sha256(_DIGEST_DOMAINS["1.2"] + body).hexdigest()
+    assert proposal.proposal_digest != hashlib.sha256(_DIGEST_DOMAINS["1.1"] + body).hexdigest()
+    assert proposal_content_digest(content) == proposal.proposal_digest
+
+
+def test_only_proposal_1_2_may_carry_the_lag(
+    tmp_path: Path, raw_sidecar: dict[str, object]
+) -> None:
+    """Aeltere Bytes bleiben kanonisch: ohne dieses Verbot waeren sie es nicht mehr."""
+    binding_path, _collection = _outro_binding(tmp_path)
+    raw = _raw(
+        raw_sidecar,
+        total=6000,
+        scenes=(_scene_event(4500, scene_name="Outro", scene_uuid=OUTRO_UUID),),
+    )
+    ready = _proposal(tmp_path, raw, outro_binding=binding_path)
+    payload = json.loads(ready.proposal_path.read_bytes())
+    del payload["proposal_digest"]
+    payload["schema_version"] = "1.1"
+    payload.pop("intro_resolution", None)
+    with pytest.raises(ValidationError, match="only proposal-1.2 may carry a pipeline lag"):
+        CutProposalContent.model_validate_json(json.dumps(payload))
+
+
+def test_proposal_1_2_refuses_a_resolution_without_the_lag(
+    tmp_path: Path, raw_sidecar: dict[str, object]
+) -> None:
+    binding_path, _collection = _outro_binding(tmp_path)
+    raw = _raw(
+        raw_sidecar,
+        total=6000,
+        scenes=(_scene_event(4500, scene_name="Outro", scene_uuid=OUTRO_UUID),),
+    )
+    ready = _proposal(tmp_path, raw, outro_binding=binding_path)
+    payload = json.loads(ready.proposal_path.read_bytes())
+    del payload["proposal_digest"]
+    payload["outro_resolution"].pop("pipeline_lag_frames")
+    with pytest.raises(ValidationError, match="requires the pipeline lag"):
+        CutProposalContent.model_validate_json(json.dumps(payload))

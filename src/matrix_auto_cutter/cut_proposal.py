@@ -56,12 +56,18 @@ from matrix_auto_cutter.sidecar import ValidatedObsEventSidecar, validate_sideca
 from matrix_auto_cutter.timebase import Frame, FrameRange
 
 ANALYSIS_VERSION: Literal["silence_dead_air/1.0"] = "silence_dead_air/1.0"
-PROPOSAL_SCHEMA_VERSION: Literal["1.1"] = "1.1"
+PROPOSAL_SCHEMA_VERSION: Literal["1.2"] = "1.2"
 PROPOSAL_FILE_NAME = "cut-proposal.json"
 MAX_JSON_BYTES = 16 * 1024 * 1024
 MAX_FFMPEG_LOG_BYTES = 2 * 1024 * 1024
 _DIGEST_DOMAIN_V10 = b"matrix-auto-cutter/cut-proposal/1.0\0"
 _DIGEST_DOMAIN_V11 = b"matrix-auto-cutter/cut-proposal/1.1\0"
+_DIGEST_DOMAIN_V12 = b"matrix-auto-cutter/cut-proposal/1.2\0"
+_DIGEST_DOMAINS = {
+    "1.0": _DIGEST_DOMAIN_V10,
+    "1.1": _DIGEST_DOMAIN_V11,
+    "1.2": _DIGEST_DOMAIN_V12,
+}
 _SILENCE_START = re.compile(rb"silence_start:\s*(-?[0-9]+(?:\.[0-9]+)?)")
 _SILENCE_END = re.compile(
     rb"silence_end:\s*(-?[0-9]+(?:\.[0-9]+)?)\s*\|\s*silence_duration:\s*"
@@ -224,7 +230,7 @@ class CutProposalContent(CanonicalModel):
     """Digest input: every immutable proposal field except the digest itself."""
 
     artifact_type: Literal["matrix_auto_cutter_cut_proposal"]
-    schema_version: Literal["1.0", "1.1"]
+    schema_version: Literal["1.0", "1.1", "1.2"]
     proposal_id: str = Field(pattern=r"^proposal-[0-9a-f]{32}$")
     recording_id: str = Field(min_length=1, max_length=100)
     source_path: str = Field(min_length=1)
@@ -273,8 +279,21 @@ class CutProposalContent(CanonicalModel):
         # ``intro_resolution`` was added to Proposal-1.1 in place instead of via a
         # new schema version, so 1.1 bytes published before the field existed must
         # keep loading; their canonical bytes and digest omit it either way.
-        if self.schema_version == "1.1" and self.outro_resolution is None:
-            raise ValueError("proposal-1.1 requires typed outro resolution")
+        if self.schema_version in {"1.1", "1.2"} and self.outro_resolution is None:
+            raise ValueError(f"proposal-{self.schema_version} requires typed outro resolution")
+        # Proposal-1.2 fuehrt die Taktkorrektur ein.  Der Betrag muss in jeder
+        # vorhandenen Evidenz stehen, sonst laesst sich der Schnittpunkt nicht
+        # gegen das Journal nachrechnen -- genau das hielt den falschen
+        # Intro-Offset so lange verborgen.  Aeltere Fassungen duerfen ihn
+        # umgekehrt nicht tragen, sonst waeren ihre Bytes nicht mehr kanonisch.
+        resolutions = tuple(
+            item for item in (self.outro_resolution, self.intro_resolution) if item is not None
+        )
+        carries_lag = tuple(item.pipeline_lag_frames is not None for item in resolutions)
+        if self.schema_version == "1.2" and not all(carries_lag):
+            raise ValueError("proposal-1.2 requires the pipeline lag in every resolution")
+        if self.schema_version != "1.2" and any(carries_lag):
+            raise ValueError("only proposal-1.2 may carry a pipeline lag")
         if "outro_resolution" in self.model_fields_set and self.outro_resolution is None:
             raise ValueError("outro_resolution may not be explicit null")
         if "intro_resolution" in self.model_fields_set and self.intro_resolution is None:
@@ -364,7 +383,7 @@ def _content_from_proposal(proposal: CutProposal) -> CutProposalContent:
 
 def proposal_content_digest(content: CutProposalContent) -> str:
     """Digest every canonical immutable content field with domain separation."""
-    domain = _DIGEST_DOMAIN_V10 if content.schema_version == "1.0" else _DIGEST_DOMAIN_V11
+    domain = _DIGEST_DOMAINS[content.schema_version]
     return hashlib.sha256(domain + content.model_dump_json().encode("utf-8")).hexdigest()
 
 
