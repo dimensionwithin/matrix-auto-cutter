@@ -1943,13 +1943,18 @@ def execute_approved_render(
             "Lautheitsmessung (Durchgang 1) fehlgeschlagen, es läuft ein einziger "
             f"loudnorm-Durchgang (Exitcode {measurement.exit_code})."
         )
+    else:
+        source_warning = loudness.source_level_warning(measured)
+        if source_warning is not None:
+            loudness_warnings.append(source_warning)
+    output_frames = sum(item.end_frame - item.start_frame for item in keep_segments)
     # Einmal gemessen, bei jedem Encoderversuch dieselbe Kette: der
     # libx264-Wiederholungslauf baut seine Argumente aus genau diesem Graphen.
     filtergraph = build_filtergraph(
         keep_segments,
         video_index=streams.video_index,
         audio_index=streams.audio_index,
-        audio_chain=loudness.render_chain(measured),
+        audio_chain=loudness.render_chain(measured, output_frames),
     )
     arguments = _render_arguments(ffmpeg_path, proposal, streams, filtergraph, encoder, partial)
     preferred_encoder = encoder
@@ -1957,7 +1962,6 @@ def execute_approved_render(
     fallback_reason: str | None = (
         None if capability.reason == "ok" else f"NVENC-Capability: {capability.reason}"
     )
-    output_frames = sum(item.end_frame - item.start_frame for item in keep_segments)
     cut_frames = proposal.source_frame_count - output_frames
     expected_output_ms = round(output_frames * 1000 / 60)
     expected_cut_ms = round(cut_frames * 1000 / 60)

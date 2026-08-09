@@ -7,7 +7,9 @@ from matrix_auto_cutter.loudness import (
     ACCEPT_TP_CEILING_DBTP,
     COMP_THRESHOLD_DB,
     LIMITER_DB,
+    MIN_SOURCE_I_LUFS,
     OUTPUT_SAMPLE_RATE,
+    SAMPLES_PER_VIDEO_FRAME,
     TARGET_I_LUFS,
     LoudnessMeasurement,
     acceptance_warnings,
@@ -18,6 +20,7 @@ from matrix_auto_cutter.loudness import (
     parse_report,
     protocol_line,
     render_chain,
+    source_level_warning,
 )
 
 MEASURED = LoudnessMeasurement(
@@ -59,21 +62,56 @@ def test_measurement_chain_shares_the_compressor_but_only_measures() -> None:
 
 
 def test_render_chain_reuses_the_measurement_and_asks_for_linear() -> None:
-    chain = render_chain(MEASURED)
+    chain = render_chain(MEASURED, 5209)
     assert chain.startswith(compressor_filter() + ",")
     assert (
         "loudnorm=I=-14:TP=-1:LRA=11:measured_I=-30.96:measured_LRA=8:measured_TP=-0.55"
         ":measured_thresh=-41.76:offset=0.54:linear=true:print_format=json"
     ) in chain
-    assert chain.endswith(
-        f"aresample={OUTPUT_SAMPLE_RATE},alimiter=limit={LIMITER_DB:g}dB:level=false"
+    assert (
+        f"aresample={OUTPUT_SAMPLE_RATE},alimiter=limit={LIMITER_DB:g}dB:level=false" in chain
     )
 
 
 def test_render_chain_without_measurement_is_the_single_pass_fallback() -> None:
-    chain = render_chain(None)
+    chain = render_chain(None, 5209)
     assert "measured_" not in chain and "linear=true" not in chain
     assert "alimiter=limit=-1.5dB:level=false" in chain
+
+
+@pytest.mark.parametrize("frames", [1, 60, 61, 5209, 5712])
+def test_the_chain_ends_clamped_to_the_exact_output_length(frames: int) -> None:
+    # end_pts, nicht end_sample: loudnorm laesst die Zeitachse laenger als das
+    # Material, die Samplezahl stimmt bereits. end_sample wuerde nie greifen.
+    assert SAMPLES_PER_VIDEO_FRAME == 800
+    for chain in (render_chain(MEASURED, frames), render_chain(None, frames)):
+        assert chain.endswith(f",apad,atrim=end_pts={frames * 800}")
+        assert "end_sample" not in chain
+        # Die Klemmung sitzt hinter aresample, sonst zaehlte sie in 192 kHz.
+        assert chain.index(f"aresample={OUTPUT_SAMPLE_RATE}") < chain.index("atrim=")
+
+
+@pytest.mark.parametrize(
+    ("input_i", "expected"),
+    [
+        (-30.96, None),
+        (-35.85, None),
+        (MIN_SOURCE_I_LUFS, None),
+        (-45.01, "ungewöhnlich leise"),
+        (-49.64, "ungewöhnlich leise"),
+    ],
+)
+def test_an_unusually_quiet_source_is_named_before_the_render(
+    input_i: float, expected: str | None
+) -> None:
+    measured = LoudnessMeasurement(
+        input_i=input_i, input_lra=13.9, input_tp=-24.33, input_thresh=-60.34, target_offset=1.11
+    )
+    warning = source_level_warning(measured)
+    if expected is None:
+        assert warning is None
+    else:
+        assert warning is not None and expected in warning and f"{input_i:.2f}" in warning
 
 
 def test_parse_report_reads_the_last_json_block() -> None:

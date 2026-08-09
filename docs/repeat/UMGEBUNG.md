@@ -64,6 +64,72 @@ erzeugte ein Proposal mit Altcode, das frisch gestartete Review-Fenster las es
 mit neuem Code und wies es als ungueltig ab. Der Fehler sah wie ein
 Schemaproblem aus und war ein Prozessproblem.
 
+**`START-MATRIX-AUTO-CUTTER.cmd` startet nichts neu, solange ein Runner lebt.**
+Es meldet dann nur „laeuft bereits" und tut nichts. Im `runner.log` stehen zwei
+verschiedene Meldungen, und nur die zweite zaehlt:
+
+- `Product Runner wird im Hintergrund gestartet.` kommt aus dem Starter
+  (`product_startup.py:102`) und wird geschrieben, **bevor** irgendetwas
+  geprueft ist. Sie belegt **keinen** Neustart. Folgt darauf `Matrix Auto Cutter
+  Product Runner laeuft bereits.` (`product_runner.py:2027`), hat der neue
+  Prozess den laufenden vorgefunden und sich sofort beendet -- der alte Code
+  laeuft weiter.
+- `Runner startet.` mit Statuscode `runner_starting` (`product_runner.py:938`)
+  ist der einzige Beleg fuer einen tatsaechlichen Start.
+
+Am 9.8.2026 lief der Runner dadurch von **12:07:20 bis 15:02:39** auf altem
+Code, quer ueber den Commit `a87b2a1` (12:41:54) hinweg. Um 14:11:54 und 14:27:56
+stand jeweils die Starterzeile im Log, eine Sekunde spaeter `laeuft bereits`.
+Nachweisbar wurde es daran, dass der Runner um 14:18 eine Warnung
+protokollierte, deren Zeichenkette der Commit entfernt hatte.
+
+### Wo das Log liegt
+
+```
+%LOCALAPPDATA%\DimensionWithin\MatrixAutoCutter\product-runner\logs\runner.log
+```
+
+**Nicht** direkt im Zustandsverzeichnis -- der Unterordner `logs\` gehoert dazu.
+
+Nuetzlicher Filter zum Nachsehen:
+
+```powershell
+$log = "$env:LOCALAPPDATA\DimensionWithin\MatrixAutoCutter\product-runner\logs\runner.log"
+Get-Content $log -Tail 400 | Select-String -Pattern "Runner startet|laeuft bereits|Lautheit: I|render_verifying|render_succeeded|render_failed"
+```
+
+## `E_RENDER_VERIFY` benennt nicht, welche Bedingung gefallen ist
+
+Die Renderverifikation prueft drei Dinge -- Medienprofil, Dauer gegen die
+erwartete Laenge (Toleranz 50 ms) und einen vollstaendigen Decode --, meldet
+aber nur einen gemeinsamen Fehlercode und einen Sammeltext. Wie
+`sidecar.clock_gate`: **bei einem Fehlschlag immer alle drei nachrechnen**,
+nicht raten.
+
+Praktisch: `ffprobe` auf die Partialdatei (Breite, Hoehe, `avg_frame_rate`,
+`sample_rate`, `format=duration` gegen `expected_output_duration_ms` aus
+`render-plan.json`) und dann der Decode von Hand.
+
+**Faustregel aus dem 9.8.2026, abgelesen an der Dauer der Verifikationsphase im
+`runner.log`:** unter 1 Sekunde heisst Medienprofil oder Dauer -- der Decode
+steht hinter der Profilpruefung und wird dann uebersprungen. Mehrere Sekunden
+heissen, der Decode ist wirklich gelaufen. Gemessene Faelle: 1 s und weniger bei
+den beiden Fehlschlaegen um 14:18 und 14:20 (Dauerbedingung), 6 s beim
+bestandenen Lauf um 12:12, 3 s beim bestandenen Lauf um 15:11.
+
+## Gescheiterte Renderversuche lassen ihre Partialdatei liegen
+
+Das ist Absicht und soll so bleiben. Der Renderer loescht nur, was er als sein
+Eigentum beweisen kann -- die fertige Ausgabe nach dem Verlinken und die eigene
+NVENC-Testdatei. Nach einem Fehlschlag in Verifikation oder Veroeffentlichung
+bleibt die `*.partial.mp4` in `Rendered\` stehen.
+
+Das ist im Zweifel das fertige Video: Am 9.8.2026 sind zwei Partialdateien zu je
+24,4 MB liegen geblieben, deren Ton fehlerfrei dekodierte und mit -14,20 LUFS
+genau im Ziel lag -- sie waren nur 83 ms zu lang. Vor dem Aufraeumen also immer
+erst hineinsehen. Die Dateien blockieren nichts: Jeder Versuch traegt seine
+eigene `attempt_id` im Namen.
+
 ## Animierte OBS-Quellen brauchen zwei Haekchen
 
 Browserquellen mit Animation -- „TruthPill Rotator", „EndCart" und

@@ -913,6 +913,92 @@ def test_failed_measurement_warns_and_still_renders_single_pass(
     assert "Lautheitsmessung (Durchgang 1) fehlgeschlagen" in status.message_de
 
 
+def _rendered_duration_ms(
+    tmp_path: Path, ready: ProposalReady, frames: int, audio_chain: str, name: str
+) -> int | None:
+    """Render `frames` frames with one audio chain and probe the container duration."""
+    from matrix_auto_cutter.render import _probe_profile, _render_arguments
+
+    streams = StreamSelection(
+        video_index=0,
+        audio_index=1,
+        width=160,
+        height=90,
+        fps_num=60,
+        fps_den=1,
+        audio_sample_rate=48_000,
+    )
+    graph = build_filtergraph(
+        (KeepSegment(start_frame=0, end_frame=frames),), audio_chain=audio_chain
+    )
+    output = tmp_path / f"{name}.mp4"
+    subprocess.run(
+        _render_arguments(_binary("ffmpeg"), ready.proposal, streams, graph, "libx264", output),
+        check=True,
+        shell=False,
+        capture_output=True,
+        timeout=120,
+    )
+    probed = subprocess.run(
+        [
+            str(_binary("ffprobe")),
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=index,codec_type,width,height,avg_frame_rate,sample_rate:format=duration",
+            "-of",
+            "json",
+            str(output),
+        ],
+        check=True,
+        shell=False,
+        capture_output=True,
+        timeout=60,
+    )
+    profile = _probe_profile(probed.stdout)
+    return profile.duration_ms if profile is not None else None
+
+
+@pytest.mark.parametrize("frames", [300, 301, 302, 303, 304, 305])
+def test_the_duration_holds_in_every_residue_class_modulo_six(
+    tmp_path: Path, raw_sidecar: dict[str, object], frames: int
+) -> None:
+    """loudnorm rounds its timeline up to whole 100 ms; 100 ms are 6 video frames.
+
+    Without the clamp only frames divisible by 6 land on that grid, so a single
+    passing run proves nothing.  All six residues have to hold.
+
+    The counts sit around 5 s on purpose: below loudnorm's 3-second frame the
+    filter takes a different path and the defect does not appear at all, so a
+    one-second clip would test nothing (measured: 61 frames pass unclamped).
+    """
+    from matrix_auto_cutter import loudness
+
+    _source, _sidecar, ready = _proposal(tmp_path, raw_sidecar)
+    measured = _rendered_duration_ms(
+        tmp_path, ready, frames, loudness.render_chain(None, frames), f"class-{frames % 6}"
+    )
+    expected = round(frames * 1000 / 60)
+    assert measured is not None
+    assert abs(measured - expected) <= 50, (
+        f"Restklasse {frames % 6}: {measured} ms gegen erwartete {expected} ms"
+    )
+
+
+def test_without_the_clamp_the_worst_residue_class_overshoots(
+    tmp_path: Path, raw_sidecar: dict[str, object]
+) -> None:
+    """Pin the defect itself: 301 frames is residue 1, the 83 ms case."""
+    from matrix_auto_cutter import loudness
+
+    _source, _sidecar, ready = _proposal(tmp_path, raw_sidecar)
+    unclamped = loudness.render_chain(None, 301).removesuffix(",apad,atrim=end_pts=240800")
+    assert "atrim" not in unclamped
+    measured = _rendered_duration_ms(tmp_path, ready, 301, unclamped, "unclamped")
+    expected = round(301 * 1000 / 60)
+    assert measured is not None and measured - expected > 50
+
+
 def test_audio_only_graph_cuts_exactly_like_the_render(
     tmp_path: Path, raw_sidecar: dict[str, object]
 ) -> None:

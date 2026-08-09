@@ -32,11 +32,12 @@ from matrix_auto_cutter.models import CanonicalModel
 # 08-14-05) und -35,74 bis -35,85 in der Messreihe vom 06.08.2026
 # (``artefakte\repeat\lautheit\``).  Das sind 17 bis 21 dB zu leise.
 #
-# Das Ergebnis landet regelmäßig etwas unter dem Ziel -- abgenommener Lauf
-# 2026-08-09 12-09-50: -14,34 LUFS.  Das Ziel wird deshalb NICHT nachgezogen:
+# Das Ergebnis streut um das Ziel, in beide Richtungen.  Abgenommene Läufe:
+# -13,39 LUFS (15-10-19), -14,34 (12-09-50), -14,53 (15-15-43), -14,60
+# (07-28-18), -15,30 (08-43-22).  Das Ziel wird trotzdem NICHT nachgezogen:
 # Der Ausgang ist spitzengebunden, nicht zielgebunden.  loudnorm und der
-# Limiter halten den True Peak, und der fehlende Rest Lautheit ist genau der
-# Preis dafür.  Ein höheres Ziel bringt keine Lautheit, sondern nur mehr
+# Limiter halten den True Peak, und was an Lautheit fehlt, ist genau der Preis
+# dafür.  Ein höheres Ziel bringt keine Lautheit, sondern nur mehr
 # Pegelreduktion durch den Limiter.
 TARGET_I_LUFS = -14.0
 
@@ -91,16 +92,32 @@ LIMITER_DB = -1.5
 # Muss der Ausgabe-Abtastrate des Renders entsprechen (``-ar 48000``).
 OUTPUT_SAMPLE_RATE = 48_000
 
+# 48000 / 60 = 800 Samples je Videoframe, ganzzahlig.  Der Renderer ist auf
+# 60/1 festgelegt (``StreamSelection.fps_num: Literal[60]``), darum ist die
+# Solllänge der Tonspur ohne Rundung aus der Framezahl ableitbar.
+SAMPLES_PER_VIDEO_FRAME = OUTPUT_SAMPLE_RATE // 60
+
+# Eingangsschranke auf den Messwert aus Durchgang 1.  Beleg: Die Quelle
+# 2026-08-09 14-15-47 maß -49,64 LUFS -- rund 15 dB unter allen anderen
+# gemessenen Läufen -- und kam als -14,20 LUFS heraus.  Alle drei
+# Abnahmeschranken am Ergebnis hätten das durchgewunken, weil die Kette den
+# Pegel ja korrekt anhebt.  Eine so leise Quelle ist aber kein normales
+# Material: sie zieht Rauschen und Raum mit hoch.  Der Wert liegt unter dem
+# leisesten sonst gemessenen Lauf (-35,85 LUFS) mit reichlich Abstand und
+# schlägt nur bei einem echten Aufnahmefehler an.
+MIN_SOURCE_I_LUFS = -45.0
+
 # Abnahmeschranken, geprüft am fertig kodierten Ergebnis -- nicht am Innenleben
 # von loudnorm.  ``normalization_type`` taugt dafür nicht: der Modus fällt bei
 # jedem realistischen Lauf auf ``dynamic`` zurück, weil ein Sprachsignal mit 17
 # bis 21 dB Anhebungsbedarf den für linear nötigen Crest von 13 dB nicht
 # erreicht.  Er gehört ins Protokoll, nicht in eine Warnung.
 #
-# Abweichung der integrierten Lautheit vom Ziel.  Gemessene Ergebnisse:
-# -14,34 LUFS (abgenommener Lauf 2026-08-09 12-09-50), -14,60 (07-28-18),
-# -15,30 (08-43-22).  Die Streuung liegt bei rund 1 dB; 1,5 dB lässt sie durch
-# und fängt einen echten Ausreißer.
+# Abweichung der integrierten Lautheit vom Ziel.  Über die fünf abgenommenen
+# Läufe reicht sie von +0,61 dB (-13,39 LUFS, Lauf 15-10-19) bis -1,30 dB
+# (-15,30 LUFS, Lauf 08-43-22).  1,5 dB lässt das durch und fängt einen echten
+# Ausreißer -- viel Luft ist das nach unten nicht mehr; wird die Schranke je
+# enger gezogen, muss sie gegen diese Reihe geprüft werden.
 ACCEPT_I_TOLERANCE_DB = 1.5
 
 # ``alimiter`` begrenzt den Abtastspitzenwert bei 48 kHz, ``loudnorm`` misst den
@@ -113,9 +130,11 @@ ACCEPT_I_TOLERANCE_DB = 1.5
 ACCEPT_TP_CEILING_DBTP = -0.5
 
 # Untergrenze des Lautheitsumfangs; darunter ist der Ton hörbar
-# zusammengedrückt.  Gemessene Ergebnisse: 4,80 LU (07-28-18), 6,60
-# (12-09-50), 13,20 (08-43-22).  Die Schranke liegt knapp unter dem niedrigsten
-# davon -- sie ist der Wächter gegen das Pumpen, nicht dessen Definition.
+# zusammengedrückt.  Gemessene Ergebnisse: 4,80 LU (07-28-18), 6,50 (15-15-43),
+# 6,60 (12-09-50), 13,20 (08-43-22), 18,80 (15-10-19).  Die Streuung ist groß
+# und folgt dem Material, nicht der Kette; die Schranke liegt knapp unter dem
+# niedrigsten Wert und ist der Wächter gegen das Pumpen, nicht dessen
+# Definition.
 ACCEPT_LRA_FLOOR_LU = 4.0
 
 
@@ -177,13 +196,31 @@ def measurement_chain() -> str:
     return f"{compressor_filter()},{_loudnorm_filter(None)}"
 
 
-def render_chain(measured: LoudnessMeasurement | None) -> str:
-    """Build pass 2, or the single-pass fallback when pass 1 gave no measurement."""
+def render_chain(measured: LoudnessMeasurement | None, output_frames: int) -> str:
+    """Build pass 2, or the single-pass fallback when pass 1 gave no measurement.
+
+    The chain ends clamped to the exact output length.  ``loudnorm`` leaves the
+    timeline longer than the material: it emits the correct number of samples,
+    but their timestamps run ahead.  Measured on run 2026-08-09 14-15-47 --
+    4.167.200 Samples (exactly right) ending at PTS 4.171.200, that is 83,3 ms
+    of surplus timeline.  The container duration follows the longer audio track,
+    and the renderer's duration check compares exactly that against a value
+    derived from video frames.
+
+    The clamp is therefore on the timeline, not on the sample count:
+    ``end_sample`` counts samples and never triggers here, ``end_pts`` counts
+    the timeline and does.  After ``aresample`` the link timebase is
+    1/``OUTPUT_SAMPLE_RATE``, so the PTS bound equals the sample bound and stays
+    integer.  ``apad`` in front keeps the clamp exact in the opposite case, when
+    the audio ever comes out short.
+    """
+    end_pts = output_frames * SAMPLES_PER_VIDEO_FRAME
     return (
         f"{compressor_filter()},"
         f"{_loudnorm_filter(measured)},"
         f"aresample={OUTPUT_SAMPLE_RATE},"
-        f"alimiter=limit={_number(LIMITER_DB)}dB:level=false"
+        f"alimiter=limit={_number(LIMITER_DB)}dB:level=false,"
+        f"apad,atrim=end_pts={end_pts}"
     )
 
 
@@ -253,6 +290,22 @@ def acceptance_warnings(measured: LoudnessMeasurement) -> tuple[str, ...]:
             f"{_number(ACCEPT_LRA_FLOOR_LU)} LU; der Ton ist zusammengedrückt."
         )
     return tuple(warnings)
+
+
+def source_level_warning(measured: LoudnessMeasurement) -> str | None:
+    """Report a source so quiet that the acceptance bounds cannot catch it.
+
+    The bounds measure the finished output, and the chain lifts almost anything
+    to the target.  Only the input level shows that the recording itself was
+    wrong.
+    """
+    if measured.input_i >= MIN_SOURCE_I_LUFS:
+        return None
+    return (
+        f"Quelle ist mit {measured.input_i:.2f} LUFS ungewöhnlich leise (unter "
+        f"{_number(MIN_SOURCE_I_LUFS)} LUFS); die Kette hebt sie an, aber die "
+        "Aufnahme selbst sollte geprüft werden."
+    )
 
 
 def protocol_line(measured: LoudnessMeasurement | None, applied: str | None) -> str:

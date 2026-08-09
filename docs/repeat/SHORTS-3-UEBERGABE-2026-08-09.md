@@ -191,12 +191,56 @@ begrenzt den Abtastspitzenwert bei 48 kHz, `loudnorm` misst den True Peak mit
 gemessen −1,19 / −1,21 / −1,00 dBTP gegen einen Limiter auf −1,5. Eine Schranke
 auf −1,5 wäre derselbe Fehler wie `normalization_type`.
 
+### 3.2 Nachtrag 9.8. spätnachmittags — Längenfehler und zweite Abnahme
+
+Die Abnahme in 3.1 war ein Zufallstreffer. `loudnorm` dehnt die **Zeitachse** auf
+das nächste volle 100-ms-Vielfache — die Samplezahl bleibt richtig, die
+Zeitstempel laufen ihr voraus. 100 ms sind 6 Videoframes, also ging die
+Dauerprüfung (Toleranz 50 ms) nur auf, wenn `output_frame_count` durch 6 teilbar
+war. Lauf 12-09-50 hatte 5712 Frames, Restklasse 0. Lauf 14-15-47 hatte 5209,
+Restklasse 1 — der ungünstigste Fall mit 83 ms Überhang — und fiel zweimal mit
+`E_RENDER_VERIFY`.
+
+Behoben durch eine Klemmung am Ende der Audiokette:
+`… , apad, atrim=end_pts=<output_frame_count × 800>`. **`end_pts`, nicht
+`end_sample`:** `end_sample` zählt Samples und hätte nie ausgelöst, weil die
+Samplezahl bereits stimmte. Die Klemmung muss hinter `aresample=48000` stehen —
+`loudnorm` gibt mit 192 kHz aus, davor würde sie auf ein Viertel schneiden.
+
+**Zweite Abnahme, Lauf `2026-08-09 15-10-19`, Renderende 15:11:55:**
+
+| | gemessen |
+|---|---|
+| I | **−13,39 LUFS** |
+| TP | **−1,41 dBTP** |
+| LRA | **18,80 LU** |
+
+Keine Warnung, Verifikation 3 s (Decode ist also wirklich gelaufen), Dauer
+39.466 gegen 39.467 ms erwartet. 2368 Frames, **Restklasse 4**.
+
+Direkt danach ein zweiter Lauf, `2026-08-09 15-15-43`, 15:16:54: I −14,53 LUFS,
+TP −0,97 dBTP, LRA 6,50 LU, 1519 Frames — **Restklasse 1**, genau die Klasse, die
+um 14:18 gefallen war. Dauer 25.316 gegen 25.317 ms erwartet.
+
+Zwei Dinge zum Merken:
+
+- **Die Streuung ist größer als gedacht.** I liegt über fünf abgenommene Läufe
+  zwischen −13,39 und −15,30 LUFS, der LRA zwischen 6,50 und 18,80 LU. Die
+  1,5-dB-Schranke hat nach unten nur noch 0,2 dB Luft. Wer sie enger zieht, muss
+  gegen diese Reihe rechnen.
+- **Der Runner lief von 12:07:20 bis 15:02:39 auf altem Code**, quer über den
+  Commit `a87b2a1` hinweg, weil `START-MATRIX-AUTO-CUTTER.cmd` bei laufendem
+  Runner nur „läuft bereits" meldet. Die Startzeile im Log belegt keinen
+  Neustart — nur `runner_starting` „Runner startet." tut das. Steht jetzt in
+  `UMGEBUNG.md`, zusammen mit dem Logpfad und einem Filter zum Nachsehen.
+
 ---
 
 ## 4. Offene Punkte — nach Wert geordnet
 
 ### 4.1 `loudnorm` — erledigt
-Gebaut und abgenommen, siehe 3.1. Offen bleibt nur die Beobachtung am
+Gebaut und abgenommen, siehe 3.1, Längenfehler behoben und zweimal nachgemessen,
+siehe 3.2. Offen bleibt nur die Beobachtung am
 Kompressor: Er arbeitet auf Material ohne Ausreißer schwach (Lauf 08-43-22:
 0,84 dB Crestgewinn für 2,97 dB Pegelverlust; Lauf 07-28-18 mit einem
 Einzelereignis über der Schwelle: 4,93 dB für 1,90 dB). Verdacht: 5 ms Attack
