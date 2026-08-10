@@ -52,6 +52,12 @@ Audiobitrate und `volumedetect` vor jedem Stapellauf pruefen:
 
 Immer `uv run python -m pytest`, niemals `uv run pytest`.
 
+Und nur ueber PowerShell, nicht ueber Git-Bash. Unter Git-Bash scheitert
+derselbe Aufruf mit „No module named pytest", obwohl das Paket im
+site-packages liegt und `PYTHONPATH` identisch gesetzt ist. Beide Shells
+reichen den `;`-getrennten Pfad unterschiedlich an den Windows-Python-Prozess
+weiter. Gefunden am 10.8.2026 beim Bau von Shorts-Stufe 0.
+
 ## Product Runner nach jeder Codeaenderung neu starten
 
 Der Product Runner laeuft als Hintergrundprozess und laedt den Code beim Start.
