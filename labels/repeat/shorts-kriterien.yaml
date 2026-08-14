@@ -1,0 +1,233 @@
+# shorts-kriterien.yaml — Fassung 0.3 (14. August 2026)
+#
+# Diese Datei ist der Text, den ein lesendes Modell in Stufe 2 als Vorgabe
+# bekommt. Jede Aussage traegt, woher sie kommt und wie gut sie belegt ist.
+#
+# Aenderungen gegenueber 0.2:
+#   - Erste Fassung mit echten Urteilen: 21 Kandidaten, 15 ja / 6 nein
+#   - Verschachtelungsregel von "plausibel" auf "belegt" (3 von 3)
+#   - Warnschwelle von 60 s auf 50 s gesenkt (gemessen, nicht geschaetzt)
+#   - "Ein Thema je Short" bestaetigt, mit dem Wortlaut des Nutzers
+#   - "endet mit vollstaendigem Satz" praezisiert: der GEDANKE muss fertig
+#     sein, nicht der Satz
+#   - Sicherheitsstufe als Vorhersagewert belegt
+#   - Der Vorbehalt "moeglicherweise Werkzeugproblem" ist erledigt
+
+herkunft:
+  aufnahme: "2026-08-07 11-35-16"
+  nutzermarken: 17           # gesetzt am 11.8., bevor ein Sucher existierte
+  blindkandidaten: 21        # an 18 Stellen, drei davon verschachtelt
+  echte_urteile: 21          # abgegeben am 14.8. an der Urteilsseite
+  stand: "2026-08-14"
+  warnung: >
+    Alles stammt aus einer einzigen Aufnahme. Bevor daraus eine Automatik
+    wird, gehoert ein zweites Video markiert und gegengeprueft.
+
+# ---------------------------------------------------------------------------
+# Was ein Short ist
+# ---------------------------------------------------------------------------
+
+definition:
+  kern: >
+    Ein abgeschlossener Gedanke, der ohne Vorwissen verstaendlich ist. Wer nur
+    diese dreissig bis fuenfzig Sekunden sieht, muss folgen koennen.
+  these_und_aufloesung: >
+    These und Aufloesung liegen beide im Ausschnitt. Eine Behauptung ohne Beleg
+    ist kein Short, ein Beleg ohne Behauptung auch nicht.
+  belegt_durch: >
+    Der einzige Kandidat mit Sicherheit "niedrig" (#1, ZCash) wurde vom
+    zerlegenden Modell selbst als "eher eine Feststellung als eine These mit
+    Aufloesung" beschrieben -- und vom Nutzer abgelehnt.
+
+# ---------------------------------------------------------------------------
+# Die Kriterien, nach Wirksamkeit sortiert
+# ---------------------------------------------------------------------------
+
+kriterien:
+
+  - name: ein_thema_je_short
+    staerke: stark
+    regel: >
+      Ein Short traegt EIN Thema. Laesst sich der Ausschnitt nur in zwei Titeln
+      zusammenfassen, ist er zu breit -- dann gehoert er ins Langvideo.
+    prueffrage: "Liesse sich der Ausschnitt in zwei Titel fassen?"
+    belegt_durch: >
+      Kandidat #5 (Finsternis-Muster, 56 s): vom Modell als "Belegkette plus
+      Aufloesung" begruendet, vom Nutzer beim Markieren am 11.8. uebersprungen
+      -- "da werden zwei verschiedene Themen innerhalb einem Short besprochen".
+      Am 14.8. an der Urteilsseite zunaechst mit Ja beurteilt, dann korrigiert:
+      "zu abgehackt beziehungsweise zu lang". Beide Male dasselbe Urteil, aus
+      demselben Grund.
+    hinweis: >
+      Die Versuchung ist, einen langen Beleg mitzunehmen, damit die These
+      traegt. Bricht der Beleg bei der Kuerzung weg, ist die Stelle kein Short
+      -- sie ist Videomaterial.
+
+  - name: kuerzestes_was_noch_fuer_sich_steht
+    staerke: stark
+    regel: >
+      Bei verschachtelten Moeglichkeiten gewinnt die kurze Fassung -- aber
+      "das kuerzeste, was noch fuer sich steht", nicht "so kurz wie moeglich".
+    belegt_durch: >
+      Drei Verschachtelungen, drei Mal dasselbe Ergebnis, ohne Ausnahme:
+        #8 (56 s) nein  <->  #9 (38 s) ja
+        #11 (53 s) nein <->  #10 (34 s) ja
+        #18 (75 s) nein <->  #16 (28 s) ja UND #17 (47 s) ja
+      Aus der laengsten Fassung wurden zwei eigenstaendige Shorts statt einem.
+    begruendung_nutzer: >
+      Ein zu langer Short nimmt dem Langvideo den Sinn: steht die vollstaendige
+      Erklaerung schon im Short, hat niemand mehr Grund, das Video zu oeffnen.
+      Mehr kurze Stuecke sind ausserdem mehr Material fuer mehrere Tage.
+    prueffragen:
+      - "Liegen These UND Aufloesung im Ausschnitt?"
+      - "Traegt sich der erste Satz ohne das Vorherige?"
+    folge: >
+      Verschachtelte Kandidaten duerfen ausgegeben werden, die kurzen sind
+      aber die Vorschlaege. Die lange Fassung kommt als Fussnote mit.
+
+  - name: grenze_liegt_auf_einer_sprechpause
+    staerke: stark
+    regel: >
+      Wo der Sprecher Luft holt, liegt eine Fuge. Ausserhalb zusammenhaengender
+      Erzaehlbloecke sind Markengrenzen von Schnittkanten nicht
+      unterscheidbar.
+    belegt_durch: >
+      34 Nutzergrenzen: 59 % innerhalb 1,5 s einer Schnittkante gegen 26 % an
+      Zufallspunkten. Ausserhalb des Erzaehlblocks 83 %, Median 0,32 s.
+      Unabhaengig bestaetigt: Die blinde Zerlegung, die die Schnittliste nie
+      gesehen hat, trifft mit 46 % ihrer Grenzen unter 0,5 s an eine Kante
+      (Zufall 11 %).
+    quelle: "cut-proposal.json, proposed_cuts -- steht in jedem Proposal bereit"
+    grenze_des_kriteriums: >
+      Versagt in pausenlosen Erzaehlbloecken. Zwischen roh 10:31 und 11:32 --
+      61 Sekunden -- gibt es keinen einzigen Schnitt. Dort traegt nur der Text.
+      Genau dort hat das Sprachmodell sechs Stuecke gefunden statt einem, und
+      fuenf davon wurden angenommen.
+
+  - name: der_gedanke_muss_fertig_sein
+    staerke: mittel
+    regel: >
+      Der letzte Gedanke ist zu Ende gesprochen. Ein fehlendes Satzzeichen
+      schadet nicht, ein fehlendes WORT schon.
+    belegt_durch: >
+      Kandidat #19 (XLM als Kopie von XRP, 29 s) abgelehnt mit der Notiz
+      "ende abgeschinitten". Der Text bricht ab bei "Ich glaube nicht, dass das
+      wieder passieren" -- das "wird" fehlt.
+      Abzugrenzen von dem widerlegten Kriterium unten: Der Nutzer schneidet
+      regelmaessig mitten im Satz und stoert sich nicht daran. Er stoert sich,
+      wenn der Gedanke unfertig bleibt.
+
+  - name: grenzsicherheit_melden
+    staerke: mittel
+    regel: >
+      Ein Kandidat mit unsicheren Grenzen wird MIT WARNUNG ausgegeben, nicht
+      weggelassen. Die Entscheidung gehoert dem Nutzer.
+    belegt_durch: >
+      Kandidat #6 trug "mittel" wegen entarteter Zeitmarken im Transkript und
+      wurde abgelehnt. Inhaltlich brauchbar, nur schlecht geschnitten.
+
+  - name: die_sicherheitsstufe_traegt
+    staerke: stark
+    regel: >
+      Die Selbsteinschaetzung des zerlegenden Modells sagt das Nutzerurteil
+      weitgehend voraus. Sie taugt zur Vorsortierung.
+    belegt_durch: >
+      Ohne die drei Verschachtelungs-Elternfassungen:
+        hoch    13 von 13 angenommen
+        mittel   2 von  4
+        niedrig  0 von  1
+      Kein einziger HOCH-Kandidat wurde wegen seines Inhalts abgelehnt.
+    hinweis: >
+      Es bleibt eine Selbsteinschaetzung, kein gemessener Wert. Bei einem
+      zweiten Video neu zu pruefen.
+
+  - name: themenwechselformel_am_anfang
+    staerke: schwach
+    regel: >
+      Formeln wie "Lasst uns ganz kurz noch ueber X reden" markieren einen
+      Anfang.
+    belegt_durch: "4 von 17 Anfaengen (24 %) gegen 7 % an Zufallspunkten."
+    hinweis: "Reales, aber duennes Signal. Taugt zur Rangfolge, nicht als Filter."
+
+# ---------------------------------------------------------------------------
+# Widerlegt -- nicht wieder aufnehmen
+# ---------------------------------------------------------------------------
+
+widerlegt:
+
+  - name: endet_mit_vollstaendigem_satz
+    stand_in: "SHORTS-KONTEXT-2026-08-09.md Abschnitt 3, als Beispielkriterium"
+    messung_small: "7 von 17 Enden innerhalb 1,5 s eines Satzendes (Zufall 16 %)"
+    messung_medium: >
+      8 von 17 (47 %), aber der Zufallswert stieg von 16 % auf 29 % --
+      der Abstand zum Zufall SCHRUMPFT von 2,6x auf 1,6x.
+    urteil: >
+      Endgueltig widerlegt. Der Vorbehalt "moeglicherweise ein Werkzeugproblem
+      von ggml-small" ist mit ggml-medium geprueft und ausgeraeumt: doppelt so
+      dichte Interpunktion macht das Kriterium nicht besser, sondern
+      schlechter. Der Nutzer schneidet nach der Pointe, nicht nach dem Punkt --
+      nach "richtig.", nach "na.".
+    ersetzt_durch: "der_gedanke_muss_fertig_sein (siehe oben)"
+
+  - name: nennung_eines_instruments_am_anfang
+    messung: "6 von 17 (35 %) gegen 24 % an Zufallspunkten."
+    urteil: "Kein tragfaehiger Unterschied. Der Sprecher nennt durchgehend Coins."
+
+  - name: anrede_am_anfang
+    messung: "1 von 17, und dort erst 1 s NACH der Grenze."
+    urteil: "Widerlegt."
+
+  - name: frage_am_anfang
+    messung: "0 von 17."
+    urteil: "Widerlegt."
+
+# ---------------------------------------------------------------------------
+# Laenge
+# ---------------------------------------------------------------------------
+
+laenge:
+  obergrenze_s: 90
+  warnschwelle_s: 50          # 0.2 hatte 60 -- gesenkt, siehe unten
+  angestrebt_s: 40
+  gemessen_marken:
+    median_s: 40
+    spanne_s: [19, 72]
+    n: 17
+  gemessen_urteile:
+    angenommen_median_s: 34
+    angenommen_spanne_s: [15, 57]
+    abgelehnt_ohne_grenzfehler_s: [53, 56, 56, 75]
+  grundsatz: >
+    Die Laenge ist ein Ergebnis, keine Bedingung. Ein Short ist so lang, wie
+    der Gedanke braucht.
+  warnschwelle_begruendung: >
+    Ab etwa 53 s traegt kein Ausschnitt mehr, mit genau einer Ausnahme (#15,
+    57 s). Alle vier laengeren Ablehnungen -- 53, 56, 56, 75 s -- wurden mit
+    derselben Begruendung verworfen: mehrere Themen. Die Laenge ist das
+    Symptom, nicht das Problem. Wer bei 50 s anfaengt zu pruefen, faengt an der
+    richtigen Stelle an.
+  keine_untergrenze: >
+    Der kuerzeste angenommene Kandidat ist 15 s lang (#14) und vollstaendig.
+    Eine Untergrenze von 30 s waere falsch.
+  achtung_achse: >
+    Alle Zeiten liegen auf der GERENDERTEN Achse. Auf der Rohachse sind
+    dieselben Ausschnitte laenger, weil sie herausgeschnittene Stillen
+    enthalten.
+
+# ---------------------------------------------------------------------------
+# Bekannte Grenzen
+# ---------------------------------------------------------------------------
+
+bekannte_grenzen:
+  - "Alle Zahlen stammen aus EINER Aufnahme, 21 Kandidaten, 17 Marken."
+  - >
+    Das Transkript entsteht ab 0.3 aus der GERENDERTEN Fassung mit
+    ggml-medium. Die Rohfassung halluzinierte ueber Musik und Stille.
+  - >
+    Was der Nutzer NICHT will, steht nur teilweise hier. Zwei Kriterien --
+    Themenreinheit und der fertige Gedanke -- entstanden erst durch Nachfragen
+    beim Sichten. Weitere werden so entstehen.
+  - >
+    Von 21 Kandidaten wurden 15 angenommen. Das ist eine hohe Quote und
+    koennte bedeuten, dass die Zerlegung gut ist -- oder dass dieses Video
+    besonders dicht ist. Ein zweites Video entscheidet das.
