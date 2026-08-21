@@ -14,6 +14,8 @@ from matrix_auto_cutter.shorts.frame_map import (
     candidate_frame_span,
     candidate_outside_windows,
     keep_segments_from_intervals,
+    map_rendered_frame,
+    map_source_frame,
     map_source_interval_to_rendered,
     ms_to_frame,
 )
@@ -120,3 +122,51 @@ def test_candidate_outside_windows_true_when_touching_but_not_overlapping() -> N
 
 def test_candidate_outside_windows_true_with_no_windows_at_all() -> None:
     assert candidate_outside_windows((0, 100), []) is True
+
+
+# --- map_rendered_frame: der Rueckweg, Auftrag shorts-stufe-3b-modul Teil 1 --------
+#
+# Der Rundlauf gegen die ECHTEN Keep-Segmente der Aufnahme 2026-08-19 17-26-15
+# (20 Schnitte, source_frame_count 48574, Keep-Summe 46543) steht im Bericht
+# artefakte/repeat/shorts-stufe-3b-modul/BERICHT-2026-08-21.md: 46543 von 46543,
+# null Abweichungen. Hier laeuft derselbe Rundlauf gegen die oben schon
+# belegten Segmente der Aufnahme 2026-08-17 20-47-23 - synthetisch ist daran
+# nichts, nur kleiner.
+
+
+def test_map_rendered_frame_ist_die_umkehrung_von_map_source_frame() -> None:
+    gesamt = sum(segment.length for segment in _REAL_KEEP_SEGMENTS)
+    rundlauf = 0
+    for rendered_frame in range(gesamt):
+        source_frame = map_rendered_frame(_REAL_KEEP_SEGMENTS, rendered_frame)
+        assert source_frame is not None
+        if map_source_frame(_REAL_KEEP_SEGMENTS, source_frame) == rendered_frame:
+            rundlauf += 1
+    assert rundlauf == gesamt
+
+
+def test_map_rendered_frame_trifft_das_erste_frame_jedes_segments() -> None:
+    rendered = 0
+    for segment in _REAL_KEEP_SEGMENTS:
+        assert map_rendered_frame(_REAL_KEEP_SEGMENTS, rendered) == segment.start_frame
+        rendered += segment.length
+
+
+def test_map_rendered_frame_ohne_gegenstueck_ist_none() -> None:
+    """Ab der Gesamtlaenge gibt es kein Quellframe mehr - kein Klemmen auf den Rand."""
+    gesamt = sum(segment.length for segment in _REAL_KEEP_SEGMENTS)
+    assert map_rendered_frame(_REAL_KEEP_SEGMENTS, gesamt) is None
+    assert map_rendered_frame(_REAL_KEEP_SEGMENTS, gesamt + 5000) is None
+
+
+def test_map_rendered_frame_verwirft_negative_frames_wie_seine_nachbarn() -> None:
+    with pytest.raises(ValueError):
+        map_rendered_frame(_REAL_KEEP_SEGMENTS, -1)
+
+
+def test_map_rendered_frame_ueberspringt_den_schnitt() -> None:
+    """Das erste geschnittene Frame taucht auf der gerenderten Achse nicht auf."""
+    segments = keep_segments_from_intervals([(10, 20)], 30)
+    assert map_rendered_frame(segments, 9) == 9
+    assert map_rendered_frame(segments, 10) == 20
+    assert map_source_frame(segments, 15) is None

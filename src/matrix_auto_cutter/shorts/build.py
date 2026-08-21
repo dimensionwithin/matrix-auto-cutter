@@ -58,6 +58,7 @@ import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from pathlib import Path
 from typing import TypeVar
 
@@ -67,7 +68,15 @@ from matrix_auto_cutter.product_runner import default_journal_directory
 from matrix_auto_cutter.shorts import avatar_canvas, canvas, chart_crop, subtitle_burn
 from matrix_auto_cutter.shorts.avatar_cut import probe_frame_count
 from matrix_auto_cutter.shorts.candidates import Candidate, CandidatesSchemaError, load_candidates
+from matrix_auto_cutter.shorts.cursor_track import (
+    CursorProtokollError,
+    CursorZeile,
+    Versatzkurve,
+    lies_cursorprotokoll,
+    versatzkurve,
+)
 from matrix_auto_cutter.shorts.frame_map import (
+    KeepSegment,
     candidate_frame_span,
     candidate_outside_windows,
     effective_cuts,
@@ -105,7 +114,7 @@ BUILD_FPS = chart_crop.SOURCE_FPS
 
 assert BUILD_FPS == canvas.CANVAS_FPS, "chart_crop und canvas muessen dieselbe fps annehmen"
 
-BUILD_REPORT_SCHEMA_VERSION = "1.9"
+BUILD_REPORT_SCHEMA_VERSION = "2.0"
 """1.1 (Auftrag shorts-pegelschnitt): je Kandidat ``pegelkorrektur`` ergaenzt.
 1.2 (Auftrag shorts-pegelmedian): je Grenze ``verfahren`` und
 ``leiser_bereich_ms`` ergaenzt - welches Verfahren griff, wie lang der
@@ -139,7 +148,12 @@ der gemessene Sprechpegel und die gefundene Stillelaenge. Siehe
 1.9 (Auftrag shorts-stillevorlauf-toleranz): ``pegelkorrektur.stillevorlauf``
 um ``unterbrechungen_anzahl``/``laengste_unterbrechung_ms`` ergaenzt - wie
 viele kurze Unterbrechungen (Nachhall, Musikakzente) im gewaehlten
-Stillebereich ueberbrueckt wurden und wie lang die laengste davon war."""
+Stillebereich ueberbrueckt wurden und wie lang die laengste davon war.
+2.0 (Auftrag shorts-3b-verdrahtung): je Kandidat ``mausverfolgung`` ergaenzt -
+``grund`` aus :attr:`cursor_track.Versatzkurve.grund` (oder der Grund, warum
+gar keine Kurve gerechnet wurde), Zahl der ``fahrten``, ``versatz_anfang`` und
+``versatz_ende``, dazu ``naehte`` und ``eingefrorene_frames``. Ohne diese
+Zeilen laesst sich spaeter nicht nachsehen, was Stufe 3b getan hat."""
 
 BUILD_REPORT_FILE_NAME = "shorts-bau-bericht.json"
 AVATAR_CUT_FILE_NAME = "avatar-cut.mp4"
@@ -446,6 +460,9 @@ class CandidateOutcome:
     output_path: str | None
     pegelkorrektur: LevelCorrectionInfo | None = None
     """``None``, solange der Kandidat es gar nicht bis zur Pegelmessung geschafft hat."""
+    mausverfolgung: KurvenInfo | None = None
+    """Auftrag shorts-3b-verdrahtung: was Stufe 3b fuer diesen Kandidaten entschieden hat -
+    ``None``, solange der Kandidat es gar nicht bis dorthin geschafft hat."""
     achsenabweichung_frames: int | None = None
     achsenabweichung_hinweis: str | None = None
     """Auftrag shorts-achsenpruefung-warnung: die Achsenpruefung (avatar_canvas, Punkt 5)
@@ -659,7 +676,9 @@ def _load_rendered_charts_windows(
     job: dict[str, object],
     *,
     journal_directory: Path,
-) -> tuple[tuple[tuple[int, int], ...] | None, SceneFilterInfo]:
+) -> tuple[
+    tuple[tuple[int, int], ...] | None, SceneFilterInfo, tuple[KeepSegment, ...]
+]:
     """Bilde die Charts-Fenster auf die gerenderte Achse ab, wenn moeglich.
 
     Gibt ``(None, info)`` zurueck, wenn der Filter aus irgendeinem Grund
@@ -675,17 +694,17 @@ def _load_rendered_charts_windows(
         proposal_node.get("path") if isinstance(proposal_node, dict) else None
     )
     if not isinstance(recording_id, str) or not recording_id:
-        return None, SceneFilterInfo(False, "kein_recording_id_im_auftrag", None, ())
+        return None, SceneFilterInfo(False, "kein_recording_id_im_auftrag", None, ()), ()
     if not isinstance(proposal_path_text, str) or not proposal_path_text:
-        return None, SceneFilterInfo(False, "kein_proposal_im_auftrag", None, ())
+        return None, SceneFilterInfo(False, "kein_proposal_im_auftrag", None, ()), ()
 
     journal_path = journal_directory / f"{recording_id}.recording-journal.ndjson"
     if not journal_path.is_file():
-        return None, SceneFilterInfo(False, "journal_nicht_gefunden", journal_path, ())
+        return None, SceneFilterInfo(False, "journal_nicht_gefunden", journal_path, ()), ()
 
     gate = inspect_approval_state(Path(proposal_path_text))
     if not gate.authorized or gate.proposal is None:
-        return None, SceneFilterInfo(False, "proposal_nicht_freigegeben", journal_path, ())
+        return None, SceneFilterInfo(False, "proposal_nicht_freigegeben", journal_path, ()), ()
 
     active_candidate_ids = (
         gate.approval.active_candidate_ids
@@ -699,15 +718,179 @@ def _load_rendered_charts_windows(
             screen_intervals, gate.proposal.source_frame_count
         )
     except ValueError:
-        return None, SceneFilterInfo(False, "schnittintervalle_ungueltig", journal_path, ())
+        return None, SceneFilterInfo(False, "schnittintervalle_ungueltig", journal_path, ()), ()
 
     scene_result = load_scene_windows(journal_path)
     if isinstance(scene_result, SceneWindowsFailed):
-        return None, SceneFilterInfo(False, f"journal_{scene_result.reason}", journal_path, ())
+        # Keep-Segmente stehen hier schon fest und bleiben gueltig: die
+        # Mausverfolgung braucht sie, den Szenenfilter aber nicht.
+        return (
+            None,
+            SceneFilterInfo(False, f"journal_{scene_result.reason}", journal_path, ()),
+            tuple(keep_segments),
+        )
 
     source_windows = tuple((window.start_frame, window.end_frame) for window in scene_result)
     rendered_windows = map_source_interval_to_rendered(keep_segments, source_windows)
-    return rendered_windows, SceneFilterInfo(True, None, journal_path, ())
+    return rendered_windows, SceneFilterInfo(True, None, journal_path, ()), tuple(keep_segments)
+
+
+# ---------------------------------------------------------------------------
+# Punkt 3c: Mausverfolgung (Stufe 3b) - EINMAL JE LAUF gelesen, nicht je Kandidat.
+#
+# Der Bau ist am 20.8. von 515 s auf 63 s je Short gebracht worden, unter
+# anderem dadurch, dass Werte einmal je Lauf statt je Kandidat gemessen
+# werden. Das Cursorprotokoll hat 5000 bis 7000 Zeilen; es 33 mal zu lesen
+# waere genau der Rueckschritt, den dieses Muster vermeiden soll.
+# ---------------------------------------------------------------------------
+
+MAUSVERFOLGUNG_ABGESCHALTET = "abgeschaltet"
+MAUSVERFOLGUNG_KEIN_EINTRAG = "kein_cursorprotokoll_im_auftrag"
+MAUSVERFOLGUNG_DATEI_FEHLT = "cursorprotokoll_nicht_gefunden"
+MAUSVERFOLGUNG_UNLESBAR = "cursorprotokoll_unlesbar"
+MAUSVERFOLGUNG_KEINE_SEGMENTE = "keine_keep_segmente"
+MAUSVERFOLGUNG_AUSSCHNITT_VORRANG = "ausschnitt_json_vorrang"
+MAUSVERFOLGUNG_SPANNE_UNGUELTIG = "kandidatenspanne_ungueltig"
+
+
+@dataclass(frozen=True, slots=True)
+class Mausverfolgung:
+    """Alles, was die Versatzkurve braucht - fuer die Dauer des Laufs unveraenderlich.
+
+    Wird von mehreren Kandidaten NEBENLAEUFIG gelesen (siehe
+    :func:`_kandidat_verarbeiten`) und darf deshalb nur unveraenderliche
+    Felder tragen.
+    """
+
+    aktiv: bool
+    grund: str | None
+    """Warum keine Kurve gerechnet wird - ``None``, solange ``aktiv``."""
+
+    csv_pfad: Path | None = None
+    anker: datetime | None = None
+    zeilen: tuple[CursorZeile, ...] = ()
+    segmente: tuple[KeepSegment, ...] = ()
+    rendered_windows: tuple[tuple[int, int], ...] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class KurvenInfo:
+    """Was Stufe 3b fuer EINEN Kandidaten entschieden hat - fuer den Baubericht."""
+
+    grund: str
+    fahrten: int
+    versatz_anfang: int
+    versatz_ende: int
+    naehte: int = 0
+    eingefrorene_frames: int = 0
+
+
+def _lade_mausverfolgung(
+    job: dict[str, object],
+    *,
+    segmente: tuple[KeepSegment, ...],
+    rendered_windows: tuple[tuple[int, int], ...] | None,
+    aktiviert: bool,
+) -> Mausverfolgung:
+    """Lies das Cursorprotokoll EINMAL und halte es samt Anker fuer den ganzen Lauf.
+
+    RUECKFAELLE SIND DER NORMALFALL: nur 7 von 27 gerenderten Aufnahmen haben
+    ueberhaupt ein Cursorprotokoll. Fehlt es, ist es unlesbar oder fehlen die
+    Keep-Segmente, ist das KEIN Abbruch - der Lauf baut dann mit dem festen
+    Versatz ``chart_crop.X_OFFSET_DEFAULT`` weiter und nennt den Grund im
+    Baubericht.
+
+    DER ANKER ist ``csv_first_row_at`` aus der Waechter-Seitendatei
+    ``cursor-<aufnahme>.json``, NICHT ``recording_started_at`` - beide liegen
+    rund 158 ms auseinander, und die Kalibrierung (Auftrag
+    ``shorts-anker-kalibrierung``) hat gegen ``csv_first_row_at`` gemessen.
+    ``shorts-job.json`` traegt den Wert nicht selbst; es traegt aber den Pfad
+    zur csv, und ``csv_first_row_at`` ist per Definition der Zeitstempel ihrer
+    ersten Zeile (an beiden bekannten Aufnahmen woertlich nachgeprueft). Der
+    Anker ist damit ohne jede Aenderung an ``inventory.py`` oder ``job.py`` zu
+    bekommen - der kleinstmoegliche Eingriff.
+    """
+    if not aktiviert:
+        return Mausverfolgung(False, MAUSVERFOLGUNG_ABGESCHALTET)
+    knoten = job.get("cursor_log")
+    pfad_text = knoten.get("path") if isinstance(knoten, dict) else None
+    if not isinstance(pfad_text, str) or not pfad_text:
+        return Mausverfolgung(False, MAUSVERFOLGUNG_KEIN_EINTRAG)
+    csv_pfad = Path(pfad_text)
+    if not csv_pfad.is_file():
+        return Mausverfolgung(False, MAUSVERFOLGUNG_DATEI_FEHLT, csv_pfad=csv_pfad)
+    try:
+        zeilen = lies_cursorprotokoll(csv_pfad)
+    except (OSError, CursorProtokollError):
+        return Mausverfolgung(False, MAUSVERFOLGUNG_UNLESBAR, csv_pfad=csv_pfad)
+    if not zeilen:
+        return Mausverfolgung(False, MAUSVERFOLGUNG_UNLESBAR, csv_pfad=csv_pfad)
+    if not segmente:
+        return Mausverfolgung(False, MAUSVERFOLGUNG_KEINE_SEGMENTE, csv_pfad=csv_pfad)
+    return Mausverfolgung(
+        aktiv=True,
+        grund=None,
+        csv_pfad=csv_pfad,
+        anker=zeilen[0].zeit,
+        zeilen=zeilen,
+        segmente=segmente,
+        rendered_windows=rendered_windows,
+    )
+
+
+def _berechne_versatzkurve(
+    mausverfolgung: Mausverfolgung,
+    *,
+    kandidat_index: int,
+    build_start_ms: int,
+    build_end_ms: int,
+    offsets: dict[int, int],
+) -> tuple[tuple[int, ...] | None, KurvenInfo]:
+    """Die Versatzkurve fuer GENAU EINEN Kandidaten, samt Auskunft fuer den Bericht.
+
+    ``ausschnitt.json`` HAT VORRANG: Traegt sie einen Eintrag fuer diesen
+    Kandidaten, wird gar keine Kurve gerechnet. Das ist der Notausgang, wenn
+    eine Kurve einmal danebenliegt.
+
+    Gibt ``(None, info)`` zurueck, wenn der feste Versatz gilt - der Aufrufer
+    reicht dann nichts an ``chart_crop`` durch und bekommt genau den Weg von
+    vor diesem Auftrag.
+    """
+    fester = offsets.get(kandidat_index, chart_crop.X_OFFSET_DEFAULT)
+    if kandidat_index in offsets:
+        return None, KurvenInfo(MAUSVERFOLGUNG_AUSSCHNITT_VORRANG, 0, fester, fester)
+    if not mausverfolgung.aktiv:
+        grund = mausverfolgung.grund or MAUSVERFOLGUNG_KEIN_EINTRAG
+        return None, KurvenInfo(grund, 0, fester, fester)
+    try:
+        spanne = candidate_frame_span(build_start_ms, build_end_ms, BUILD_FPS)
+    except ValueError:
+        return None, KurvenInfo(MAUSVERFOLGUNG_SPANNE_UNGUELTIG, 0, fester, fester)
+    if spanne[1] <= spanne[0]:
+        return None, KurvenInfo(MAUSVERFOLGUNG_SPANNE_UNGUELTIG, 0, fester, fester)
+
+    kurve: Versatzkurve = versatzkurve(
+        kandidatenspanne=spanne,
+        segmente=mausverfolgung.segmente,
+        zeilen=mausverfolgung.zeilen,
+        anker=mausverfolgung.anker,
+        szenenfenster=mausverfolgung.rendered_windows,
+        fps=BUILD_FPS,
+    )
+    info = KurvenInfo(
+        grund=kurve.grund,
+        fahrten=len(kurve.fahrten),
+        versatz_anfang=kurve.werte[0],
+        versatz_ende=kurve.werte[-1],
+        naehte=len(kurve.naehte),
+        eingefrorene_frames=kurve.eingefrorene_frames,
+    )
+    if kurve.ist_rueckfall:
+        # Rueckfaelle bleiben Rueckfaelle: fester Versatz, Grund benannt, kein
+        # Abbruch. Eine konstante Kurve durchzureichen waere derselbe Bildinhalt
+        # bei mehr beweglichen Teilen im ffmpeg-Aufruf.
+        return None, info
+    return kurve.werte, info
 
 
 # ---------------------------------------------------------------------------
@@ -1030,6 +1213,7 @@ def _run_chart_crop_for_span(
     rendered_video_path: Path,
     candidate: Candidate,
     offsets: dict[int, int],
+    kurve: Sequence[int] | None,
     output_path: Path,
     ffmpeg_path: Path,
     ffprobe_path: Path | None,
@@ -1051,7 +1235,7 @@ def _run_chart_crop_for_span(
     laeuft dort genau einmal je Lauf, statt hier bei jedem Kandidaten erneut
     per ffprobe gemessen zu werden.
     """
-    plan = chart_crop.plan_chart_crop(candidate, offsets=offsets, fps=BUILD_FPS)
+    plan = chart_crop.plan_chart_crop(candidate, offsets=offsets, fps=BUILD_FPS, kurve=kurve)
     process_result = chart_crop.run_chart_crop(
         input_path=rendered_video_path,
         output_path=output_path,
@@ -1203,6 +1387,7 @@ def _build_one_candidate(
     candidate: Candidate,
     build_start_ms: int,
     build_end_ms: int,
+    kurve: tuple[int, ...] | None,
     whole_video_words: Sequence[Word],
     rendered_video_path: Path,
     avatar_cut_path: Path,
@@ -1234,6 +1419,7 @@ def _build_one_candidate(
         rendered_video_path=rendered_video_path,
         candidate=span_candidate,
         offsets=offsets,
+        kurve=kurve,
         output_path=ausschnitt_path,
         ffmpeg_path=ffmpeg_path,
         ffprobe_path=ffprobe_path,
@@ -1339,6 +1525,7 @@ def run_shorts_build(
     arbeitskopie_aktiv: bool = True,
     parallel: int = PARALLEL_DEFAULT,
     framecount_cache_aktiv: bool = True,
+    mausverfolgung_aktiv: bool = True,
 ) -> BuildResult | BuildFailed:
     """Ende-zu-Ende: einen Auftrag samt Kandidatenliste zu fertigen Shorts bauen.
 
@@ -1357,6 +1544,13 @@ def run_shorts_build(
     ``framecount_cache_aktiv`` (Auftrag shorts-framezahl-seitendatei, Standard
     an): schaltet die Framezahl-Seitendatei in :func:`derive_inputs` ab -
     ``--kein-framecount-cache`` in der CLI.
+
+    ``mausverfolgung_aktiv`` (Auftrag shorts-3b-verdrahtung, Standard an):
+    schaltet Stufe 3b ab - ``--keine-mausverfolgung`` in der CLI. Der Lauf
+    faellt dann vollstaendig auf Stufe 3a zurueck (fester Versatz
+    ``chart_crop.X_OFFSET_DEFAULT``, sonst identische Kandidatenspannen). Das
+    ist der Weg, auf dem sich beide Fassungen nebeneinander vergleichen
+    lassen.
 
     ``parallel`` (Auftrag shorts-bau-parallel, Voreinstellung
     :data:`PARALLEL_DEFAULT`): wieviele Kandidaten gleichzeitig gebaut werden.
@@ -1428,8 +1622,15 @@ def run_shorts_build(
     resolved_journal_directory = (
         journal_directory if journal_directory is not None else default_journal_directory()
     )
-    rendered_windows, scene_filter_info = _load_rendered_charts_windows(
+    rendered_windows, scene_filter_info, keep_segments = _load_rendered_charts_windows(
         job, journal_directory=resolved_journal_directory
+    )
+    # EINMAL JE LAUF, nicht je Kandidat - siehe :func:`_lade_mausverfolgung`.
+    mausverfolgung = _lade_mausverfolgung(
+        job,
+        segmente=keep_segments,
+        rendered_windows=rendered_windows,
+        aktiviert=mausverfolgung_aktiv,
     )
 
     video_name = derived.canvas_recording_id
@@ -1451,6 +1652,7 @@ def run_shorts_build(
             candidates=candidates,
             whole_video_words=whole_video_words,
             rendered_windows=rendered_windows,
+            mausverfolgung=mausverfolgung,
             rendered_video_path=active_rendered_video_path,
             avatar_cut_path=active_avatar_cut_path,
             offsets=offsets,
@@ -1489,6 +1691,7 @@ def _kandidat_verarbeiten(
     candidate: Candidate,
     whole_video_words: Sequence[Word],
     rendered_windows: tuple[tuple[int, int], ...] | None,
+    mausverfolgung: Mausverfolgung,
     rendered_video_path: Path,
     avatar_cut_path: Path,
     offsets: dict[int, int],
@@ -1597,6 +1800,17 @@ def _kandidat_verarbeiten(
         stillevorlauf_aktiv=stillevorlauf_aktiv,
     )
 
+    # Stufe 3b auf der TATSAECHLICH gebauten Spanne, nicht auf den rohen
+    # Kandidatengrenzen: die Pegelkorrektur oben hat sie gerade verschoben,
+    # und die Kurve muss Frame fuer Frame zu dem passen, was gebaut wird.
+    kurve, kurven_info = _berechne_versatzkurve(
+        mausverfolgung,
+        kandidat_index=candidate.index,
+        build_start_ms=build_start_ms,
+        build_end_ms=build_end_ms,
+        offsets=offsets,
+    )
+
     candidate_dir = output_dir / f"kandidat-{candidate.index:02d}"
     if not candidate_dir.exists():
         notizen.verzeichnis_angelegt(candidate.index, candidate_dir)
@@ -1606,6 +1820,7 @@ def _kandidat_verarbeiten(
             candidate=candidate,
             build_start_ms=build_start_ms,
             build_end_ms=build_end_ms,
+            kurve=kurve,
             whole_video_words=whole_video_words,
             rendered_video_path=rendered_video_path,
             avatar_cut_path=avatar_cut_path,
@@ -1630,6 +1845,7 @@ def _kandidat_verarbeiten(
                 build_end_ms=build_end_ms,
                 output_path=None,
                 pegelkorrektur=level_info,
+                mausverfolgung=kurven_info,
             ),
             False,
         )
@@ -1647,6 +1863,7 @@ def _kandidat_verarbeiten(
                 build_end_ms=build_end_ms,
                 output_path=None,
                 pegelkorrektur=level_info,
+                mausverfolgung=kurven_info,
             ),
             False,
         )
@@ -1665,6 +1882,7 @@ def _kandidat_verarbeiten(
             build_end_ms=build_end_ms,
             output_path=short_path,
             pegelkorrektur=level_info,
+            mausverfolgung=kurven_info,
             achsenabweichung_frames=achsenabweichung_frames,
             achsenabweichung_hinweis=achsenabweichung_hinweis,
         ),
@@ -1677,6 +1895,7 @@ def _build_all_candidates(
     candidates: Sequence[Candidate],
     whole_video_words: Sequence[Word],
     rendered_windows: tuple[tuple[int, int], ...] | None,
+    mausverfolgung: Mausverfolgung,
     rendered_video_path: Path,
     avatar_cut_path: Path,
     offsets: dict[int, int],
@@ -1713,6 +1932,7 @@ def _build_all_candidates(
             candidate=candidate,
             whole_video_words=whole_video_words,
             rendered_windows=rendered_windows,
+            mausverfolgung=mausverfolgung,
             rendered_video_path=rendered_video_path,
             avatar_cut_path=avatar_cut_path,
             offsets=offsets,
@@ -1822,6 +2042,23 @@ def _framecount_cache_payload(info: FrameCountCacheInfo) -> dict[str, object]:
     }
 
 
+def _mausverfolgung_payload(info: KurvenInfo | None) -> dict[str, object] | None:
+    """Was Stufe 3b fuer diesen Kandidaten getan hat.
+
+    Ohne diese Zeilen laesst sich spaeter nicht nachsehen, was passiert ist.
+    """
+    if info is None:
+        return None
+    return {
+        "grund": info.grund,
+        "fahrten": info.fahrten,
+        "versatz_anfang": info.versatz_anfang,
+        "versatz_ende": info.versatz_ende,
+        "naehte": info.naehte,
+        "eingefrorene_frames": info.eingefrorene_frames,
+    }
+
+
 def build_report_payload(result: BuildResult) -> dict[str, object]:
     """Baue den JSON-Inhalt der Uebersicht - je Kandidat gebaut oder nicht, mit Grund."""
     return {
@@ -1885,6 +2122,7 @@ def build_report_payload(result: BuildResult) -> dict[str, object]:
                 "build_end_ms": outcome.build_end_ms,
                 "output_path": outcome.output_path,
                 "pegelkorrektur": _level_correction_payload(outcome.pegelkorrektur),
+                "mausverfolgung": _mausverfolgung_payload(outcome.mausverfolgung),
                 "achsenabweichung_frames": outcome.achsenabweichung_frames,
                 "achsenabweichung_hinweis": outcome.achsenabweichung_hinweis,
             }
@@ -1950,6 +2188,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             "wird dann nicht mehr vorgeschoben"
         ),
     )
+    parser.add_argument(
+        "--keine-mausverfolgung",
+        action="store_true",
+        help=(
+            "Mausverfolgung (Stufe 3b) abschalten (Auftrag shorts-3b-verdrahtung) - der "
+            "Ausschnitt steht dann wieder fest auf chart_crop.X_OFFSET_DEFAULT, bei sonst "
+            "unveraenderten Kandidatenspannen. Der Weg, um beide Fassungen zu vergleichen"
+        ),
+    )
     args = parser.parse_args(argv)
 
     ffmpeg_found = args.ffmpeg or discover_ffmpeg()
@@ -1975,6 +2222,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             parallel=args.parallel,
             framecount_cache_aktiv=not args.kein_framecount_cache,
             stillevorlauf_aktiv=not args.kein_stillevorlauf,
+            mausverfolgung_aktiv=not args.keine_mausverfolgung,
         )
     except KeyboardInterrupt:
         # Die Aufraeumarbeit ist an dieser Stelle schon geschehen: laufende

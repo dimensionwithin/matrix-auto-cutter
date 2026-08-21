@@ -210,3 +210,36 @@ def map_source_frame_floor(segments: Sequence[KeepSegment], source_frame: int) -
         rendered += segment.length
         last_covered = rendered - 1
     return last_covered
+
+
+def map_rendered_frame(segments: Sequence[KeepSegment], rendered_frame: int) -> int | None:
+    """Der Rueckweg: bilde ein gerendertes Frame auf seinen Quellframe ab.
+
+    Gegenrichtung zu :func:`map_source_frame` und auf allen erhaltenen Frames
+    dessen exakte Umkehrung::
+
+        map_source_frame(segments, map_rendered_frame(segments, f)) == f
+
+    fuer jedes ``f`` von 0 bis zur Gesamtlaenge der Segmente. Reine
+    Ganzzahlarithmetik, keine Gleitkommazahlen, kein Rateversuch.
+
+    Verhalten ausserhalb des gueltigen Bereichs - dieselbe Form wie bei den
+    Nachbarn, und aus demselben Grund: Ein NEGATIVES ``rendered_frame`` ist ein
+    Aufruffehler und wirft ``ValueError``, genau wie ein negatives
+    ``source_frame`` in :func:`map_source_frame`,
+    :func:`map_source_frame_ceiling` und :func:`map_source_frame_floor` - eine
+    Frameachse hat kein Frame vor null, das ist keine Frage der Daten, sondern
+    ein Fehler des Aufrufers. Ein ``rendered_frame`` AB der Gesamtlaenge der
+    Segmente ist dagegen ein zulaessiger, nur eben unbesetzter Wert: Er hat
+    kein Gegenstueck auf der Quellachse, und das ist ``None`` - dieselbe
+    Auskunft, die :func:`map_source_frame` fuer einen Quellframe in einem
+    Schnitt gibt. Kein Klemmen auf den Rand.
+    """
+    if rendered_frame < 0:
+        raise ValueError("rendered_frame darf nicht negativ sein")
+    rest = rendered_frame
+    for segment in segments:
+        if rest < segment.length:
+            return segment.start_frame + rest
+        rest -= segment.length
+    return None

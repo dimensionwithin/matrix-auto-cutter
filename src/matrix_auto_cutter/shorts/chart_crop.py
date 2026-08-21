@@ -147,8 +147,100 @@ def offset_for_candidate(offsets: dict[int, int], index: int) -> int:
 # ---------------------------------------------------------------------------
 
 
-def crop_scale_filter(x_offset: int) -> str:
-    """Der Crop-plus-Skalierungs-Teilausdruck fuer einen gegebenen Versatz."""
+SENDCMD_MAX_ZEICHEN = 24_000
+"""Obergrenze fuer die Kommandoliste - darueber wird die Kommandozeile unter Windows eng.
+
+Windows begrenzt eine Kommandozeile auf 32767 Zeichen. Eine zu lange Liste
+soll laut anschlagen und nicht abgeschnitten an ffmpeg gehen, wo sie als
+Syntaxfehler an voellig anderer Stelle auftauchte. In der Praxis ist reichlich
+Luft: ein Short von 20 s (die Obergrenze der Kriterien) kann wegen
+``cursor_track.MINDESTVERWEILDAUER_MS`` hoechstens rund 15 Fahrten enthalten,
+also rund 630 Kommandos oder 13000 Zeichen.
+"""
+
+SENDCMD_VORLAUF_FRAMES = 0.5
+"""Wieviel FRUEHER als das Zielframe ein Kommando gesetzt wird - siehe unten.
+
+Ein halbes Frame. Das Kommando liegt damit genau in der Mitte zwischen dem
+vorigen und dem Zielframe: die groesstmoegliche Sicherheitsspanne nach beiden
+Seiten (bei 60 fps rund 8,3 ms), ohne je das falsche Frame zu treffen.
+"""
+
+
+def crop_sendcmd_kommandos(kurve: Sequence[int], *, fps: int = SOURCE_FPS) -> str:
+    """Baue aus einer Versatzkurve die ``sendcmd``-Kommandoliste - je Wechsel eines.
+
+    WARUM ``sendcmd`` UND KEIN ``crop``-AUSDRUCK ueber die Framenummer ``n``:
+    Ein Ausdruck der Form ``v0 + (v1-v0)*gte(n,i1) + ...`` ist framegenau von
+    selbst und war der erste Weg. Er scheitert aber an einer harten Grenze von
+    ffmpeg: der Ausdrucksparser (``libavutil/eval.c``) hat ein festes Budget
+    von 100 Teilausdruecken. GEMESSEN gegen ffmpeg 8.1.1: bis 98 Summanden
+    laeuft es, ab 99 bricht ``crop`` schon beim Einrichten des Filters ab
+    ("Failed to configure input pad"). Eine einzige Fahrt erzeugt aber rund 42
+    Wechsel - schon drei Fahrten in einem Short sprengen die Grenze. Das ist
+    keine Frage der Eleganz, sondern eine Wand.
+
+    ``sendcmd`` kennt diese Grenze nicht. Der Preis ist, dass es an einem
+    ZEITPUNKT ausloest statt an einer Framenummer - genau die Rundungsfrage,
+    auf die es hier ankommt (der Wert an Frame k muss der Kurvenwert an
+    Frame k sein, nicht der an k+1). Geloest wird sie, indem das Kommando fuer
+    Frame ``k`` auf ``(k - 0.5) / fps`` gesetzt wird, also ein halbes Frame zu
+    frueh: Das erste Frame, dessen Zeitstempel diese Marke erreicht, ist genau
+    Frame ``k``, und zwischen Kommando und Frame liegt nach beiden Seiten eine
+    halbe Framedauer Sicherheit. Nachgewiesen an einer Testquelle, deren
+    Spaltenwerte die Spaltennummer tragen: 200 Frames, 199 Kommandos, null
+    Abweichungen.
+
+    Der Zeitstempel gilt NACH ``setpts=PTS-STARTPTS``, die Kandidatenspanne
+    beginnt also bei 0 - dieselbe Achse, auf der die Kurve gerechnet wurde.
+
+    Der Wert des ERSTEN Frames steht nicht in dieser Liste: er ist der feste
+    Anfangswert des ``crop``-Filters selbst (siehe :func:`crop_scale_filter`).
+
+    Jeder Kurvenwert wird durch :func:`_validate_offset` geprueft: Ganzzahl,
+    gerade, in ``[X_OFFSET_MIN, X_OFFSET_MAX]``. Ein Kurvenwert ausserhalb des
+    Kontrakts ist ein Fehler und kein Anlass zum stillen Klemmen.
+    """
+    if not kurve:
+        raise ValueError("Versatzkurve ist leer")
+    if fps <= 0:
+        raise ValueError(f"fps muss positiv sein, ist aber {fps}")
+    for index, wert in enumerate(kurve):
+        _validate_offset(wert, context=f"Versatzkurve, Frame {index}")
+    teile = [
+        f"{(index - SENDCMD_VORLAUF_FRAMES) / fps:.6f} crop x {kurve[index]};"
+        for index in range(1, len(kurve))
+        if kurve[index] != kurve[index - 1]
+    ]
+    kommandos = "".join(teile)
+    if len(kommandos) > SENDCMD_MAX_ZEICHEN:
+        raise ValueError(
+            f"sendcmd-Kommandoliste ist {len(kommandos)} Zeichen lang, mehr als "
+            f"{SENDCMD_MAX_ZEICHEN} - {len(teile)} Wechsel in der Kurve"
+        )
+    return kommandos
+
+
+def crop_scale_filter(
+    x_offset: int, *, kurve: Sequence[int] | None = None, fps: int = SOURCE_FPS
+) -> str:
+    """Der Crop-plus-Skalierungs-Teilausdruck.
+
+    Ohne ``kurve`` genau wie bisher: EIN fester Versatz im Filterausdruck.
+    Dieser Weg bleibt vollstaendig erhalten und ist der Weg, wenn Stufe 3b
+    nichts liefert oder abgeschaltet ist.
+
+    Mit ``kurve`` wandert der Ausschnitt frameweise: ``crop`` startet auf dem
+    ERSTEN Kurvenwert, und ein vorgeschaltetes ``sendcmd`` setzt ihn an jedem
+    Wechsel neu (:func:`crop_sendcmd_kommandos`). ``x_offset`` wird dann nicht
+    verwendet. Enthaelt die Kurve gar keinen Wechsel, bleibt es beim festen
+    Versatz - ein leeres ``sendcmd`` waere ein Filter ohne Wirkung.
+    """
+    if kurve is not None:
+        kommandos = crop_sendcmd_kommandos(kurve, fps=fps)
+        crop_teil = f"crop={CROP_WIDTH}:{CROP_HEIGHT}:{kurve[0]}:0"
+        vorne = f"sendcmd=c='{kommandos}'," if kommandos else ""
+        return f"{vorne}{crop_teil},scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}"
     if not (X_OFFSET_MIN <= x_offset <= X_OFFSET_MAX):
         raise ValueError(f"x_offset {x_offset} liegt ausserhalb [{X_OFFSET_MIN}, {X_OFFSET_MAX}]")
     return (
@@ -158,7 +250,12 @@ def crop_scale_filter(x_offset: int) -> str:
 
 
 def build_ffmpeg_filter_complex(
-    *, start_frame: int, end_frame: int, x_offset: int, fps: int
+    *,
+    start_frame: int,
+    end_frame: int,
+    x_offset: int,
+    fps: int,
+    kurve: Sequence[int] | None = None,
 ) -> tuple[str, str, str]:
     """Baue den ``-filter_complex``-Ausdruck und die Ausgabelabels fuer den Ausschnitt.
 
@@ -172,11 +269,16 @@ def build_ffmpeg_filter_complex(
     """
     if end_frame <= start_frame:
         raise ValueError(f"end_frame ({end_frame}) muss nach start_frame ({start_frame}) liegen")
+    if kurve is not None and len(kurve) != end_frame - start_frame:
+        raise ValueError(
+            f"Versatzkurve hat {len(kurve)} Werte, die Spanne aber "
+            f"{end_frame - start_frame} Frames"
+        )
     start_s = start_frame / fps
     end_s = end_frame / fps
     video = (
         f"[0:v]trim=start_frame={start_frame}:end_frame={end_frame},"
-        f"setpts=PTS-STARTPTS,{crop_scale_filter(x_offset)}[v0]"
+        f"setpts=PTS-STARTPTS,{crop_scale_filter(x_offset, kurve=kurve, fps=fps)}[v0]"
     )
     audio = f"[0:a]atrim=start={start_s:.9f}:end={end_s:.9f},asetpts=PTS-STARTPTS[a0]"
     return f"{video};{audio}", "[v0]", "[a0]"
@@ -191,6 +293,7 @@ def build_ffmpeg_arguments(
     end_frame: int,
     x_offset: int,
     fps: int = SOURCE_FPS,
+    kurve: Sequence[int] | None = None,
 ) -> list[str]:
     """Vollstaendiges ffmpeg-Kommando fuer einen Kandidaten-Ausschnitt.
 
@@ -202,7 +305,7 @@ def build_ffmpeg_arguments(
     ``-r`` gesetzt, nicht dem Encoder ueberlassen.
     """
     filter_complex, video_label, audio_label = build_ffmpeg_filter_complex(
-        start_frame=start_frame, end_frame=end_frame, x_offset=x_offset, fps=fps
+        start_frame=start_frame, end_frame=end_frame, x_offset=x_offset, fps=fps, kurve=kurve
     )
     return [
         str(ffmpeg_path),
@@ -271,6 +374,14 @@ class ChartCropPlan:
     end_frame: int
     fps: int
 
+    kurve: tuple[int, ...] | None = None
+    """Versatz je Frame aus Stufe 3b - ``None`` heisst fester ``x_offset`` wie bisher."""
+
+    @property
+    def bewegt(self) -> bool:
+        """Wahr, wenn der Ausschnitt einer Kurve folgt statt fest zu stehen."""
+        return self.kurve is not None
+
     @property
     def expected_frame_count(self) -> int:
         """Erwartete Ausgabe-Framezahl - exakt ``end_frame - start_frame``, keine Toleranz."""
@@ -283,10 +394,22 @@ class ChartCropPlan:
 
 
 def plan_chart_crop(
-    candidate: Candidate, *, offsets: dict[int, int], fps: int = SOURCE_FPS
+    candidate: Candidate,
+    *,
+    offsets: dict[int, int],
+    fps: int = SOURCE_FPS,
+    kurve: Sequence[int] | None = None,
 ) -> ChartCropPlan:
-    """Baue den Zuschnittplan aus einem Kandidaten und den geladenen Versaetzen."""
+    """Baue den Zuschnittplan aus einem Kandidaten und den geladenen Versaetzen.
+
+    ``ausschnitt.json`` HAT VORRANG: Traegt sie fuer diesen Kandidaten einen
+    Eintrag, gewinnt dieser feste Versatz und eine mitgegebene Kurve wird
+    verworfen. Das ist der Notausgang, wenn eine Kurve einmal danebenliegt -
+    er muss ohne Codeaenderung greifen.
+    """
     start_frame, end_frame = candidate_frame_span(candidate.start_ms, candidate.end_ms, fps)
+    if candidate.index in offsets:
+        kurve = None
     return ChartCropPlan(
         candidate_index=candidate.index,
         start_ms=candidate.start_ms,
@@ -295,6 +418,7 @@ def plan_chart_crop(
         start_frame=start_frame,
         end_frame=end_frame,
         fps=fps,
+        kurve=None if kurve is None else tuple(kurve),
     )
 
 
@@ -317,6 +441,7 @@ def run_chart_crop(
         end_frame=plan.end_frame,
         x_offset=plan.x_offset,
         fps=plan.fps,
+        kurve=plan.kurve,
     )
     return process_runner(arguments, timeout_seconds)
 
@@ -574,6 +699,9 @@ def chart_crop_report_payload(plan: ChartCropPlan, checks: VerifyChecks) -> dict
         "start_frame": plan.start_frame,
         "end_frame": plan.end_frame,
         "x_offset": plan.x_offset,
+        "bewegter_ausschnitt": plan.bewegt,
+        "x_offset_anfang": plan.kurve[0] if plan.kurve else plan.x_offset,
+        "x_offset_ende": plan.kurve[-1] if plan.kurve else plan.x_offset,
         "fps": plan.fps,
         "checks": {
             "frame_count": {

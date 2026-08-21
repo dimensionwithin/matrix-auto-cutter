@@ -489,3 +489,92 @@ def test_run_stage3a_for_candidate_reports_specific_failure_code(
     assert result.code == "frame_count_mismatch"
     report_path = tmp_path / "out.json"
     assert report_path.is_file()
+
+
+# --- Auftrag shorts-3b-verdrahtung: der bewegte Ausschnitt ------------------------
+
+
+def test_fester_versatz_bleibt_woertlich_wie_bisher() -> None:
+    """Ohne Kurve aendert sich am bisherigen Weg kein Zeichen."""
+    assert cc.crop_scale_filter(416) == "crop=1728:1440:416:0,scale=1080:900"
+
+
+def test_sendcmd_setzt_je_wechsel_genau_ein_kommando() -> None:
+    kommandos = cc.crop_sendcmd_kommandos([482, 482, 484, 484, 480], fps=60)
+    assert kommandos.count(";") == 2
+    assert "crop x 484;" in kommandos
+    assert "crop x 480;" in kommandos
+
+
+def test_sendcmd_setzt_das_kommando_ein_halbes_frame_zu_frueh() -> None:
+    """Der Wert an Frame k muss der Kurvenwert an Frame k sein, nicht der an k+1."""
+    kommandos = cc.crop_sendcmd_kommandos([482, 600], fps=60)
+    # Frame 1 liegt bei 1/60 s = 0,016667 s; das Kommando eine halbe Framedauer davor.
+    assert kommandos == "0.008333 crop x 600;"
+
+
+def test_sendcmd_ohne_wechsel_ist_leer_und_der_filter_bleibt_fest() -> None:
+    assert cc.crop_sendcmd_kommandos([600] * 50) == ""
+    gefiltert = cc.crop_scale_filter(416, kurve=[600] * 50)
+    assert gefiltert == "crop=1728:1440:600:0,scale=1080:900"
+    assert "sendcmd" not in gefiltert
+
+
+def test_crop_startet_auf_dem_ersten_kurvenwert_nicht_auf_x_offset() -> None:
+    gefiltert = cc.crop_scale_filter(416, kurve=[482, 600])
+    assert gefiltert.startswith("sendcmd=c='")
+    assert "crop=1728:1440:482:0" in gefiltert
+    assert ":416:" not in gefiltert
+
+
+def test_sendcmd_verwirft_werte_ausserhalb_des_kontrakts() -> None:
+    with pytest.raises(cc.AusschnittSchemaError):
+        cc.crop_sendcmd_kommandos([482, 834])  # ausserhalb [0, 832]
+    with pytest.raises(cc.AusschnittSchemaError):
+        cc.crop_sendcmd_kommandos([482, 483])  # ungerade
+    with pytest.raises(ValueError):
+        cc.crop_sendcmd_kommandos([])
+
+
+def test_filter_complex_verlangt_eine_kurve_in_spannenlaenge() -> None:
+    with pytest.raises(ValueError):
+        cc.build_ffmpeg_filter_complex(
+            start_frame=10, end_frame=20, x_offset=416, fps=60, kurve=[482] * 9
+        )
+    ausdruck, _, _ = cc.build_ffmpeg_filter_complex(
+        start_frame=10, end_frame=20, x_offset=416, fps=60, kurve=[482] * 10
+    )
+    assert "trim=start_frame=10:end_frame=20" in ausdruck
+    assert "crop=1728:1440:482:0" in ausdruck
+
+
+def test_zu_lange_kommandoliste_schlaegt_laut_an() -> None:
+    """Eine abgeschnittene Kommandozeile waere ein Syntaxfehler an falscher Stelle."""
+    wechselnd = [482 + 2 * (i % 100) for i in range(20_000)]
+    with pytest.raises(ValueError, match="Zeichen lang"):
+        cc.crop_sendcmd_kommandos(wechselnd)
+
+
+def test_ausschnitt_json_hat_vorrang_vor_der_kurve() -> None:
+    """Der Notausgang, wenn eine Kurve einmal danebenliegt."""
+    kandidat = _candidate(3, 0, 1000)
+    plan = cc.plan_chart_crop(kandidat, offsets={3: 700}, kurve=[482] * 60)
+    assert plan.kurve is None
+    assert plan.bewegt is False
+    assert plan.x_offset == 700
+
+    ohne_eintrag = cc.plan_chart_crop(kandidat, offsets={}, kurve=[482] * 60)
+    assert ohne_eintrag.bewegt is True
+    assert ohne_eintrag.kurve is not None and ohne_eintrag.kurve[0] == 482
+
+
+def test_kurve_erscheint_im_laufbericht() -> None:
+    kandidat = _candidate(0, 0, 1000)
+    plan = cc.plan_chart_crop(kandidat, offsets={}, kurve=[482] * 59 + [700])
+    nutzlast = cc.chart_crop_report_payload(
+        plan,
+        cc.VerifyChecks(60, 60, True, 1080, 900, True, 1, True, 0.0, 0.0, True),
+    )
+    assert nutzlast["bewegter_ausschnitt"] is True
+    assert nutzlast["x_offset_anfang"] == 482
+    assert nutzlast["x_offset_ende"] == 700

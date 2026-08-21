@@ -211,7 +211,7 @@ def test_derive_inputs_rejects_unmeasurable_avatar_frame_count(
 
 
 def test_scene_filter_skipped_when_no_recording_id_in_job(tmp_path: Path) -> None:
-    windows, info = build._load_rendered_charts_windows({}, journal_directory=tmp_path)
+    windows, info, _segmente = build._load_rendered_charts_windows({}, journal_directory=tmp_path)
     assert windows is None
     assert info.applied is False
     assert info.skip_reason == "kein_recording_id_im_auftrag"
@@ -219,7 +219,7 @@ def test_scene_filter_skipped_when_no_recording_id_in_job(tmp_path: Path) -> Non
 
 def test_scene_filter_skipped_when_journal_missing(tmp_path: Path) -> None:
     job = {"proposal": {"recording_id": "rec-x", "path": str(tmp_path / "cut-proposal.json")}}
-    windows, info = build._load_rendered_charts_windows(job, journal_directory=tmp_path)
+    windows, info, _segmente = build._load_rendered_charts_windows(job, journal_directory=tmp_path)
     assert windows is None
     assert info.applied is False
     assert info.skip_reason == "journal_nicht_gefunden"
@@ -260,7 +260,9 @@ def test_scene_filter_maps_windows_when_journal_and_proposal_available(
     )
 
     job = {"proposal": {"recording_id": "rec-x", "path": str(tmp_path / "cut-proposal.json")}}
-    windows, info = build._load_rendered_charts_windows(job, journal_directory=journal_dir)
+    windows, info, _segmente = build._load_rendered_charts_windows(
+        job, journal_directory=journal_dir
+    )
     assert windows == ((0, 5000),)
     assert info.applied is True
     assert info.skip_reason is None
@@ -1443,6 +1445,7 @@ def test_abbruchmarke_stoppt_die_stufen_eines_kandidaten(tmp_path: Path, monkeyp
             avatar_source_width=1920,
             avatar_source_height=1080,
         ),
+        kurve=None,
         candidate_dir=tmp_path / "kandidat-00",
         ffmpeg_path=Path("ffmpeg.exe"),
         ffprobe_path=Path("ffprobe.exe"),
@@ -1777,3 +1780,167 @@ def test_run_shorts_build_reicht_framecount_cache_aktiv_an_derive_inputs_durch(
     payload = build.build_report_payload(zweiter)
     assert payload["derived_inputs"]["rendered_video_framecount_cache"]["cache_treffer"] is True
     assert payload["derived_inputs"]["avatar_framecount_cache"]["cache_treffer"] is True
+
+
+# --- Auftrag shorts-3b-verdrahtung: Mausverfolgung, einmal je Lauf ----------------
+
+_CURSOR_KOPF = "zeit,x,y\n"
+
+
+def _cursor_csv(pfad: Path, zeilen: int = 200) -> Path:
+    from datetime import datetime, timedelta, timezone
+
+    t0 = datetime(2026, 8, 19, 17, 26, 15, tzinfo=timezone(timedelta(hours=2)))
+    text = _CURSOR_KOPF + "".join(
+        f"{(t0 + timedelta(milliseconds=100 * i)).isoformat()},1300,700\n" for i in range(zeilen)
+    )
+    pfad.parent.mkdir(parents=True, exist_ok=True)
+    pfad.write_text(text, encoding="utf-8")
+    return pfad
+
+
+_SEGMENTE = (build.KeepSegment(0, 60_000),)
+
+
+def test_mausverfolgung_abgeschaltet_nennt_den_grund(tmp_path: Path) -> None:
+    ergebnis = build._lade_mausverfolgung(
+        {"cursor_log": {"path": str(_cursor_csv(tmp_path / "c.csv"))}},
+        segmente=_SEGMENTE,
+        rendered_windows=None,
+        aktiviert=False,
+    )
+    assert ergebnis.aktiv is False
+    assert ergebnis.grund == build.MAUSVERFOLGUNG_ABGESCHALTET
+
+
+def test_mausverfolgung_ohne_eintrag_im_auftrag_faellt_zurueck() -> None:
+    ergebnis = build._lade_mausverfolgung(
+        {}, segmente=_SEGMENTE, rendered_windows=None, aktiviert=True
+    )
+    assert ergebnis.aktiv is False
+    assert ergebnis.grund == build.MAUSVERFOLGUNG_KEIN_EINTRAG
+
+
+def test_mausverfolgung_bei_fehlender_datei_faellt_zurueck(tmp_path: Path) -> None:
+    ergebnis = build._lade_mausverfolgung(
+        {"cursor_log": {"path": str(tmp_path / "fehlt.csv")}},
+        segmente=_SEGMENTE,
+        rendered_windows=None,
+        aktiviert=True,
+    )
+    assert ergebnis.aktiv is False
+    assert ergebnis.grund == build.MAUSVERFOLGUNG_DATEI_FEHLT
+
+
+def test_mausverfolgung_bei_kaputtem_protokoll_faellt_zurueck_statt_abzubrechen(
+    tmp_path: Path,
+) -> None:
+    kaputt = tmp_path / "c.csv"
+    kaputt.write_text("zeit,x,y\nnicht-iso,1,2\n", encoding="utf-8")
+    ergebnis = build._lade_mausverfolgung(
+        {"cursor_log": {"path": str(kaputt)}},
+        segmente=_SEGMENTE,
+        rendered_windows=None,
+        aktiviert=True,
+    )
+    assert ergebnis.aktiv is False
+    assert ergebnis.grund == build.MAUSVERFOLGUNG_UNLESBAR
+
+
+def test_mausverfolgung_ohne_keep_segmente_faellt_zurueck(tmp_path: Path) -> None:
+    ergebnis = build._lade_mausverfolgung(
+        {"cursor_log": {"path": str(_cursor_csv(tmp_path / "c.csv"))}},
+        segmente=(),
+        rendered_windows=None,
+        aktiviert=True,
+    )
+    assert ergebnis.aktiv is False
+    assert ergebnis.grund == build.MAUSVERFOLGUNG_KEINE_SEGMENTE
+
+
+def test_anker_ist_die_erste_protokollzeile_also_csv_first_row_at(tmp_path: Path) -> None:
+    """shorts-job.json traegt csv_first_row_at nicht - die erste Zeile ist er."""
+    csv = _cursor_csv(tmp_path / "c.csv")
+    ergebnis = build._lade_mausverfolgung(
+        {"cursor_log": {"path": str(csv)}},
+        segmente=_SEGMENTE,
+        rendered_windows=None,
+        aktiviert=True,
+    )
+    assert ergebnis.aktiv is True
+    erste_zeile = csv.read_text(encoding="utf-8").splitlines()[1].split(",")[0]
+    assert ergebnis.anker is not None
+    assert ergebnis.anker.isoformat() == erste_zeile
+
+
+def test_versatzkurve_wird_gerechnet_und_im_bericht_benannt(tmp_path: Path) -> None:
+    mausverfolgung = build._lade_mausverfolgung(
+        {"cursor_log": {"path": str(_cursor_csv(tmp_path / "c.csv"))}},
+        segmente=_SEGMENTE,
+        rendered_windows=None,
+        aktiviert=True,
+    )
+    kurve, info = build._berechne_versatzkurve(
+        mausverfolgung,
+        kandidat_index=0,
+        build_start_ms=1000,
+        build_end_ms=6000,
+        offsets={},
+    )
+    # Ruhiger Cursor in der Trittzone: gerechnet, aber ohne Fahrt und deshalb
+    # eine konstante Kurve - die geht als Kurve durch, nicht als Rueckfall.
+    assert info.grund == "berechnet"
+    assert info.fahrten == 0
+    assert info.versatz_anfang == info.versatz_ende == 482
+    assert kurve is not None and set(kurve) == {482}
+
+
+def test_ausschnitt_json_verhindert_dass_ueberhaupt_gerechnet_wird(tmp_path: Path) -> None:
+    mausverfolgung = build._lade_mausverfolgung(
+        {"cursor_log": {"path": str(_cursor_csv(tmp_path / "c.csv"))}},
+        segmente=_SEGMENTE,
+        rendered_windows=None,
+        aktiviert=True,
+    )
+    kurve, info = build._berechne_versatzkurve(
+        mausverfolgung,
+        kandidat_index=7,
+        build_start_ms=1000,
+        build_end_ms=6000,
+        offsets={7: 600},
+    )
+    assert kurve is None
+    assert info.grund == build.MAUSVERFOLGUNG_AUSSCHNITT_VORRANG
+    assert info.versatz_anfang == info.versatz_ende == 600
+
+
+def test_rueckfall_liefert_keine_kurve_sondern_den_festen_versatz_416(tmp_path: Path) -> None:
+    """Kein Protokoll -> fester Versatz 416, Grund benannt, KEIN Abbruch."""
+    mausverfolgung = build._lade_mausverfolgung(
+        {}, segmente=_SEGMENTE, rendered_windows=None, aktiviert=True
+    )
+    kurve, info = build._berechne_versatzkurve(
+        mausverfolgung,
+        kandidat_index=0,
+        build_start_ms=1000,
+        build_end_ms=6000,
+        offsets={},
+    )
+    assert kurve is None
+    assert info.grund == build.MAUSVERFOLGUNG_KEIN_EINTRAG
+    assert info.versatz_anfang == info.versatz_ende == 416
+
+
+def test_mausverfolgung_steht_je_kandidat_im_baubericht() -> None:
+    nutzlast = build._mausverfolgung_payload(
+        build.KurvenInfo("berechnet", 3, 482, 700, naehte=1, eingefrorene_frames=12)
+    )
+    assert nutzlast == {
+        "grund": "berechnet",
+        "fahrten": 3,
+        "versatz_anfang": 482,
+        "versatz_ende": 700,
+        "naehte": 1,
+        "eingefrorene_frames": 12,
+    }
+    assert build._mausverfolgung_payload(None) is None
