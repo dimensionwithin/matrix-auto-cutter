@@ -28,8 +28,9 @@ import os
 import tempfile
 import threading
 import webbrowser
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -51,7 +52,6 @@ from matrix_auto_cutter.shorts.judge import (
 )
 from matrix_auto_cutter.shorts.transcript import RENDERED_TRANSCRIPT_FILE_NAME, RENDERED_WAV_NAME
 
-URTEILE_FILE_NAME = "urteile.json"
 _URTEILE_SCHEMA_VERSION = "1.0"
 _URTEILE_VALUES = ("ja", "nein", "spaeter")
 _MAX_URTEIL_REQUEST_BYTES = 8 * 1024
@@ -200,6 +200,65 @@ def write_urteile(path: Path, urteile: Mapping[int, Urteil]) -> None:
     finally:
         if temporary is not None and temporary.exists():
             temporary.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Sitzungseigene Urteilsdatei (Auftrag shorts-urteilsschutz, Teil A).
+#
+# Bis hierher schrieb jede Sitzung nach demselben festen Namen
+# ``urteile.json`` - am 14.8. überschrieb dadurch ein Werkzeug-Probelauf den
+# echten Urteilsstand; gerettet wurde er nur von Hand durch Umbenennen. Ab
+# jetzt legt jede Sitzung ihre EIGENE Datei an und übernimmt beim Start den
+# Inhalt der jüngsten vorhandenen - die ältere bleibt unangetastet stehen.
+# ---------------------------------------------------------------------------
+
+
+class AmbiguousUrteileStateError(RuntimeError):
+    """Der vorhandene Urteilsstand ist nicht eindeutig fortsetzbar."""
+
+
+def _existing_urteile_files(job_dir: Path) -> list[Path]:
+    """Alle vorhandenen Urteilsdateien, alte wie neue Namensform (``urteile*.json``)."""
+    return [path for path in job_dir.glob("urteile*.json") if path.is_file()]
+
+
+def start_session_urteile(
+    job_dir: Path,
+    *,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+) -> Path:
+    """Lege die sitzungseigene Urteilsdatei an; übernimm den jüngsten vorhandenen Stand.
+
+    Der Server schreibt fortan ausschließlich in die hier erzeugte Datei -
+    niemals mehr nach ``urteile.json``. Existieren bereits Urteilsdateien,
+    wird der Inhalt der nach Änderungszeit jüngsten in die neue Datei kopiert;
+    ältere Dateien bleiben unverändert stehen. Teilen sich mehrere Dateien
+    denselben Zeitstempel, oder ist die jüngste nicht lesbar, wird
+    :class:`AmbiguousUrteileStateError` ausgelöst statt stillschweigend leer
+    zu starten.
+    """
+    new_path = job_dir / now().strftime("urteile-%Y-%m-%d-%H%M%S.json")
+    candidates = _existing_urteile_files(job_dir)
+    if not candidates:
+        return new_path
+    by_mtime: dict[int, list[Path]] = {}
+    for path in candidates:
+        by_mtime.setdefault(path.stat().st_mtime_ns, []).append(path)
+    newest = by_mtime[max(by_mtime)]
+    if len(newest) > 1:
+        raise AmbiguousUrteileStateError(
+            "mehrere Urteilsdateien mit demselben Zeitstempel: "
+            + ", ".join(str(path) for path in sorted(newest))
+        )
+    source = newest[0]
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AmbiguousUrteileStateError(f"jüngste Urteilsdatei nicht lesbar: {source}") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("kandidaten"), dict):
+        raise AmbiguousUrteileStateError(f"jüngste Urteilsdatei hat unerwartete Form: {source}")
+    write_urteile(new_path, load_urteile(source))
+    return new_path
 
 
 # ---------------------------------------------------------------------------
@@ -464,7 +523,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             transcript_segments=transcript_segments,
             transcript_words=transcript_words,
         )
-        urteile_path = job_dir / URTEILE_FILE_NAME
+        try:
+            urteile_path = start_session_urteile(job_dir)
+        except AmbiguousUrteileStateError as exc:
+            print(f"ANGEHALTEN: {exc}")
+            return 1
         html_bytes = build_judge_html(
             entries, kriterien_text=kriterien_text, urteile_path=urteile_path
         ).encode("utf-8")
@@ -476,7 +539,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             entries=entries,
         )
         url = server_url(server)
-        print(f"Urteilsserver läuft: {url} ({len(entries)} Kandidaten, Strg+C zum Beenden)")
+        print(
+            f"Urteilsserver läuft: {url} ({len(entries)} Kandidaten, Strg+C zum Beenden) - "
+            f"Urteile werden gespeichert in {urteile_path}"
+        )
         webbrowser.open(url, new=2)
         try:
             server.serve_forever()

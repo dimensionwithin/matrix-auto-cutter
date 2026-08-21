@@ -39,6 +39,32 @@ class KeepSegment:
         return self.end_frame - self.start_frame
 
 
+def ms_to_frame(ms: int, fps: int) -> int:
+    """Runde eine Millisekundenmarke auf ihre Framezahl bei ``fps``.
+
+    Ab hier die EINZIGE Stelle, an der aus Millisekunden eine Framezahl wird
+    (Auftrag shorts-stufe-3a-frames, Teil A) - auch fuer Stufe 3b und Stufe 5.
+    """
+    return round(ms * fps / 1000)
+
+
+def candidate_frame_span(start_ms: int, end_ms: int, fps: int) -> tuple[int, int]:
+    """Framespanne ``(start_frame, end_frame)`` eines Kandidaten, ``end_frame`` ausschliessend.
+
+    Dieselbe Konvention wie bei den Keep-Segmenten. Rundet Start und Ende
+    unabhaengig (nicht die Dauer) - eine nicht-positive Framezahl ist ein
+    Fehler, kein stilles Klemmen.
+    """
+    start_frame = ms_to_frame(start_ms, fps)
+    end_frame = ms_to_frame(end_ms, fps)
+    if end_frame - start_frame <= 0:
+        raise ValueError(
+            f"Framespanne muss positiv sein, ist aber {end_frame - start_frame} "
+            f"(start_ms={start_ms}, end_ms={end_ms}, fps={fps})"
+        )
+    return start_frame, end_frame
+
+
 def effective_cuts(
     proposed_cuts: Sequence[ProposedCut],
     active_candidate_ids: Sequence[str] | None,
@@ -127,6 +153,40 @@ def map_source_frame_ceiling(segments: Sequence[KeepSegment], source_frame: int)
             return rendered + (source_frame - segment.start_frame)
         rendered += segment.length
     return rendered
+
+
+def map_source_interval_to_rendered(
+    segments: Sequence[KeepSegment], source_windows: Sequence[tuple[int, int]]
+) -> tuple[tuple[int, int], ...]:
+    """Bilde halboffene Quellframe-Fenster (z. B. Szenenfenster) auf die gerenderte Achse ab.
+
+    Kein neues Verfahren: beide Enden laufen über :func:`map_source_frame_ceiling`
+    (kleinste gerenderte Position, deren Quellframe >= der gesuchten Marke) -
+    dieselbe Rundung an Anfang und Ende hält das Fenster halboffen, so wie es
+    :func:`keep_segments_from_intervals` selbst schon voraussetzt. Ein Fenster,
+    das vollständig in einem Schnitt liegt, hat kein Gegenstück im gerenderten
+    Ergebnis und entfällt (leeres Zwischenergebnis, kein Nulleintrag).
+    """
+    rendered: list[tuple[int, int]] = []
+    for start_frame, end_frame in source_windows:
+        rendered_start = map_source_frame_ceiling(segments, start_frame)
+        rendered_end = map_source_frame_ceiling(segments, end_frame)
+        if rendered_end > rendered_start:
+            rendered.append((rendered_start, rendered_end))
+    return tuple(rendered)
+
+
+def candidate_outside_windows(
+    candidate_span: tuple[int, int], rendered_windows: Sequence[tuple[int, int]]
+) -> bool:
+    """Melde, ob eine Kandidaten-Framespanne keines der gerenderten Fenster überschneidet.
+
+    Beide Spannen sind halboffen. Ein Kandidat, der ein Fenster auch nur
+    teilweise berührt, gilt als nicht außerhalb - nur eine Spanne ohne jede
+    Überschneidung wird gekennzeichnet.
+    """
+    start, end = candidate_span
+    return not any(start < w_end and end > w_start for w_start, w_end in rendered_windows)
 
 
 def map_source_frame_floor(segments: Sequence[KeepSegment], source_frame: int) -> int | None:

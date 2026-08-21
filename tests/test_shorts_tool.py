@@ -300,6 +300,53 @@ def test_find_cursor_missing_directory(tmp_path: Path) -> None:
     )
 
 
+def test_find_cursor_uses_sidecar_when_present(tmp_path: Path) -> None:
+    """Eine Seitendatei entscheidet über den Dateistamm von obs_output_path - kein Raten."""
+    cursor_dir = tmp_path / "Cursor"
+    _touch(cursor_dir / "cursor-2026-08-17 19-45-36.csv", "zeit,x,y\n")
+    _touch(
+        cursor_dir / "cursor-2026-08-17 19-45-36.json",
+        json.dumps(
+            {
+                "recording_started_at": "2026-08-17T19:45:36.7261941+02:00",
+                "csv_first_row_at": "2026-08-17T19:45:36.8888058+02:00",
+                "lead_seconds": -0.1626117,
+                "rows": 555,
+                "obs_output_path": "F:/MatrixMarketAutoEdit/2026-08-17 19-45-36.mp4",
+            }
+        ),
+    )
+    match = find_cursor("2026-08-17 19-45-36", cursor_dir)
+    assert match.match_kind == "sidecar"
+    assert match.path == cursor_dir / "cursor-2026-08-17 19-45-36.csv"
+    assert match.lead_seconds == pytest.approx(-0.1626117)
+
+
+def test_find_cursor_sidecar_ignored_for_other_video_name(tmp_path: Path) -> None:
+    """Eine Seitendatei, die auf ein anderes Video zeigt, ist kein Treffer für dieses."""
+    cursor_dir = tmp_path / "Cursor"
+    _touch(cursor_dir / "cursor-2026-08-17 19-45-36.csv", "zeit,x,y\n")
+    _touch(
+        cursor_dir / "cursor-2026-08-17 19-45-36.json",
+        json.dumps({"obs_output_path": "F:/MatrixMarketAutoEdit/2026-08-17 19-45-36.mp4"}),
+    )
+    match = find_cursor("2026-08-09 15-10-19", cursor_dir)
+    assert match == CursorMatch(None, "none", None)
+
+
+def test_find_cursor_without_sidecar_still_uses_time_window(tmp_path: Path) -> None:
+    """Pruefstein: das Protokoll vom 7.8. ohne Seitendatei bleibt unveraendert zugeordnet."""
+    cursor_dir = tmp_path / "Cursor"
+    _touch(
+        cursor_dir / "cursor-2026-08-07 11-28-59.csv",
+        "zeit,x,y\n2026-08-07T11:29:08.0642210+02:00,-792,367\n",
+    )
+    match = find_cursor("2026-08-07 11-35-16", cursor_dir)
+    assert match.match_kind == "matched_guess"
+    assert match.path == cursor_dir / "cursor-2026-08-07 11-28-59.csv"
+    assert match.lead_seconds == 368
+
+
 # --- Sessions -> recording_id, UTC-Fallen umgehen ----------------------------------
 
 

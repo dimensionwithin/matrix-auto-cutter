@@ -49,3 +49,12 @@ Write-Host "Starte Runner..."
 
 Write-Host ""
 Write-Host "Fertig. Pruefe, ob dein Avatar in OBS sichtbar ist." -ForegroundColor Cyan
+
+Write-Host ""
+Write-Host "Starte Cursor-Waechter (Strg+C beendet ihn)..."
+try {
+    $waechterSkript = Join-Path $PSScriptRoot "scripts\START-CURSOR-WAECHTER.ps1"
+    & $waechterSkript
+} catch {
+    Write-Host "FEHLER im Cursor-Waechter: $($_.Exception.Message)" -ForegroundColor Red
+}

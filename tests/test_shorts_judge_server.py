@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -358,3 +360,89 @@ def test_second_lock_holder_is_refused_while_first_holds_it(tmp_path: Path) -> N
         assert second.acquire() is False
     finally:
         first.close()
+
+
+# --- Sitzungseigene Urteilsdatei (Auftrag shorts-urteilsschutz, Teil A) ---------------
+
+
+def _fixed_now(stamp: datetime) -> Callable[[], datetime]:
+    return lambda: stamp
+
+
+def _urteil(titel: str, urteil: str) -> srv.Urteil:
+    return srv.Urteil(
+        index=0, titel=titel, start_ms=0, end_ms=1, ist_kind=False, urteil=urteil, notiz=""
+    )
+
+
+def test_start_session_urteile_creates_its_own_file_per_session(tmp_path: Path) -> None:
+    stamp = datetime(2026, 8, 17, 15, 30, 45, tzinfo=UTC)
+    path = srv.start_session_urteile(tmp_path, now=_fixed_now(stamp))
+    assert path.name == "urteile-2026-08-17-153045.json"
+    assert path.parent == tmp_path
+
+
+def test_start_session_urteile_never_writes_to_the_legacy_name(tmp_path: Path) -> None:
+    stamp = datetime(2026, 8, 17, 15, 30, 45, tzinfo=UTC)
+    path = srv.start_session_urteile(tmp_path, now=_fixed_now(stamp))
+    srv.write_urteile(path, {0: _urteil("T", "ja")})
+    assert not (tmp_path / "urteile.json").exists()
+
+
+def test_start_session_urteile_carries_forward_the_newest_existing_file(tmp_path: Path) -> None:
+    older = tmp_path / "urteile-alt.json"
+    newer = tmp_path / "urteile-neu.json"
+    srv.write_urteile(older, {0: _urteil("alt", "nein")})
+    srv.write_urteile(newer, {0: _urteil("neu", "ja")})
+    # ``write_urteile`` läuft in derselben Sekunde ab - die Änderungszeit von Hand
+    # auseinanderziehen, sonst ist "jüngste Datei" auf mancher Dateisystemuhr nicht eindeutig.
+    older_stat = older.stat()
+    os.utime(older, (older_stat.st_atime, older_stat.st_mtime - 5))
+
+    stamp = datetime(2026, 8, 17, 15, 30, 45, tzinfo=UTC)
+    session_path = srv.start_session_urteile(tmp_path, now=_fixed_now(stamp))
+
+    restored = srv.load_urteile(session_path)
+    assert restored[0].titel == "neu"
+    assert restored[0].urteil == "ja"
+    # Die ältere Datei bleibt unangetastet stehen.
+    assert srv.load_urteile(older)[0].titel == "alt"
+
+
+def test_start_session_urteile_with_no_existing_files_starts_empty(tmp_path: Path) -> None:
+    stamp = datetime(2026, 8, 17, 15, 30, 45, tzinfo=UTC)
+    session_path = srv.start_session_urteile(tmp_path, now=_fixed_now(stamp))
+    assert not session_path.exists()
+    assert srv.load_urteile(session_path) == {}
+
+
+def test_start_session_urteile_stops_on_files_sharing_the_same_timestamp(tmp_path: Path) -> None:
+    a = tmp_path / "urteile-a.json"
+    b = tmp_path / "urteile-b.json"
+    srv.write_urteile(a, {0: _urteil("a", "ja")})
+    srv.write_urteile(b, {0: _urteil("b", "ja")})
+    same_time = a.stat().st_mtime
+    os.utime(b, (same_time, same_time))
+    os.utime(a, (same_time, same_time))
+
+    stamp = datetime(2026, 8, 17, 15, 30, 45, tzinfo=UTC)
+    with pytest.raises(srv.AmbiguousUrteileStateError):
+        srv.start_session_urteile(tmp_path, now=_fixed_now(stamp))
+
+
+def test_start_session_urteile_stops_on_unreadable_newest_file(tmp_path: Path) -> None:
+    broken = tmp_path / "urteile-kaputt.json"
+    broken.write_text("{nicht gueltiges json", encoding="utf-8")
+
+    stamp = datetime(2026, 8, 17, 15, 30, 45, tzinfo=UTC)
+    with pytest.raises(srv.AmbiguousUrteileStateError):
+        srv.start_session_urteile(tmp_path, now=_fixed_now(stamp))
+
+
+def test_start_session_urteile_carries_forward_legacy_urteile_json_name(tmp_path: Path) -> None:
+    legacy = tmp_path / "urteile.json"
+    srv.write_urteile(legacy, {0: _urteil("legacy", "ja")})
+    stamp = datetime(2026, 8, 17, 15, 30, 45, tzinfo=UTC)
+    session_path = srv.start_session_urteile(tmp_path, now=_fixed_now(stamp))
+    assert session_path.name != "urteile.json"
+    assert srv.load_urteile(session_path)[0].titel == "legacy"

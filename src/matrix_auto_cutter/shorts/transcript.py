@@ -10,8 +10,14 @@ Kette auf - keine zweite Transkriptionslogik.
 
 Deutsch (``-l de``) und wortgenaues JSON (``-ojf``) sind in
 ``build_whisper_argv`` bereits fest verdrahtet, keine Übersteuerung nötig.
-``--prompt`` läuft hier absichtlich nicht mit - die Vokabeldatei ist gemessen
-wirkungslos (``SHORTS-1-UEBERGABE-2026-08-07.md`` Abschnitt 2.2).
+
+``--prompt``: Am 7.8.2026 war die Vokabeldatei mit ``ggml-small`` gemessen
+wirkungslos (``SHORTS-1-UEBERGABE-2026-08-07.md`` Abschnitt 2.2). Am
+19.8.2026 wurde das mit ``ggml-large-v3-turbo`` erneut gemessen
+(``artefakte/repeat/shorts-vokabular/BERICHT-2026-08-19.md``): dort wirkt
+``--prompt`` - "wrong-footed" wird nur mit Vokabelvorgabe korrekt erkannt.
+Deshalb reicht dieses Modul die Vokabeldatei jetzt durch (``--prompt-file``,
+Voreinstellung ``labels/repeat/whisper-vokabular.txt``).
 """
 
 from __future__ import annotations
@@ -54,6 +60,50 @@ RENDERED_TRANSCRIPT_FILE_NAME = "transkript-rendered.json"
 # ist. 120 s ist der doppelte repeat-Wert - ein erster, nicht gemessener
 # Kompromiss; siehe Auftrag 15, Abschnitt 2.1.
 DEFAULT_MAX_SEGMENT_LEN = 120
+
+# Voreinstellungen fuer Auftrag shorts-vokabular: aus dem Repository ableitbar,
+# nicht von Hand zu uebergeben (dieses Werkzeug soll spaeter als geplante
+# Aufgabe ohne Handeingaben laufen). Die Parameter bleiben als Uebersteuerung
+# erhalten.
+DEFAULT_WHISPER_BINARY = Path(r"P:\AI\whisper.cpp\build\bin\Release\whisper-cli.exe")
+DEFAULT_WHISPER_MODEL = Path(r"P:\AI\whisper-data\models\ggml-large-v3-turbo.bin")
+DEFAULT_VOCAB_PATH = Path("labels") / "repeat" / "whisper-vokabular.txt"
+
+
+class PromptFileDecodeError(Exception):
+    """Die Vokabeldatei ist nicht als UTF-8 lesbar.
+
+    Fail closed, kein Rückfall auf eine andere Kodierung - die Datei war bis
+    zum 19.8.2026 fehlerhaft kodiert; ein stiller Rückfall würde denselben
+    Fehler wieder verstecken.
+    """
+
+    def __init__(self, path: str) -> None:
+        """Store the undecodable prompt file path."""
+        self.path = path
+        super().__init__(f"Vokabeldatei ist nicht als UTF-8 lesbar: {path}")
+
+
+def load_prompt_text(path: Path) -> str:
+    """Lies eine Vokabeldatei strikt als UTF-8 - siehe ``PromptFileDecodeError``."""
+    raw = path.read_bytes()
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise PromptFileDecodeError(str(path)) from exc
+
+
+def resolve_prompt(prompt_file: Path | None, default_vocab_path: Path) -> str | None:
+    """Lies den ``--prompt``-Text: ``prompt_file`` wenn gesetzt, sonst die Voreinstellung.
+
+    Ist ``prompt_file`` nicht gesetzt und existiert ``default_vocab_path``
+    nicht, gibt es keinen Prompt (``None``, Flag bleibt in ``run_whisper``
+    ganz weg - heutiges Verhalten unveraendert).
+    """
+    target = prompt_file if prompt_file is not None else default_vocab_path
+    if prompt_file is None and not target.is_file():
+        return None
+    return load_prompt_text(target)
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +222,7 @@ def transcribe_video(
     force: bool = False,
     wav_name: str = RAW_WAV_NAME,
     transcript_file_name: str = TRANSCRIPT_FILE_NAME,
+    initial_prompt: str | None = None,
 ) -> TranscriptResult:
     """Ende-zu-Ende: Ton ziehen, whisper aufrufen, Transkript schreiben.
 
@@ -184,7 +235,10 @@ def transcribe_video(
     ``transcript_file_name`` steuern, ob die Rohaufnahme (Vorgabe) oder die
     gerenderte Fassung (``RENDERED_WAV_NAME``, ``RENDERED_TRANSCRIPT_FILE_NAME``,
     Auftrag 19/20) transkribiert wird, ohne das jeweils andere Transkript zu
-    berühren.
+    berühren. ``initial_prompt`` wird unveraendert an ``run_whisper``
+    durchgereicht (``None`` laesst ``--prompt`` ganz weg); bei einer
+    wiederverwendeten Rohausgabe (``status == "reused"``) hat er keine
+    Wirkung, weil whisper-cli dann gar nicht laeuft.
     """
     target_dir.mkdir(parents=True, exist_ok=True)
     raw_json_path, transcript_path = transcript_paths(
@@ -216,7 +270,7 @@ def transcribe_video(
             threads=threads,
             timeout_ms=whisper_timeout_ms,
             max_segment_len=max_segment_len,
-            initial_prompt=None,
+            initial_prompt=initial_prompt,
         )
         raw_json = whisper_result.raw_json
         wav_path.unlink(missing_ok=True)
@@ -251,8 +305,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="Shorts Stufe 2, Teil 1: Transkript der gerenderten Fassung"
     )
     parser.add_argument("job_path", type=Path, help="Pfad zur shorts-job.json")
-    parser.add_argument("--whisper-binary", required=True, type=Path)
-    parser.add_argument("--whisper-model", required=True, type=Path)
+    parser.add_argument("--whisper-binary", type=Path, default=None)
+    parser.add_argument("--whisper-model", type=Path, default=None)
+    parser.add_argument("--prompt-file", type=Path, default=None)
     parser.add_argument("--ffmpeg", type=Path, default=None)
     parser.add_argument("--ffprobe", type=Path, default=None)
     parser.add_argument("--threads", type=int, default=DEFAULT_THREADS)
@@ -269,6 +324,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("ffprobe nicht gefunden (PATH prüfen oder --ffprobe angeben)")
         return 2
 
+    whisper_binary = (
+        args.whisper_binary if args.whisper_binary is not None else DEFAULT_WHISPER_BINARY
+    )
+    if not whisper_binary.is_file():
+        print(f"Whisper-Binary nicht gefunden: {whisper_binary}")
+        return 2
+    whisper_model = args.whisper_model if args.whisper_model is not None else DEFAULT_WHISPER_MODEL
+    if not whisper_model.is_file():
+        print(f"Whisper-Modell nicht gefunden: {whisper_model}")
+        return 2
+
+    try:
+        initial_prompt = resolve_prompt(args.prompt_file, DEFAULT_VOCAB_PATH)
+    except PromptFileDecodeError as exc:
+        print(str(exc))
+        return 3
+
     job = json.loads(args.job_path.read_text(encoding="utf-8"))
     video_path = Path(job["rendered_video"]["path"])
     duration_ms = probe_duration_ms(video_path, Path(ffprobe_path))
@@ -280,8 +352,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         video_path,
         target_dir=args.job_path.parent,
         ffmpeg_path=str(ffmpeg_path),
-        whisper_binary=str(args.whisper_binary),
-        whisper_model=str(args.whisper_model),
+        whisper_binary=str(whisper_binary),
+        whisper_model=str(whisper_model),
         runner=NativeProcessRunner(),
         audio_duration_ms=duration_ms,
         threads=args.threads,
@@ -289,6 +361,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         force=args.force,
         wav_name=RENDERED_WAV_NAME,
         transcript_file_name=RENDERED_TRANSCRIPT_FILE_NAME,
+        initial_prompt=initial_prompt,
     )
     print(f"{result.status}: {result.segment_count} Segmente -> {result.transcript_path}")
     return 0

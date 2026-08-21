@@ -222,6 +222,82 @@ def test_transcribe_video_force_reruns_even_if_raw_json_exists(tmp_path: Path) -
     assert result.segment_count == 2
 
 
+def test_transcribe_video_passes_initial_prompt_through(tmp_path: Path) -> None:
+    video, whisper_binary, whisper_model = _prepare_binaries(tmp_path)
+    target_dir = tmp_path / "out"
+    wav_path = target_dir / tr.RAW_WAV_NAME
+    seen_argv: list[list[str]] = []
+
+    def runner(argv: list[str], timeout_ms: int) -> ProcessResult:
+        del timeout_ms
+        seen_argv.append(argv)
+        if "-ojf" in argv:
+            path = Path(argv[argv.index("-f") + 1])
+            path.with_name(path.name + ".json").write_text(_RAW_WHISPER_JSON, encoding="utf-8")
+            return ProcessResult(0, "", "", False, 1)
+        output_path = Path(argv[-1])
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"fake-wav-bytes")
+        wav_path.parent.mkdir(parents=True, exist_ok=True)
+        return ProcessResult(0, "", "", False, 1)
+
+    tr.transcribe_video(
+        video,
+        target_dir=target_dir,
+        ffmpeg_path="ffmpeg.exe",
+        whisper_binary=str(whisper_binary),
+        whisper_model=str(whisper_model),
+        runner=runner,
+        audio_duration_ms=2_500,
+        initial_prompt="wrong-footed, Wyckoff",
+    )
+
+    whisper_argv = next(argv for argv in seen_argv if "-ojf" in argv)
+    assert "--prompt" in whisper_argv
+    assert whisper_argv[whisper_argv.index("--prompt") + 1] == "wrong-footed, Wyckoff"
+
+
+def test_load_prompt_text_reads_utf8(tmp_path: Path) -> None:
+    path = tmp_path / "vokabular.txt"
+    path.write_text("wrong-footed, Wyckoff, Fibonacci", encoding="utf-8")
+    assert tr.load_prompt_text(path) == "wrong-footed, Wyckoff, Fibonacci"
+
+
+def test_load_prompt_text_fails_closed_on_bad_encoding(tmp_path: Path) -> None:
+    path = tmp_path / "vokabular.txt"
+    # gueltiges Latin-1, aber kein gueltiges UTF-8 (0xE4 = 'ä' in Latin-1,
+    # aber ein alleinstehendes Fortsetzungsbyte in UTF-8)
+    path.write_bytes(b"B\xe4renmarkt")
+    with pytest.raises(tr.PromptFileDecodeError):
+        tr.load_prompt_text(path)
+
+
+def test_resolve_prompt_uses_explicit_file_when_given(tmp_path: Path) -> None:
+    explicit = tmp_path / "explicit.txt"
+    explicit.write_text("explizit", encoding="utf-8")
+    default = tmp_path / "default.txt"
+    default.write_text("standard", encoding="utf-8")
+    assert tr.resolve_prompt(explicit, default) == "explizit"
+
+
+def test_resolve_prompt_falls_back_to_default_when_it_exists(tmp_path: Path) -> None:
+    default = tmp_path / "default.txt"
+    default.write_text("standard", encoding="utf-8")
+    assert tr.resolve_prompt(None, default) == "standard"
+
+
+def test_resolve_prompt_returns_none_when_nothing_given_and_no_default(tmp_path: Path) -> None:
+    default = tmp_path / "missing.txt"
+    assert tr.resolve_prompt(None, default) is None
+
+
+def test_resolve_prompt_fails_closed_on_bad_default_encoding(tmp_path: Path) -> None:
+    default = tmp_path / "default.txt"
+    default.write_bytes(b"B\xe4renmarkt")
+    with pytest.raises(tr.PromptFileDecodeError):
+        tr.resolve_prompt(None, default)
+
+
 def test_transcribe_video_missing_whisper_binary_raises(tmp_path: Path) -> None:
     video, _whisper_binary, whisper_model = _prepare_binaries(tmp_path)
     target_dir = tmp_path / "out"

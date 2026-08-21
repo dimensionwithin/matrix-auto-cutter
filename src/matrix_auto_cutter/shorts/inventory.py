@@ -39,12 +39,17 @@ DEFAULT_DRIVE_ROOT = Path("F:/")
 
 # Suchfenster für die Avatar-Zeitversatz-Zuordnung. Die bekannten Sonderfälle
 # liegen bei +1, +8 und +9 Sekunden; 15 s lässt Luft, ohne benachbarte,
-# unabhängige Aufnahmen fälschlich zu verbinden.
+# unabhängige Aufnahmen fälschlich zu verbinden. OBS startet die zweite
+# Aufnahme systematisch SPÄTER, nie früher - ein negativer Versatz (Avatar vor
+# dem Aufnahmebeginn) gehört deshalb nicht ins Fenster, siehe unten in
+# ``find_avatar``.
 AVATAR_OFFSET_WINDOW_SECONDS = 15
 # Suchfenster für die Cursor-Zuordnung: das Cursorprotokoll beginnt vor der
-# eigentlichen Aufnahme (im bekannten Fall rund 6 Minuten). Eine Stunde deckt
-# das mit Rand ab, ohne quer über mehrere Tage hinweg zu verbinden.
-CURSOR_LEAD_WINDOW_SECONDS = 3600
+# eigentlichen Aufnahme (im bekannten Fall rund 6 Minuten). Die
+# Arbeitsanweisung schreibt vor, den Logger vor OBS zu starten - 30 Minuten
+# Vorlauf deckt das mit Rand ab, ohne quer über mehrere Tage hinweg zu
+# verbinden.
+CURSOR_LEAD_WINDOW_SECONDS = 1800
 
 
 def parse_name_timestamp(name: str) -> datetime | None:
@@ -103,20 +108,21 @@ def find_avatar(
 
     timestamp = parse_name_timestamp(name)
     if timestamp is not None and avatar_dir.is_dir():
-        best_delta: int | None = None
-        best_path: Path | None = None
+        # Alle Kandidaten im Fenster sammeln statt nur den naechstliegenden zu
+        # merken: mehrere Treffer heissen "ungeklaert", nicht "den naechsten
+        # raten".
+        in_window: list[tuple[int, Path]] = []
         for candidate in avatar_dir.glob(f"{AVATAR_PREFIX}*.mp4"):
             candidate_name = candidate.name[len(AVATAR_PREFIX) : -len(".mp4")]
             candidate_timestamp = parse_name_timestamp(candidate_name)
             if candidate_timestamp is None:
                 continue
             delta = int((candidate_timestamp - timestamp).total_seconds())
-            if abs(delta) <= offset_window_seconds and (
-                best_delta is None or abs(delta) < abs(best_delta)
-            ):
-                best_delta, best_path = delta, candidate
-        if best_path is not None:
-            return AvatarMatch(best_path, "offset_guess", best_delta)
+            if 0 <= delta <= offset_window_seconds:
+                in_window.append((delta, candidate))
+        if len(in_window) == 1:
+            delta, path = in_window[0]
+            return AvatarMatch(path, "offset_guess", delta)
 
     root_fallback = drive_root / f"{AVATAR_PREFIX}{name}.mp4"
     if root_fallback.is_file():
@@ -129,8 +135,43 @@ class CursorMatch:
     """Ergebnis der Cursorprotokoll-Zuordnung, mit sichtbarer Unsicherheit."""
 
     path: Path | None
-    match_kind: Literal["matched_guess", "none"]
-    lead_seconds: int | None = None
+    match_kind: Literal["sidecar", "matched_guess", "none"]
+    lead_seconds: float | None = None
+
+
+def _sidecar_json_path(csv_path: Path) -> Path:
+    """Pfad der zur CSV gleichnamigen Seitendatei des Waechters."""
+    return csv_path.with_suffix(".json")
+
+
+def _find_cursor_via_sidecar(name: str, cursor_dir: Path) -> CursorMatch | None:
+    """Eindeutige Zuordnung über die Waechter-Seitendatei, wenn vorhanden.
+
+    Die Seitendatei trägt ``obs_output_path`` - den tatsächlichen Pfad der
+    Aufnahme, die dieses Cursorprotokoll begleitet hat. Stimmt ihr Dateistamm
+    mit ``name`` überein, ist das der Treffer; keine Zeitrechnung, kein
+    Fenster, kein Raten.
+    """
+    for candidate in sorted(cursor_dir.glob(f"{CURSOR_PREFIX}*.csv")):
+        sidecar = _sidecar_json_path(candidate)
+        if not sidecar.is_file():
+            continue
+        try:
+            payload = json.loads(sidecar.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        output_path = payload.get("obs_output_path")
+        if not isinstance(output_path, str) or not output_path:
+            continue
+        if Path(output_path).stem != name:
+            continue
+        lead_seconds = payload.get("lead_seconds")
+        if not isinstance(lead_seconds, int | float):
+            lead_seconds = None
+        return CursorMatch(candidate, "sidecar", lead_seconds)
+    return None
 
 
 def _first_cursor_row_timestamp(csv_path: Path) -> datetime | None:
@@ -164,8 +205,13 @@ def find_cursor(
     max_lead_seconds: int = CURSOR_LEAD_WINDOW_SECONDS,
 ) -> CursorMatch:
     """Erkenne das nächstgelegene, vor der Aufnahme gestartete Cursorprotokoll."""
+    if not cursor_dir.is_dir():
+        return CursorMatch(None, "none")
+    sidecar_match = _find_cursor_via_sidecar(name, cursor_dir)
+    if sidecar_match is not None:
+        return sidecar_match
     timestamp = parse_name_timestamp(name)
-    if timestamp is None or not cursor_dir.is_dir():
+    if timestamp is None:
         return CursorMatch(None, "none")
     best_lead: int | None = None
     best_path: Path | None = None
