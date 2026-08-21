@@ -4,17 +4,42 @@
 
 - **whisper.cpp-Binary**: `P:\AI\whisper.cpp\build\bin\Release\whisper-cli.exe`
   485.888 Bytes, Stand 28.04.2026. Gesamtgroesse des Baums `P:\AI\whisper.cpp`: 176 MB.
-- **Modell**: `P:\AI\whisper-data\models\ggml-small.bin`
-  487.601.967 Bytes (465 MB), Stand 28.04.2026.
+- **Modell (Vorgabe im Code)**: `P:\AI\whisper-data\models\ggml-large-v3-turbo.bin`
+  1.624.555.275 Bytes (1,51 GB), Stand 12.08.2026 13:57. Voreinstellung
+  `DEFAULT_WHISPER_MODEL` in `src\matrix_auto_cutter\shorts\transcript.py:69`.
+  `ggml-small.bin` liegt weiterhin im Modellordner (487.601.967 Bytes,
+  Stand 28.04.2026) und wird nicht mehr als Vorgabe verwendet. Gesamtgroesse
+  von `P:\AI\whisper-data\models\`: 3.645.920.301 Bytes (3,40 GB;
+  `Get-ChildItem ... | Measure-Object -Property Length -Sum`, 21.8.2026),
+  darin `ggml-small.bin`, `ggml-medium.bin` und `ggml-large-v3-turbo.bin`.
 
-Beide liegen bewusst **ausserhalb** des Repositorys und werden nicht versioniert.
-`whisper.cpp/` steht bereits in der `.gitignore` (Abschnitt "vendored SDKs / toolchains").
+Modell und Binary liegen bewusst **ausserhalb** des Repositorys und werden
+nicht versioniert. `whisper.cpp/` steht bereits in der `.gitignore`
+(Abschnitt "vendored SDKs / toolchains").
 
-## Beispielaufruf
+## Beispielaufruf (heute: ueber das Modul)
+
+Die Transkription laeuft heute nicht mehr durch einen Direktaufruf des
+Binaries, sondern durch `src\matrix_auto_cutter\shorts\transcript.py`, das
+Modell, Binary und Vokabeldatei aus dem Repository zieht (siehe unten) und
+die vorhandene `asr.py`-Kette aufruft:
+
+```
+uv run python -m matrix_auto_cutter.shorts.transcript ^
+  <pfad-zur-shorts-job.json>
+```
+
+Ohne `--whisper-binary`/`--whisper-model`/`--prompt-file` verwendet der
+Aufruf die Voreinstellungen aus `transcript.py` (Binary, Modell,
+`labels\repeat\whisper-vokabular.txt`). Beleg:
+`artefakte\repeat\shorts-vokabular\BERICHT-2026-08-19.md`, Abschnitt
+"Pruefstein".
+
+### Nachtrag: Direktaufruf des Binaries (nur fuer Diagnosefaelle)
 
 ```
 P:\AI\whisper.cpp\build\bin\Release\whisper-cli.exe ^
-  -m P:\AI\whisper-data\models\ggml-small.bin ^
+  -m P:\AI\whisper-data\models\ggml-large-v3-turbo.bin ^
   -f <pfad-zur-wav-datei> ^
   -l de ^
   -t 4 ^
@@ -24,14 +49,69 @@ P:\AI\whisper.cpp\build\bin\Release\whisper-cli.exe ^
 
 ## Durchsatz
 
-Gemessen: 4,06-fache Echtzeit bei 4 Threads. Eine Stunde Aufnahme entspricht
-rund 15 Minuten Transkriptionszeit.
+Die 4,06-fache Echtzeit war an `ggml-small` gemessen und gilt fuer
+`ggml-large-v3-turbo` nicht. Fuer `turbo` liegen zwei Messungen an
+unterschiedlichem Material vor, beide nicht mit der alten Zahl vergleichbar
+(andere Threadzahl/Laenge):
 
-## `-ml 60` ist Pflicht
+- `artefakte\repeat\shorts-modellvergleich\MODELLVERGLEICH-2026-08-14.md`,
+  Abschnitt 2.2: 1037,19 s Audio, `-t 8`, Laufzeit 13 min 56 s (836 s).
+- `artefakte\repeat\shorts-stufe-4\BERICHT-2026-08-17.md`, Abschnitt "Teil A":
+  74,6 s Audio, `-t 8`, **ohne** `-ml`, Laufzeit 49,710 s (0,666-fache
+  Echtzeit laut Bericht, d. h. schneller als Echtzeit).
 
-Ohne `-ml` (max_len) liefert whisper Segmente von zehn Sekunden und mehr.
-Segmentgrenzen tragen die Aeusserungsbildung nachgelagert im repeat-Paket --
-ein zu grosses Segment zerstoert diese Grundlage.
+Ein eigener, sauber vergleichbarer Durchsatzlauf fuer `turbo` unter den
+Bedingungen der alten Messung (4 Threads, `-ml 60`) ist nicht belegt.
+
+## `-ml`: 60 im repeat-Diagnosepfad, 120 im Shorts-Pfad
+
+`-ml` (max_len) ist ohne Wert Pflicht -- ohne die Option liefert whisper
+Segmente von zehn Sekunden und mehr.
+
+Zwei Vorgaben stehen nebeneinander im Code:
+
+- **Repeat-Diagnose** (`src\matrix_auto_cutter\repeat\asr.py:18`,
+  `DEFAULT_MAX_SEGMENT_LEN = 60`): Segmentgrenzen tragen die
+  Aeusserungsbildung nachgelagert im repeat-Paket -- ein zu grosses Segment
+  zerstoert diese Grundlage. Dieser Pfad ist unveraendert.
+- **Shorts-Stufe-2-Transkription** (`src\matrix_auto_cutter\shorts\transcript.py:62`,
+  `DEFAULT_MAX_SEGMENT_LEN = 120`): fuer die Kandidatensuche soll ein
+  zusammenhaengender Gedanke nicht an einer festen Segmentgrenze zerreissen.
+  Der Code-Kommentar an derselben Stelle nennt das selbst "ein erster, nicht
+  gemessener Kompromiss" und verweist auf "Auftrag 15, Abschnitt 2.1"
+  (`artefakte\repeat\shorts-stufe-2-vorbereitung\VORBEREITUNG-2026-08-11.md`).
+  Diese Datei traegt keine Unterabschnitte 2.1/2.2 -- ihr Abschnitt "## 2 —
+  Urteilsseite aus dem Repeat-Block" behandelt die Urteilsseite, nicht die
+  Segmentlaenge. Eine gemessene Begruendung fuer den Wechsel von 60 auf 120
+  wurde in `artefakte\repeat\` nicht gefunden.
+
+**Ergebnis:** Wert 120 gilt im Shorts-Pfad laut Code
+(`transcript.py:62`), Wert 60 gilt weiterhin im repeat-Diagnosepfad laut
+Code (`asr.py:18`). Keiner der beiden Werte ist falsch -- sie gelten fuer
+verschiedene Pfade. Die Begruendung fuer den Shorts-Wert 120 ist im Code
+selbst als ungemessen vermerkt und in den durchsuchten Berichten nicht
+belegt.
+
+## Vokabeldatei (`--prompt`)
+
+- **Ort**: `labels\repeat\whisper-vokabular.txt`.
+- **Fundstelle**: `DEFAULT_VOCAB_PATH` in
+  `src\matrix_auto_cutter\shorts\transcript.py:70`; gezogen ueber
+  `resolve_prompt()` (`transcript.py:96-106`), sofern `--prompt-file` nicht
+  gesetzt ist und die Datei existiert. Der Inhalt wird strikt als UTF-8
+  gelesen (`load_prompt_text()`, `transcript.py:87-93`) und unveraendert als
+  `--prompt` an whisper-cli durchgereicht.
+- **Wofuer der Wert steht**: Fachbegriffe, die whisper sonst falsch erkennt
+  (Beleg: "wrong-footed" vs. "gerund wurde",
+  `artefakte\repeat\shorts-vokabular\BERICHT-2026-08-19.md`).
+- Die Datei muss UTF-8 OHNE BOM sein. Schreiben per PowerShell mit
+  `UTF8Encoding($false)`, pruefen mit `Get-Content -Encoding UTF8` -- ohne
+  den Schalter zeigt PowerShell 5.1 Buchstabensalat, obwohl die Datei
+  stimmt.
+- Die Vorgabe wirkt nur im ERSTEN Verarbeitungsfenster von whisper.cpp.
+  Fachbegriffe im hinteren Teil einer Aufnahme sind unzuverlaessig
+  (gemessen 18.8.: "wrong-footed" im Ausschnitt korrekt, im Volllauf
+  "gerong-footed").
 
 ## `-ojf` und Absturzsicherheit
 
@@ -147,3 +227,11 @@ vergleichbare -- brauchen in ihren Eigenschaften beides:
 Ohne diese Haekchen laeuft die Animation im Hintergrund weiter, und der
 Szenenwechsel trifft sie an zufaelliger Stelle. Das sah zweimal wie ein Fehler
 im Cutter aus und war keiner.
+
+## Cursor-Waechter
+
+Skript: `scripts\START-CURSOR-WAECHTER.ps1`, protokolliert Mauszeiger-Position
+waehrend einer OBS-Aufnahme nach `F:\ShortsQuellen\Cursor\` (Vorgabe
+`-TargetDir`). Laeuft als Teil von `START-ALLES.ps1` (ruft das Skript
+gegen Ende auf) mit. Er muss **vor** der Aufnahme laufen -- er verbindet
+sich per obs-websocket und schreibt erst ab `RecordStateChanged`.
