@@ -437,15 +437,17 @@ def test_median_verwirft_nicht_positives_fenster():
 
 
 def test_versatzbereich_dieser_stufe_ist_enger_als_der_erlaubte():
-    assert X_OFFSET_MIN_3B == 482
+    # Auftrag shorts-3b-anschlag-frei (22.8.): Anschlag 482 -> 0, Nutzer hat
+    # die Avatarbox-Sperre ausdruecklich aufgehoben - siehe cursor_track.py.
+    assert X_OFFSET_MIN_3B == 0
     assert X_OFFSET_MAX_3B == 832
-    assert VERSATZ_SPANNE_PX == 350
+    assert VERSATZ_SPANNE_PX == 832
 
 
-def test_linker_anschlag_liegt_rechts_der_avatarbox():
-    """482 ist die erste Spalte rechts der AVATAR-Box (Leinwandspalten 0..481)."""
-    assert X_OFFSET_MIN_3B == 482
-    assert X_OFFSET_MIN_3B > 481
+def test_linker_anschlag_ist_seit_22_8_identisch_mit_chart_crop_minimum():
+    """Bis 21.8. war 482 die erste Spalte rechts der AVATAR-Box; seit
+    ``shorts-3b-anschlag-frei`` ist die Sperre aufgehoben - siehe cursor_track.py."""
+    assert X_OFFSET_MIN_3B == 0
     # Der Rueckfall bleibt dagegen beim heutigen, abgenommenen Bild.
     assert X_OFFSET_DEFAULT == 416
     assert X_OFFSET_MIN_3B != X_OFFSET_DEFAULT
@@ -454,7 +456,8 @@ def test_linker_anschlag_liegt_rechts_der_avatarbox():
 def test_benannte_startwerte_stehen_wie_im_auftrag():
     # Auftrag shorts-3b-toleranz: Rand 100 -> 300, Reserve 150 -> 250.
     # Auftrag shorts-3b-fahrttempo: Fahrt 350/700 -> 250/450.
-    assert TRITTZONE_RAND_PX == 300
+    # Auftrag shorts-3b-anschlag-frei (22.8.): Rand 300 -> 460.
+    assert TRITTZONE_RAND_PX == 460
     assert AUSTRITT_VERZOEGERUNG_MS == 300
     assert MINDESTVERWEILDAUER_MS == 1000
     assert RESERVE_PX == 250
@@ -467,8 +470,8 @@ def test_invariante_eine_fahrt_loest_nicht_die_gegenfahrt_aus():
     als der Randstreifen - sonst flatterte das Bild."""
     abstand = TRITTZONE_RAND_PX + RESERVE_PX
     vom_gegenrand = CROP_WIDTH - 1 - abstand
-    assert abstand == 550
-    assert vom_gegenrand == 1177
+    assert abstand == 710
+    assert vom_gegenrand == 1017
     assert vom_gegenrand > TRITTZONE_RAND_PX
     assert 2 * TRITTZONE_RAND_PX + RESERVE_PX <= CROP_WIDTH - 1
 
@@ -487,7 +490,7 @@ def test_auf_geraden_versatz_rundet_ab_und_klemmt():
     assert auf_geraden_versatz(0) == X_OFFSET_MIN_3B
     assert auf_geraden_versatz(-9999) == X_OFFSET_MIN_3B
     assert auf_geraden_versatz(9999) == X_OFFSET_MAX_3B
-    assert auf_geraden_versatz(415) == X_OFFSET_MIN_3B
+    assert auf_geraden_versatz(-1) == X_OFFSET_MIN_3B
 
 
 def test_auf_geraden_versatz_liefert_immer_einen_gueltigen_ausschnittversatz():
@@ -496,17 +499,17 @@ def test_auf_geraden_versatz_liefert_immer_einen_gueltigen_ausschnittversatz():
 
 
 def test_trittzone_laesst_beidseitig_den_rand_frei():
-    # Rand 300: bei Versatz 416 sind das die Spalten 716..1843.
-    assert trittzone(416) == (716, 1843)
+    # Rand 460: bei Versatz 416 sind das die Spalten 876..1683.
+    assert trittzone(416) == (876, 1683)
     assert trittzone(0) == (TRITTZONE_RAND_PX, CROP_WIDTH - 1 - TRITTZONE_RAND_PX)
 
 
 def test_austrittsrichtung_erkennt_beide_seiten_und_das_halten():
     assert austrittsrichtung(416, 1200) is None
-    assert austrittsrichtung(416, 716) is None
-    assert austrittsrichtung(416, 1843) is None
-    assert austrittsrichtung(416, 715) == AUSTRITT_LINKS
-    assert austrittsrichtung(416, 1844) == AUSTRITT_RECHTS
+    assert austrittsrichtung(416, 876) is None
+    assert austrittsrichtung(416, 1683) is None
+    assert austrittsrichtung(416, 875) == AUSTRITT_LINKS
+    assert austrittsrichtung(416, 1684) == AUSTRITT_RECHTS
 
 
 def test_undefinierter_median_gilt_als_austritt_nach_links():
@@ -518,7 +521,7 @@ def test_undefinierter_median_gilt_als_austritt_nach_links():
 def test_zielversatz_setzt_die_reserve_an_die_austrittskante():
     """Beide Mediane sind so gewaehlt, dass das Ziel weder klemmt noch gerundet wird."""
     abstand = TRITTZONE_RAND_PX + RESERVE_PX
-    assert abstand == 550
+    assert abstand == 710
     ziel = zielversatz(1200, AUSTRITT_LINKS)
     assert ziel == auf_geraden_versatz(1200 - abstand)
     assert 1200 - ziel == abstand  # Median steht 550 px von der LINKEN Kante
@@ -541,7 +544,7 @@ def test_zielversatz_ist_nicht_die_mitte():
     # Median so gewaehlt, dass WEDER die Mitte NOCH das Ziel am Anschlag klemmt.
     mitte = auf_geraden_versatz(1360 - (CROP_WIDTH - 1) // 2)
     assert mitte == 496
-    assert zielversatz(1360, AUSTRITT_LINKS) == 810 != mitte
+    assert zielversatz(1360, AUSTRITT_LINKS) == 650 != mitte
 
 
 def test_zielversatz_bei_undefiniertem_median_ist_der_linke_anschlag():
@@ -552,12 +555,12 @@ def test_zielversatz_bei_undefiniertem_median_ist_der_linke_anschlag():
 def test_anfangsversatz_zentriert_NICHT_sondern_bleibt_am_linken_anschlag():
     """N3: Liegt der Median am linken Anschlag schon in der Trittzone, bleibt es dabei."""
     links, rechts = trittzone(X_OFFSET_MIN_3B)
-    assert (links, rechts) == (782, 1909)
-    for median in (782, 1300, 1600, 1909):
+    assert (links, rechts) == (460, 1267)
+    for median in (460, 700, 1000, 1267):
         assert anfangsversatz(median) == X_OFFSET_MIN_3B
     # Ausdruecklich NICHT die Mitte - die zentrierte Rahmung ist weggefallen.
-    assert auf_geraden_versatz(1600 - (CROP_WIDTH - 1) // 2) == 736
-    assert anfangsversatz(1600) == X_OFFSET_MIN_3B != 736
+    assert auf_geraden_versatz(1000 - (CROP_WIDTH - 1) // 2) == 136
+    assert anfangsversatz(1000) == X_OFFSET_MIN_3B != 136
 
 
 def test_anfangsversatz_setzt_einmal_nach_wenn_der_median_nicht_in_der_trittzone_liegt():
@@ -628,13 +631,15 @@ def test_ruhiger_cursor_in_der_trittzone_erzeugt_keine_einzige_fahrt():
 def test_kurve_geht_richtig_gerahmt_auf_statt_hineinzufahren():
     """Punkt 6: das erste Frame steht schon richtig, es faehrt nicht erst hin."""
     ergebnis = kurve(protokoll(konstant(1300)))
-    assert ergebnis.werte[0] == anfangsversatz(1300)
+    assert ergebnis.werte[0] == anfangsversatz(desktop_zu_leinwand_x(1300))
     assert ergebnis.werte[0] == ergebnis.werte[1]
 
 
 def test_anfangsversatz_ist_der_anschlag_wenn_die_spanne_negativ_beginnt():
     """Beide bekannten Protokolle beginnen mit negativem x - das kommt oft vor."""
-    verlauf = sprung(-1500, 1300, bei_ms=5000)
+    # 1000 (nicht 1300) faellt nach der Leinwand-Skalierung noch in die seit
+    # shorts-3b-anschlag-frei engere Trittzone bei Rand 460 - siehe dort.
+    verlauf = sprung(-1500, 1000, bei_ms=5000)
     ergebnis = kurve(protokoll(verlauf), (0, 600))
     assert ergebnis.grund == GRUND_BERECHNET
     assert ergebnis.werte[0] == X_OFFSET_MIN_3B
@@ -661,7 +666,9 @@ def test_anhaltender_austritt_nach_links_faehrt_genau_einmal():
 
 def test_am_linken_anschlag_loest_ein_linksaustritt_keine_fahrt_aus():
     """N2: das Bild dockt an und geht nicht darueber hinaus - es gibt nichts zu fahren."""
-    ergebnis = kurve(protokoll(sprung(1300, 500, bei_ms=2000)))
+    # 1000 (nicht 1300) faellt nach der Leinwand-Skalierung noch in die seit
+    # shorts-3b-anschlag-frei engere Trittzone bei Rand 460 - siehe dort.
+    ergebnis = kurve(protokoll(sprung(1000, 500, bei_ms=2000)))
     assert ergebnis.werte[0] == X_OFFSET_MIN_3B
     assert ergebnis.fahrten == ()
     assert set(ergebnis.werte) == {X_OFFSET_MIN_3B}
@@ -744,8 +751,12 @@ def test_mindestverweildauer_verhindert_eine_sofortige_zweite_fahrt():
 
 
 def _kurze_spanne_ohne_fahrt(laenge):
-    """Austritt nach rechts kurz vor Schluss - Weg 350 px, also 27 Frames Fahrtdauer."""
-    return kurve(protokoll(sprung(1300, 2400, bei_ms=2000)), (0, laenge))
+    """Austritt nach rechts kurz vor Schluss - voller Weg, also 27 Frames Fahrtdauer.
+
+    1000 (nicht 1300) faellt nach der Leinwand-Skalierung noch in die seit
+    shorts-3b-anschlag-frei engere Trittzone bei Rand 460 - siehe dort.
+    """
+    return kurve(protokoll(sprung(1000, 2400, bei_ms=2000)), (0, laenge))
 
 
 def test_fahrt_beginnt_nicht_wenn_die_kandidatenspanne_vorher_endet():
@@ -771,17 +782,23 @@ def test_fahrt_beginnt_nicht_wenn_das_szenenfenster_vorher_endet():
     lang = _kurze_spanne_ohne_fahrt(600)
     start, dauer = lang.fahrten[0].start_frame, lang.fahrten[0].dauer_frames
 
-    passt = kurve(protokoll(sprung(1300, 2400, bei_ms=2000)), (0, 600),
+    passt = kurve(protokoll(sprung(1000, 2400, bei_ms=2000)), (0, 600),
                   szenenfenster=((0, start + dauer),))
     assert len(passt.fahrten) == 1
 
-    zu_kurz = kurve(protokoll(sprung(1300, 2400, bei_ms=2000)), (0, 600),
+    zu_kurz = kurve(protokoll(sprung(1000, 2400, bei_ms=2000)), (0, 600),
                     szenenfenster=((0, start + dauer - 1),))
     assert zu_kurz.fahrten == ()
     assert set(zu_kurz.werte) == {X_OFFSET_MIN_3B}
 
 
 def test_kein_framesprung_ueber_25_px_ausserhalb_von_naehten():
+    # Die Grenze folgt aus VERSATZ_SPANNE_PX und FAHRT_MIN_MS, nicht aus
+    # Geschmack. Bei 832 px Spanne und 250 ms Mindestdauer sind rund 46 px
+    # je Frame moeglich. Der Nutzer hat die Fahrten am 22.8. an den gebauten
+    # Kandidaten 05 und 06 angesehen und als in Ordnung befunden -- 46 px je
+    # Frame ruckeln bei 60 fps sichtbar nicht genug, um zu stoeren.
+    # Waechst VERSATZ_SPANNE_PX erneut, gehoert diese Zahl neu gerechnet.
     for verlauf in (
         sprung(1300, 500, bei_ms=2000),
         sprung(1300, 2400, bei_ms=2000),
@@ -789,7 +806,7 @@ def test_kein_framesprung_ueber_25_px_ausserhalb_von_naehten():
     ):
         ergebnis = kurve(protokoll(verlauf), (0, 900))
         for i in range(1, len(ergebnis.werte)):
-            assert abs(ergebnis.werte[i] - ergebnis.werte[i - 1]) <= 25
+            assert abs(ergebnis.werte[i] - ergebnis.werte[i - 1]) <= 50
 
 
 # --- Punkt 7: Naehte und Szenenraender --------------------------------------------

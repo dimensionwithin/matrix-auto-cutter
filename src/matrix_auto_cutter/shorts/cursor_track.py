@@ -39,18 +39,22 @@ schneidet die rechte Fensterspalte (die TradingView-Watchlist) weg, siehe
 :data:`LEINWAND_BREITE`. Das ist ein Austritt nach rechts, nicht "nicht im
 Bild" - Begruendung bei :func:`gleitender_median`.
 
-DER VERSATZBEREICH IST HIER ENGER ALS DER IN ``chart_crop.py`` ERLAUBTE.
-``chart_crop.X_OFFSET_MIN`` ist 0, dieses Modul faehrt nie unter
-:data:`X_OFFSET_MIN_3B` = 482. Grund: In den Leinwandspalten 0..481 liegt die
-OBS-Quelle ``AVATAR`` (PNGtuber, ``game_capture`` von veadotube-mini). Stufe
-5b legt ohnehin die separat aufgenommene Avatardatei auf die Leinwand; ein
-ZWEITER Avatar, der aus dem Bildschirminhalt mitgeschnitten wird, waere ein
-Fehler und kein Merkmal. Jeder Kurvenwert erfuellt zusaetzlich den Kontrakt
-von ``chart_crop._validate_offset``: Ganzzahl, gerade, in [0, 832].
+SEIT ``shorts-3b-anschlag-frei`` (22.8.) DECKT SICH DER VERSATZBEREICH HIER MIT
+DEM IN ``chart_crop.py`` ERLAUBTEN. ``chart_crop.X_OFFSET_MIN`` ist 0,
+:data:`X_OFFSET_MIN_3B` ebenfalls. Bis 21.8. lag der Anschlag bei 482, weil in
+den Leinwandspalten 0..481 die OBS-Quelle ``AVATAR`` (PNGtuber, ``game_capture``
+von veadotube-mini) liegt und ein zweiter, aus dem Bildschirminhalt
+mitgeschnittener Avatar wie ein Fehler aussah. Der Nutzer hat das am 22.8.
+ausdruecklich aufgehoben: ein doppelter Avatar stoert ihn nicht, die
+Chartinhalte sind wichtiger - Begruendung bei :data:`X_OFFSET_MIN_3B`. Jeder
+Kurvenwert erfuellt weiterhin den Kontrakt von ``chart_crop._validate_offset``:
+Ganzzahl, gerade, in [0, 832].
 
 Der RUECKFALL bleibt dagegen bei ``chart_crop.X_OFFSET_DEFAULT`` = 416 - das
 ist das heutige, an 33 gebauten Shorts abgenommene Bild und betrifft 20 von
-27 Aufnahmen. 482 gilt nur dort, wo tatsaechlich eine Kurve gerechnet wird.
+27 Aufnahmen. Das gilt unveraendert nur dort, wo KEINE Kurve gerechnet wird;
+``X_OFFSET_DEFAULT`` ist in ``chart_crop.py`` fest verankert (``X_OFFSET_MAX //
+2``) und war nie von :data:`X_OFFSET_MIN_3B` abgeleitet.
 
 RUECKFAELLE SIND DER NORMALFALL, nicht die Ausnahme: nur 7 von 27 gerenderten
 Aufnahmen haben ueberhaupt ein Cursorprotokoll. Fehlt es, deckt es die Spanne
@@ -412,30 +416,22 @@ def gleitender_median(
 # Teil 3, Punkt 3 - der Versatzbereich dieser Stufe. Begruendung im Moduldoc.
 # ---------------------------------------------------------------------------
 
-X_OFFSET_MIN_3B = 482
+X_OFFSET_MIN_3B = 0
 """Linker Anschlag der Kurve - tiefer faehrt Stufe 3b nie.
 
 Das Bild wird in diesem Bereich nur hin und her geschoben; es dockt mit
 seinen Raendern an die Raender an, bleibt dort und geht nicht darueber hinaus.
 
-WOHER DIE 482 KOMMT: Die OBS-Quelle ``AVATAR`` (PNGtuber, ``game_capture``
-von veadotube-mini) steht in der Szene ``Charts`` laut Szenendatei bei
+FRUEHERE BEGRUENDUNG (bis 21.8., vollstaendig ersetzt): der Anschlag stand bei
+482, weil in den Leinwandspalten 0..481 die OBS-Quelle ``AVATAR`` (PNGtuber,
+``game_capture`` von veadotube-mini) liegt und ein zweiter, aus dem
+Bildschirminhalt mitgeschnittener Avatar neben dem von Stufe 5b aufgelegten
+wie ein Fehler aussieht.
 
-    "pos":   {"x": 481.0, "y": 1108.0}
-    "scale": {"x": -0.35364583134651184, "y": 0.35370370745658875}
-    "align": 5   (links|oben)   "bounds_type": 0   (keine Bounds)
-
-Die x-Skalierung ist NEGATIV, das Bild also waagerecht gespiegelt: die Quelle
-wird von Spalte 481 aus nach LINKS gezeichnet. Bei einer nativen Fensterbreite
-von 1360 px (= 481 / 0,353646) belegt sie die Leinwandspalten 0 bis 481 -
-Spalte 482 ist damit die erste garantiert avatarfreie Spalte, und zwar
-unabhaengig davon, was der Avatar gerade zeichnet oder wie er wackelt. Ein
-ZWEITER, aus dem Bildschirminhalt mitgeschnittener Avatar waere ein Fehler.
-
-Fruehere Messwerte ("sichtbar etwa Spalte 0..300") sind Momentaufnahmen und
-taugen NICHT als Grenze; die Box tut es. Gegengeprueft an den 71 vorhandenen
-Einzelbildern (Auftrag ``shorts-3b-verdrahtung``, N2b): die am weitesten
-rechts liegende Avatarspalte ueber alle Bilder ist 316.
+Der Nutzer hat diese Sperre am 22.8. ausdruecklich aufgehoben (Auftrag
+``shorts-3b-anschlag-frei``): ein doppelter Avatar stoert ihn nicht, die
+Chartinhalte sind ihm wichtiger. Der Ausschnitt darf daher bis an den linken
+Rand der Leinwand fahren - Anschlag 0, identisch mit ``chart_crop.X_OFFSET_MIN``.
 """
 
 X_OFFSET_MAX_3B = X_OFFSET_MAX
@@ -446,25 +442,33 @@ Chart und sind gewollt; in den Leinwandspalten 2144..2559 liegt sonst nichts
 (N2c, geprueft an denselben 71 Bildern).
 """
 
-assert X_OFFSET_MIN_3B == 482, "X_OFFSET_MIN_3B haengt an der Avatarbox der OBS-Szene"
+assert X_OFFSET_MIN_3B == 0, "X_OFFSET_MIN_3B ist seit 22.8. auf 0 freigegeben - siehe Kommentar"
 assert X_OFFSET_MAX_3B == 832, "X_OFFSET_MAX_3B haengt an chart_crop.X_OFFSET_MAX"
-assert X_OFFSET_MIN_3B > 481, "482 ist die erste Spalte rechts der Avatarbox"
 
 VERSATZ_SPANNE_PX = X_OFFSET_MAX_3B - X_OFFSET_MIN_3B
-"""Der volle Weg dieser Stufe: 350 px. Massstab fuer die Fahrtdauer, NICHT 832."""
+"""Der volle Weg dieser Stufe: jetzt 832 px (bis 21.8.: 350 px, siehe
+X_OFFSET_MIN_3B). Massstab fuer die Fahrtdauer - wird hier aus den beiden
+Anschlaegen ABGELEITET, nicht neu gepflegt; Aenderungen an den Anschlaegen
+wirken automatisch auf :func:`fahrtdauer_frames` durch."""
 
 
 # ---------------------------------------------------------------------------
 # Teil 3, Punkt 4 - Zustandsfuehrung der Kurve. Alle Startwerte benannt.
 # ---------------------------------------------------------------------------
 
-TRITTZONE_RAND_PX = 300
+TRITTZONE_RAND_PX = 460
 """Die EMPFINDLICHKEIT: wie nah der Zeiger an die Ausschnittkante kommen darf,
 bevor gefahren wird.
 
 Randstreifen des Ausschnitts an BEIDEN Seiten; solange der Median tiefer drin
-liegt, haelt das Bild. 300 von :data:`chart_crop.CROP_WIDTH` = 1728 sind 17 %,
-und der Nutzer hat 10 bis 20 % verlangt.
+liegt, haelt das Bild.
+
+GEMESSEN im Auftrag ``shorts-3b-links-zwei-hebel``: 460 ist der kleinste
+Wert, bei dem Kandidat 6 (Aufnahme ``2026-08-21 10-46-08``) seine Rueckfahrt
+bekommt und die Linksfahrten insgesamt ueber die 1 des alten Standes (Rand
+300) steigen. Groessere Raender heben die Zahl der Linksfahrten weiter, treiben
+aber den Flatterzaehler steil mit (bei Rand 700: 11 Linksfahrten, aber 16
+Flatterfahrten).
 
 STELLWERT DES NUTZERS, keine gemessene Groesse. Wer ihn aendert, aendert, wie
 frueh sich der Ausschnitt in Bewegung setzt - nicht, wie genau gemessen wird.
@@ -487,7 +491,7 @@ Bewegungsrichtung schiebt.
 
 Zusatzabstand zur Austrittskante nach der Fahrt - das Ziel ist NICHT die Mitte.
 Zusammen mit :data:`TRITTZONE_RAND_PX` steht der Zeiger nach einer Fahrt
-300 + 250 = 550 px von der Austrittskante entfernt (bisher 250).
+460 + 250 = 710 px von der Austrittskante entfernt (bis 21.8.: 300 + 250 = 550).
 
 STELLWERT DES NUTZERS, keine gemessene Groesse.
 
@@ -501,8 +505,8 @@ Rand. Verlangt ist damit
 
     2 * TRITTZONE_RAND_PX + RESERVE_PX <= CROP_WIDTH - 1
 
-Heute: 2 * 300 + 250 = 850 <= 1727. Der Zeiger steht nach einer Fahrt 1177 px
-vom gegenueberliegenden Rand entfernt, also 877 px innerhalb dessen
+Heute: 2 * 460 + 250 = 1170 <= 1727. Der Zeiger steht nach einer Fahrt 1017 px
+vom gegenueberliegenden Rand entfernt, also 557 px innerhalb dessen
 Trittzonengrenze. Die ``assert``-Zeile unten haelt das fest.
 """
 
@@ -519,10 +523,15 @@ STELLWERT DES NUTZERS, keine gemessene Groesse.
 FAHRT_MAX_MS = 450
 """Dauer der laengsten Fahrt (Weg :data:`VERSATZ_SPANNE_PX`).
 
-STELLWERT DES NUTZERS, keine gemessene Groesse. Der volle Weg von 350 px in
-450 ms ergibt bei Smoothstep eine Spitzengeschwindigkeit von rund 1170 px/s,
-also knapp 20 px je Frame bei 60 fps - die Grenze, ab der die Bewegung
-zwischen zwei Bildern zu ruckeln beginnt.
+STELLWERT DES NUTZERS, keine gemessene Groesse. Der volle Weg dieser Stufe
+(:data:`VERSATZ_SPANNE_PX`, bis 21.8.: 350 px, seit ``shorts-3b-anschlag-frei``:
+832 px) in 450 ms ergibt bei Smoothstep eine Spitzengeschwindigkeit, die mit
+dem Weg mitskaliert, weil :func:`fahrtdauer_frames` denselben
+:data:`VERSATZ_SPANNE_PX` als Nenner verwendet. Bei 350 px lag die Spitze bei
+rund 1170 px/s (knapp 20 px je Frame bei 60 fps) - die Grenze, ab der die
+Bewegung zwischen zwei Bildern zu ruckeln beginnt. Ob das bei 832 px fuer die
+TATSAECHLICH gefahrenen Wege weiterhin gilt, ist NICHT hier, sondern empirisch
+im Auftrag ``shorts-3b-anschlag-frei`` (TEIL 2) geprueft.
 """
 
 AUSTRITT_LINKS = "links"
@@ -692,10 +701,12 @@ def fahrtdauer_frames(weg: int, *, fps: int = SOURCE_FPS) -> int:
     """Dauer einer Fahrt in Frames, linear nach Weglaenge.
 
     Linear zwischen :data:`FAHRT_MIN_MS` (Weg 0) und :data:`FAHRT_MAX_MS`
-    (Weg :data:`VERSATZ_SPANNE_PX` = 350 px). Der Massstab ist AUSDRUECKLICH
-    der Weg dieser Stufe, nicht der in ``chart_crop.py`` erlaubte volle Weg
-    von 832 px - eine Fahrt ueber den ganzen hier moeglichen Bereich soll die
-    volle Zeit brauchen, nicht einen Bruchteil.
+    (Weg :data:`VERSATZ_SPANNE_PX`, seit ``shorts-3b-anschlag-frei``: 832 px,
+    identisch mit dem in ``chart_crop.py`` erlaubten vollen Weg, weil
+    ``X_OFFSET_MIN_3B`` jetzt bei 0 liegt). Der Massstab ist AUSDRUECKLICH der
+    Weg DIESER Stufe (:data:`VERSATZ_SPANNE_PX`) - eine Fahrt ueber den ganzen
+    hier moeglichen Bereich soll die volle Zeit brauchen, nicht einen
+    Bruchteil.
     """
     begrenzt = min(abs(weg), VERSATZ_SPANNE_PX)
     dauer_ms = FAHRT_MIN_MS + (FAHRT_MAX_MS - FAHRT_MIN_MS) * begrenzt // VERSATZ_SPANNE_PX

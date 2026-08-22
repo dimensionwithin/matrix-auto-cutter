@@ -753,6 +753,8 @@ def test_pegelkorrektur_verschiebt_beide_grenzen_und_wird_berichtet(
         )
 
     monkeypatch.setattr(build, "verschiebe_auf_leiseste_stelle", fake_snap)
+    monkeypatch.setattr(build, "finde_wortende_ton", lambda *a, **k: a[1])
+    monkeypatch.setattr(build, "finde_worteinsatz_ton", lambda *a, **k: 0)
 
     result = build.run_shorts_build(**kwargs)
 
@@ -796,11 +798,45 @@ def test_pegelkorrektur_sucht_bei_der_startgrenze_nur_rueckwaerts(
         return LevelSnap(mark_ms, mark_ms, 0, -60.0, -30.0)
 
     monkeypatch.setattr(build, "verschiebe_auf_leiseste_stelle", fake_snap)
+    monkeypatch.setattr(build, "finde_wortende_ton", lambda *a, **k: a[1])
+    monkeypatch.setattr(build, "finde_worteinsatz_ton", lambda *a, **k: 0)
 
     result = build.run_shorts_build(**kwargs)
 
     assert isinstance(result, build.BuildResult)
     assert aufrufe == [(9800, True), (20200, False)]
+
+
+def test_worteinsatz_gewinnt_wenn_er_spaeter_liegt_als_die_pegelkorrektur(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Auftrag shorts-pegel-wortgrenze, TEIL 3: der gemessene Worteinsatz ist ein
+    ZIEL - liegt er spaeter als das Ergebnis der rueckwaertigen leiseste-Stelle-
+    Suche, wird er stattdessen uebernommen (VERFAHREN_WORT_EINSATZ)."""
+    kwargs = _prepare_single_candidate_build(tmp_path, monkeypatch)
+
+    def fake_snap(media_path, mark_ms, **k):
+        del media_path, k
+        # Die Pegelkorrektur selbst schiebt die Startgrenze weit zurueck.
+        shift = -300 if mark_ms < 15000 else 0
+        return LevelSnap(mark_ms, mark_ms + shift, shift, -60.0, -30.0)
+
+    monkeypatch.setattr(build, "verschiebe_auf_leiseste_stelle", fake_snap)
+    monkeypatch.setattr(build, "finde_wortende_ton", lambda *a, **k: a[1])
+    # Der gemessene Einsatz liegt 50 ms NACH der (ungepolsterten) Wortmarke,
+    # also klar nach dem Ergebnis der Pegelkorrektur (mark_ms - 300).
+    monkeypatch.setattr(build, "finde_worteinsatz_ton", lambda *a, **k: a[1] + 50)
+
+    result = build.run_shorts_build(**kwargs)
+
+    assert isinstance(result, build.BuildResult)
+    outcome = result.outcomes[0]
+    assert outcome.pegelkorrektur is not None
+    assert outcome.pegelkorrektur.start is not None
+    assert outcome.pegelkorrektur.start.verfahren == "wort_einsatz"
+    # finde_worteinsatz_ton wird mit new_start_ms (10000, ungepolstert) aufgerufen -
+    # Einsatz also 10000 + 50 = 10050, klar spaeter als 9800 - 300 = 9500.
+    assert outcome.build_start_ms == 10000 + 50
 
 
 def test_pegelkorrektur_wird_auf_dem_gerenderten_video_gemessen(
@@ -816,6 +852,8 @@ def test_pegelkorrektur_wird_auf_dem_gerenderten_video_gemessen(
         return LevelSnap(mark_ms, mark_ms, 0, -60.0, -30.0)
 
     monkeypatch.setattr(build, "verschiebe_auf_leiseste_stelle", fake_snap)
+    monkeypatch.setattr(build, "finde_wortende_ton", lambda *a, **k: a[1])
+    monkeypatch.setattr(build, "finde_worteinsatz_ton", lambda *a, **k: 0)
 
     result = build.run_shorts_build(**kwargs)
 
@@ -1076,6 +1114,8 @@ def test_pegelkorrektur_die_die_spanne_verkuerzt_wird_verworfen(
         return LevelSnap(mark_ms, 15000, 15000 - mark_ms, -60.0, -30.0)
 
     monkeypatch.setattr(build, "verschiebe_auf_leiseste_stelle", fake_snap)
+    monkeypatch.setattr(build, "finde_wortende_ton", lambda *a, **k: a[1])
+    monkeypatch.setattr(build, "finde_worteinsatz_ton", lambda *a, **k: 0)
 
     result = build.run_shorts_build(**kwargs)
 
@@ -1891,8 +1931,8 @@ def test_versatzkurve_wird_gerechnet_und_im_bericht_benannt(tmp_path: Path) -> N
     # eine konstante Kurve - die geht als Kurve durch, nicht als Rueckfall.
     assert info.grund == "berechnet"
     assert info.fahrten == 0
-    assert info.versatz_anfang == info.versatz_ende == 482
-    assert kurve is not None and set(kurve) == {482}
+    assert info.versatz_anfang == info.versatz_ende == 422
+    assert kurve is not None and set(kurve) == {422}
 
 
 def test_ausschnitt_json_verhindert_dass_ueberhaupt_gerechnet_wird(tmp_path: Path) -> None:
