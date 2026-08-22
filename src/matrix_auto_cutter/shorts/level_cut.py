@@ -148,6 +148,18 @@ VERFAHREN_BEREICHSMITTE = "bereichsmitte"
 VERFAHREN_TIEFSTER_PUNKT = "tiefster_punkt"
 """Rueckfall: kein Bereich im Fenster war lang genug, es zaehlte der tiefste Punkt."""
 
+VERFAHREN_WORTGRENZE_STEHT = "wortgrenze_steht"
+"""Auftrag shorts-pegel-wortgrenze: ``such_min_ms``/``such_max_ms`` liessen kein
+gueltiges Suchfenster (leer oder zu schmal fuer eine Messstelle) - die Marke
+bleibt unveraendert stehen. Kein Ausweichen, keine Naeherung."""
+
+VERFAHREN_WORT_EINSATZ = "wort_einsatz"
+"""Auftrag shorts-pegel-wortgrenze, TEIL 3: die Startgrenze wurde auf den am
+Ton gemessenen Worteinsatz (:func:`finde_worteinsatz_ton`) vorgerueckt - nicht
+von der leiseste-Stelle-Suche selbst gewaehlt (siehe Aufrufstelle in
+``build._apply_level_correction``: der Einsatz gewinnt, wenn er spaeter liegt
+als das Ergebnis der rueckwaertigen leiseste-Stelle-Suche)."""
+
 
 class LevelCutFailed(RuntimeError):
     """Die Pegelmessung ist fehlgeschlagen - fail closed, kein stiller Rueckfall.
@@ -228,18 +240,32 @@ def _default_process_runner(arguments: Sequence[str], timeout_seconds: int) -> P
     return ProcessResult(result.returncode, (result.stdout or b"").decode("utf-8", "replace"))
 
 
-def _filter_chain() -> str:
-    """Der Filtergraph: Sprachband, 10-ms-Bloecke, RMS je Block auf stdout.
+def _filter_chain(*, hochband: bool = False) -> str:
+    """Der Filtergraph: ein Band, 10-ms-Bloecke, RMS je Block auf stdout.
 
     EIN ffmpeg-Aufruf misst damit das ganze Fenster. Aus nicht ueberlappenden
     10-ms-Bloecken laesst sich der 40-ms-Wert an jeder 10-ms-Stelle exakt
     zusammensetzen (siehe :func:`_combine_to_measure_window`), weil sich
     Leistungen addieren.
+
+    ``hochband=True`` (Auftrag shorts-pegel-wortgrenze, Nachtrag N1) misst
+    statt des Sprachbands (Vorgabe, 200-3400 Hz - fuer die leiseste-Stelle-
+    Suche unveraendert) alles OBERHALB :data:`SPEECH_BAND_LOWPASS_HZ` - das
+    Band, das Reibe- und Verschlusslaute traegt, die das Sprachband allein
+    kaum sieht (Befund, Abschnitt 1.6/1.8: der Reibelaut von kandidat-01
+    steht im Sprachband bei nur -30 bis -39 dB, im Hochband deutlich hoeher).
+    Nur :func:`finde_wortende_ton` und :func:`finde_worteinsatz_ton` nutzen
+    beide Baender (je Block das Maximum, siehe :func:`_fetch_zweiband_levels`)
+    - die leiseste-Stelle-Suche selbst bleibt unveraendert einbaendig.
     """
+    band = (
+        f"highpass=f={SPEECH_BAND_LOWPASS_HZ}"
+        if hochband
+        else f"highpass=f={SPEECH_BAND_HIGHPASS_HZ},lowpass=f={SPEECH_BAND_LOWPASS_HZ}"
+    )
     return (
         f"aresample={MEASURE_SAMPLE_RATE},"
-        f"highpass=f={SPEECH_BAND_HIGHPASS_HZ},"
-        f"lowpass=f={SPEECH_BAND_LOWPASS_HZ},"
+        f"{band},"
         f"asetnsamples=n={_BLOCK_SAMPLES}:p=0,"
         f"astats=metadata=1:reset=1,"
         f"ametadata=print:key={_ASTATS_KEY}:file=-"
@@ -488,6 +514,7 @@ def _fetch_measured_levels(
     timeout_seconds: int,
     process_runner: ProcessRunner,
     context: str,
+    hochband: bool = False,
 ) -> list[float]:
     """Miss die 40-ms-Pegel im 10-ms-Raster ueber ``[fetch_start_ms, +fetch_duration_ms)``.
 
@@ -495,7 +522,8 @@ def _fetch_measured_levels(
     :func:`finde_stillevorlauf` - dieselbe Filterkette wie
     :func:`verschiebe_auf_leiseste_stelle`. ``context`` geht nur in die
     Fehlermeldung ein, damit sich Sprechpegel- von Vorlauf-Fehlern unterscheiden
-    lassen.
+    lassen. ``hochband`` reicht an :func:`_filter_chain` durch (Auftrag
+    shorts-pegel-wortgrenze, Nachtrag N1) - Vorgabe unveraendert das Sprachband.
     """
     arguments = [
         str(ffmpeg_path),
@@ -510,7 +538,7 @@ def _fetch_measured_levels(
         "-map",
         "0:a:0",
         "-af",
-        _filter_chain(),
+        _filter_chain(hochband=hochband),
         "-f",
         "null",
         "-",
@@ -529,6 +557,46 @@ def _fetch_measured_levels(
             f"kein messbarer Ton bei {fetch_start_ms} ms in {media_path} ({context})",
         )
     return _combine_to_measure_window(block_levels)
+
+
+def _fetch_zweiband_levels(
+    media_path: Path,
+    *,
+    fetch_start_ms: int,
+    fetch_duration_ms: int,
+    ffmpeg_path: Path,
+    timeout_seconds: int,
+    process_runner: ProcessRunner,
+    context: str,
+) -> list[float]:
+    """Wie :func:`_fetch_measured_levels`, aber je Block das Maximum.
+
+    Sprachband und Hochband (Auftrag shorts-pegel-wortgrenze, Nachtrag N1) -
+    fuer :func:`finde_wortende_ton` und :func:`finde_worteinsatz_ton`, NICHT
+    fuer die leiseste-Stelle-Suche (siehe :func:`_filter_chain`).
+    """
+    sprachband = _fetch_measured_levels(
+        media_path,
+        fetch_start_ms=fetch_start_ms,
+        fetch_duration_ms=fetch_duration_ms,
+        ffmpeg_path=ffmpeg_path,
+        timeout_seconds=timeout_seconds,
+        process_runner=process_runner,
+        context=f"{context}/Sprachband",
+        hochband=False,
+    )
+    hochband = _fetch_measured_levels(
+        media_path,
+        fetch_start_ms=fetch_start_ms,
+        fetch_duration_ms=fetch_duration_ms,
+        ffmpeg_path=ffmpeg_path,
+        timeout_seconds=timeout_seconds,
+        process_runner=process_runner,
+        context=f"{context}/Hochband",
+        hochband=True,
+    )
+    laenge = min(len(sprachband), len(hochband))
+    return [max(sprachband[i], hochband[i]) for i in range(laenge)]
 
 
 def _stillebereich_laenge(
@@ -684,6 +752,320 @@ def finde_stillevorlauf(
     )
 
 
+WORTENDE_SUCHE_MS = 150
+"""Fenster (je Richtung um eine Whisper-Wortmarke) fuer :func:`finde_wortende_ton`
+(Auftrag shorts-pegel-wortgrenze, Nachtrag N1).
+
+Ersetzt die alte, rein an Whisper gemessene Pause als Schranke der
+Pegelkorrektur: Whispers Marken sind eine Naeherung (Befund
+``shorts-bau-21-08-befund/BERICHT-2026-08-22.md``, Abschnitt 1.7 - Wortanfaenge
+liegen 35-65 ms zu frueh), deshalb bestimmt dieses Modul das tatsaechliche
+Lautende/den tatsaechlichen Ausklang selbst am Ton, in einem Fenster von
+150 ms um die Whisper-Marke."""
+
+WORTENDE_FALLBACK_MS = 65
+"""Konservative Untergrenze, wenn :func:`finde_wortende_ton` auch innerhalb von
+:data:`WORTENDE_SUCHE_MAX_MS` keinen dauerhaften Uebergang von laut zu leise
+findet (Nachtrag N1) - dieselbe Zahl wie die OBERE gemessene Frueh-Abweichung
+der Wortanfaenge (Befund, Abschnitt 1.7: 35-65 ms), hier konservativ als
+"mindestens so lange noch Ton" auf die Endgrenze uebertragen. Kein
+Geschmackswert."""
+
+WORTENDE_SUCHE_MAX_MS = 800
+"""Sicherheitsdeckel der Vorwaertssuche in :func:`finde_wortende_ton`, falls
+der Ton ueber :data:`WORTENDE_SUCHE_MS` hinaus laut bleibt.
+
+Die reine Whisper-Marke ist in durchlaufender Rede keine verlaessliche
+Messgroesse (Befund, Abschnitt 1.7): bei kandidat-04 liegt das tatsaechliche
+Lautende 400 ms, bei kandidat-06 300 ms nach der Marke - beides deutlich
+ueber :data:`WORTENDE_SUCHE_MS`. Die Suche folgt dem lauten Lauf deshalb bei
+Bedarf weiter, bis maximal 800 ms - reichlich Sicherheitsabstand ueber der
+groessten im Befund gemessenen Abweichung (400 ms), dieselbe Groessenordnung
+wie der Sicherheitsdeckel des Stillevorlaufs (:data:`VORLAUF_SUCHE_MAX_MS`).
+Erst danach greift :data:`WORTENDE_FALLBACK_MS`."""
+
+START_EINSATZ_SUCHE_MS = 120
+"""Hoechste Vorwaertsverschiebung der Startgrenze auf den tatsaechlichen
+Lauteinsatz des ersten enthaltenen Wortes (Auftrag shorts-pegel-wortgrenze,
+TEIL 3/Nachtrag N1). Stellwert, hergeleitet aus der gemessenen systematischen
+Frueh-Abweichung der whisper-Wortanfaenge von 35 bis 65 ms (Befund, Abschnitt
+1.7), mit Sicherheitsabstand - kein Geschmackswert."""
+
+EINSATZ_BESTAETIGUNG_MS = 30
+"""Mindestlaenge eines durchgehend lauten Laufs, damit :func:`finde_worteinsatz_ton`
+ihn als echten Worteinsatz gelten laesst statt als kurzes Stoergeraeusch
+(Klick, Atmer) - deutlich kuerzer als jedes gesprochene Wort, aber laenger als
+ein einzelner 10-ms-Ausreisser."""
+
+WORTENDE_UNTERBRECHUNG_MAX_MS = 20
+"""Toleranz fuer :func:`finde_wortende_ton`, um einzelne Rauschausreisser NICHT
+schon als Lautende zu werten - bewusst NICHT :data:`STILLE_UNTERBRECHUNG_MAX_MS`
+(120 ms): jener Wert ist fuer den Stillevorlauf kalibriert, wo echte Pausen
+hunderte ms bis Sekunden dauern und kurze Betonungsspitzen ueberbrueckt werden
+muessen. An einer Wortgrenze sind die echten Pausen selbst kurz (Befund,
+Tabelle 1.2: 0-170 ms) - eine 120-ms-Toleranz wuerde genau diese echten,
+kurzen Pausen ueberbruecken und die Suche in den naechsten Satz hineinlaufen
+lassen (gemessen bei kandidat-00: die echte 40-ms-Pause nach "richtig?" wird
+mit 120 ms Toleranz uebersprungen, das Lautende landet 420 ms spaeter im
+naechsten Satz). 20 ms liegt klar unter den gemessenen echten Pausen (kuerzeste
+40 ms) und klar ueber einzelnen 10-ms-Rauschbloecken."""
+
+assert WORTENDE_SUCHE_MS % STEP_MS == 0, "WORTENDE_SUCHE_MS muss ein Vielfaches von STEP_MS sein"
+# WORTENDE_FALLBACK_MS (65) ist bewusst KEIN Vielfaches von STEP_MS: es ist ein
+# Additionsterm auf eine whisper-Millisekundenmarke, die selbst nicht auf dem
+# 10-ms-Messraster liegt - keine Rasterbedingung noetig.
+assert START_EINSATZ_SUCHE_MS % STEP_MS == 0, (
+    "START_EINSATZ_SUCHE_MS muss ein Vielfaches von STEP_MS sein"
+)
+assert EINSATZ_BESTAETIGUNG_MS % STEP_MS == 0, (
+    "EINSATZ_BESTAETIGUNG_MS muss ein Vielfaches von STEP_MS sein"
+)
+assert WORTENDE_SUCHE_MAX_MS % STEP_MS == 0, (
+    "WORTENDE_SUCHE_MAX_MS muss ein Vielfaches von STEP_MS sein"
+)
+assert WORTENDE_SUCHE_MAX_MS >= WORTENDE_SUCHE_MS, (
+    "WORTENDE_SUCHE_MAX_MS muss mindestens WORTENDE_SUCHE_MS sein"
+)
+assert WORTENDE_UNTERBRECHUNG_MAX_MS % STEP_MS == 0, (
+    "WORTENDE_UNTERBRECHUNG_MAX_MS muss ein Vielfaches von STEP_MS sein"
+)
+
+
+def _sprechpegel_aus_fenster(finite_levels: Sequence[float]) -> float:
+    """Sprechpegel eines (kleinen) Fensters.
+
+    Energetisches Mittel der lauteren Haelfte aller endlichen Pegel -
+    dieselbe Definition wie in :func:`finde_stillevorlauf` (dort mit voller
+    Begruendung), hier auf ein enges Wortgrenzenfenster angewandt.
+    """
+    laute_haelfte = sorted(finite_levels, reverse=True)
+    laute_haelfte = laute_haelfte[: max(1, len(laute_haelfte) // 2)]
+    return _mean_level_db(laute_haelfte)
+
+
+def _folge_bis_wechsel(
+    levels: Sequence[float],
+    start_index: int,
+    threshold_db: float,
+    *,
+    ab_index_laut: bool,
+    toleranz_bloecke: int,
+) -> int | None:
+    """Suche ab ``start_index`` den ersten DAUERHAFTEN Wechsel in den anderen Zustand.
+
+    Verallgemeinert :func:`_stillebereich_laenge` auf beide Richtungen: laut
+    zu leise fuer Lautende/Ausklang (:func:`finde_wortende_ton`), leise zu
+    laut fuer den Worteinsatz (:func:`finde_worteinsatz_ton`). Kurze
+    Ausreisser bis ``toleranz_bloecke`` im jeweils anderen Zustand werden
+    ueberbrueckt, wie dort.
+
+    Gibt den Index des ERSTEN Blocks im neuen, dauerhaften Zustand zurueck -
+    das ist genau die gesuchte Grenze (erster leiser Block = Lautende, erster
+    lauter Block = Worteinsatz) - oder ``None``, wenn kein dauerhafter Wechsel
+    innerhalb der Liste liegt.
+    """
+    index = start_index
+    while index < len(levels):
+        is_loud = levels[index] >= threshold_db
+        if is_loud == ab_index_laut:
+            index += 1
+            continue
+        lauf_start = index
+        while index < len(levels) and (levels[index] >= threshold_db) != ab_index_laut:
+            index += 1
+        if index - lauf_start > toleranz_bloecke:
+            return lauf_start
+    return None
+
+
+def finde_wortende_ton(
+    media_path: Path,
+    whisper_end_ms: int,
+    *,
+    ffmpeg_path: Path,
+    erweiterte_suche: bool = True,
+    timeout_seconds: int = 120,
+    process_runner: ProcessRunner | None = None,
+) -> int:
+    """Bestimme das tatsaechliche Lautende/den tatsaechlichen Ausklang am Ton.
+
+    Auftrag shorts-pegel-wortgrenze, Nachtrag N1. Dient zwei Zwecken mit
+    demselben Verfahren: als Untergrenze der ENDgrenze eines Kandidaten
+    (``whisper_end_ms`` = Whisper-Endmarke des letzten enthaltenen Wortes,
+    ``erweiterte_suche=True``, Vorgabe) und als Untergrenze der STARTgrenze
+    (``whisper_end_ms`` = Whisper-Endmarke des VORIGEN Wortes - "der gemessene
+    Ausklang des Vorgaengerwortes", ``erweiterte_suche=False``).
+
+    ``erweiterte_suche=False`` deckelt die Vorwaertssuche auf
+    :data:`WORTENDE_SUCHE_MS` (keine Verlaengerung bis
+    :data:`WORTENDE_SUCHE_MAX_MS`): geht die Suche als Ausklang des VORIGEN
+    Wortes in eine Kandidatenspanne OHNE Pause hinein (Regelfall, Befund
+    Tabelle 1.2: 9 von 12 Grenzen 0 ms), gibt es dort keinen "Ausklang" im
+    eigentlichen Sinn - das naechste Wort schliesst nahtlos an, und die neue
+    Rede laeuft ungebremst weiter. Eine unbeschraenkte Suche wuerde dann nicht
+    "den Ausklang", sondern irgendeine spaetere, thematisch fremde Pause
+    finden (gemessen bei kandidat-01: 470 ms nach der Marke, mitten im
+    naechsten Satz) - kein sinnvoller Bezug fuer die Startgrenze. Fuer die
+    ENDgrenze eines Kandidaten (``erweiterte_suche=True``) gilt das nicht:
+    dort IST das gesuchte Lautende per Definition irgendwo nach der Marke,
+    auch wenn es (kandidat-04, kandidat-06) mehrere hundert ms entfernt liegt.
+
+    Verfahren (im Zweiband-Maximum aus Sprach- und Hochband, siehe
+    :func:`_fetch_zweiband_levels` - das Sprachband allein uebersieht
+    Reibe-/Verschlusslaute am Wortrand, Befund Abschnitt 1.8, dieselben
+    10-ms-Bloecke/40-ms-Ausschnitte wie :func:`verschiebe_auf_leiseste_stelle`):
+    der Sprechpegel des Fensters ``[whisper_end_ms - WORTENDE_SUCHE_MS,
+    whisper_end_ms + WORTENDE_SUCHE_MS]`` wird als energetisches Mittel der
+    lauteren Haelfte bestimmt (wie :func:`finde_stillevorlauf`), die Schwelle
+    liegt :data:`STILLE_ABSTAND_DB` darunter. Steht die Whisper-Marke selbst
+    schon unter der Schwelle, ist der Ton dort bereits leise - keine
+    Korrektur noetig, die Marke selbst gilt als Lautende. Steht sie darueber
+    (der Regelfall), wird vorwaerts verfolgt, bis der Pegel DAUERHAFT (laenger
+    als :data:`WORTENDE_UNTERBRECHUNG_MAX_MS`, kurze Aussetzer werden
+    ueberbrueckt - siehe dort, warum bewusst NICHT die groessere Toleranz des
+    Stillevorlaufs) unter die Schwelle faellt; der erste leise Block dieses
+    dauerhaften Uebergangs ist das Lautende. Bleibt der Ton ueber
+    :data:`WORTENDE_SUCHE_MS` hinaus laut
+    (durchlaufende Rede ohne Pause an der Whisper-Marke, Befund Abschnitt
+    1.7), folgt die Suche dem lauten Lauf weiter, hoechstens bis
+    :data:`WORTENDE_SUCHE_MAX_MS` - genau der Fall bei kandidat-04 (reale
+    Pause 400 ms nach der Marke) und kandidat-06 (300 ms).
+
+    Findet sich auch innerhalb von :data:`WORTENDE_SUCHE_MAX_MS` kein
+    dauerhafter Uebergang, gilt ``whisper_end_ms + WORTENDE_FALLBACK_MS`` als
+    konservative Untergrenze - kein Ausweichen, keine Naeherung ueber diesen
+    Stellwert hinaus.
+
+    Gibt IMMER einen Wert zurueck (nie ``None``) - eine fehlgeschlagene
+    Tonmessung wirft weiterhin :class:`LevelCutFailed`, wie im ganzen Modul.
+    """
+    runner = process_runner if process_runner is not None else _default_process_runner
+    vorwaerts_ms = WORTENDE_SUCHE_MAX_MS if erweiterte_suche else WORTENDE_SUCHE_MS
+    fetch_start_ms = max(0, whisper_end_ms - WORTENDE_SUCHE_MS - MEASURE_MS // 2)
+    fetch_duration_ms = WORTENDE_SUCHE_MS + vorwaerts_ms + MEASURE_MS
+    levels = _fetch_zweiband_levels(
+        media_path,
+        fetch_start_ms=fetch_start_ms,
+        fetch_duration_ms=fetch_duration_ms,
+        ffmpeg_path=ffmpeg_path,
+        timeout_seconds=timeout_seconds,
+        process_runner=runner,
+        context="Wortende/Ausklang",
+    )
+    # Der Sprechpegel (Kontext fuer die Schwelle) stuetzt sich nur auf das
+    # engere Kontextfenster [-WORTENDE_SUCHE_MS, +WORTENDE_SUCHE_MS] - der
+    # erweiterte Sicherheitsbereich danach gehoert noch zum selben Wort und
+    # wuerde den Sprechpegel nur (richtig) erhoehen, ist aber fuer die
+    # Schwellenbestimmung nicht noetig.
+    kontext_bloecke = 2 * WORTENDE_SUCHE_MS // STEP_MS + 1
+    finite_levels = [level for level in levels[:kontext_bloecke] if level != -math.inf]
+    if not finite_levels:
+        return whisper_end_ms + WORTENDE_FALLBACK_MS
+
+    sprechpegel_db = _sprechpegel_aus_fenster(finite_levels)
+    threshold_db = sprechpegel_db - STILLE_ABSTAND_DB
+    anchor_index = round((whisper_end_ms - fetch_start_ms - MEASURE_MS // 2) / STEP_MS)
+    anchor_index = max(0, min(len(levels) - 1, anchor_index))
+
+    if levels[anchor_index] < threshold_db:
+        # An der Whisper-Marke ist es bereits leise - kein Nachlauf noetig.
+        return whisper_end_ms
+
+    toleranz_bloecke = WORTENDE_UNTERBRECHUNG_MAX_MS // STEP_MS
+    idx = _folge_bis_wechsel(
+        levels, anchor_index, threshold_db, ab_index_laut=True, toleranz_bloecke=toleranz_bloecke
+    )
+    if idx is None:
+        return whisper_end_ms + WORTENDE_FALLBACK_MS
+    return fetch_start_ms + idx * STEP_MS + MEASURE_MS // 2
+
+
+def finde_worteinsatz_ton(
+    media_path: Path,
+    whisper_start_ms: int,
+    *,
+    ffmpeg_path: Path,
+    nicht_vor_ms: int | None = None,
+    timeout_seconds: int = 120,
+    process_runner: ProcessRunner | None = None,
+) -> int:
+    """Bestimme den tatsaechlichen Lauteinsatz eines Wortes am Ton (TEIL 3).
+
+    Auftrag shorts-pegel-wortgrenze, Nachtrag N1: whisper-Wortanfaenge liegen
+    systematisch 35-65 ms zu frueh (Befund, Abschnitt 1.7); diese Funktion
+    sucht, hoechstens bis ``whisper_start_ms + START_EINSATZ_SUCHE_MS``, nach
+    dem Punkt, an dem der Ton dauerhaft (laenger als
+    :data:`EINSATZ_BESTAETIGUNG_MS`, um einzelne Stoergeraeusche nicht als
+    Einsatz zu werten) ueber die Schwelle (Sprechpegel des Fensters minus
+    :data:`STILLE_ABSTAND_DB`) steigt. Gemessen wird NUR im Sprachband
+    (200-3400 Hz, nicht im Zweiband-Maximum wie :func:`finde_wortende_ton`):
+    das Hochband traegt den ABKLINGENDEN Reibelaut des Vorgaengerwortes oft
+    noch weit in den Suchbereich hinein (kandidat-01: Hochband bleibt bis
+    63075 erhoeht) und wuerde die Suche dadurch gerade dort blind machen, wo
+    der wahre Einsatz des NEUEN Wortes liegt - im Sprachband zeigt sich dieser
+    dagegen klar (Befund, Abschnitt 1.6: Sprung von -39.7 auf -20.8 dB).
+
+    ``nicht_vor_ms`` (typischerweise der Rueckgabewert von
+    :func:`finde_wortende_ton` fuer das VORIGE Wort): die Suche beginnt
+    fruehestens dort, nie vor ``whisper_start_ms``. Ohne diese Verankerung
+    wuerde die Suche oft schon an der Whisper-Marke selbst abbrechen, weil
+    dort noch der Ausklang des Vorgaengerwortes steht (laut genug, um die
+    Schwelle zu ueberschreiten) - das waere dann faelschlich "hier ist schon
+    Ton", obwohl es der FALSCHE, alte Ton ist.
+
+    Steht die Marke, ab der gesucht wird, selbst schon ueber der Schwelle,
+    ist dort bereits Ton - kein Vorruecken noetig, ``whisper_start_ms`` bleibt
+    der Einsatz. Findet sich innerhalb der Suchweite kein dauerhafter Einsatz,
+    bleibt ``whisper_start_ms`` selbst die Obergrenze (TEIL 3: "Findest du
+    keinen klaren Einsatz ... bleibt die Grenze stehen") - keine Naeherung
+    nach vorn ohne klaren Beleg am Ton.
+
+    Der Sprechpegel (und damit die Schwelle) wird bewusst NICHT nur aus dem
+    schmalen Vorwaertsfenster bestimmt, sondern wie bei
+    :func:`finde_wortende_ton` aus einem um :data:`WORTENDE_SUCHE_MS`
+    RUECKWAERTS erweiterten Fenster (robust auf klarer Rede vor der Marke) -
+    ein rein lokales Fenster kann selbst ueberwiegend aus dem leisen
+    Ausklang bestehen und liefert dann einen kuenstlich zu nachsichtigen
+    Sprechpegel.
+
+    Gibt IMMER einen Wert zurueck (nie ``None``).
+    """
+    runner = process_runner if process_runner is not None else _default_process_runner
+    fetch_start_ms = max(0, whisper_start_ms - WORTENDE_SUCHE_MS - MEASURE_MS // 2)
+    fetch_duration_ms = WORTENDE_SUCHE_MS + START_EINSATZ_SUCHE_MS + MEASURE_MS
+    levels = _fetch_measured_levels(
+        media_path,
+        fetch_start_ms=fetch_start_ms,
+        fetch_duration_ms=fetch_duration_ms,
+        ffmpeg_path=ffmpeg_path,
+        timeout_seconds=timeout_seconds,
+        process_runner=runner,
+        context="Worteinsatz",
+    )
+    finite_levels = [level for level in levels if level != -math.inf]
+    if not finite_levels:
+        return whisper_start_ms
+
+    sprechpegel_db = _sprechpegel_aus_fenster(finite_levels)
+    threshold_db = sprechpegel_db - STILLE_ABSTAND_DB
+    such_ab_ms = whisper_start_ms if nicht_vor_ms is None else max(whisper_start_ms, nicht_vor_ms)
+    anchor_index = round((such_ab_ms - fetch_start_ms - MEASURE_MS // 2) / STEP_MS)
+    anchor_index = max(0, min(len(levels) - 1, anchor_index))
+
+    if levels[anchor_index] >= threshold_db:
+        # An der Marke, ab der gesucht wird, ist bereits Ton.
+        return min(such_ab_ms, whisper_start_ms + START_EINSATZ_SUCHE_MS)
+
+    toleranz_bloecke = EINSATZ_BESTAETIGUNG_MS // STEP_MS
+    idx = _folge_bis_wechsel(
+        levels, anchor_index, threshold_db, ab_index_laut=False, toleranz_bloecke=toleranz_bloecke
+    )
+    if idx is None:
+        return whisper_start_ms
+    onset_ms = fetch_start_ms + idx * STEP_MS + MEASURE_MS // 2
+    return min(onset_ms, whisper_start_ms + START_EINSATZ_SUCHE_MS)
+
+
 def verschiebe_auf_leiseste_stelle(
     media_path: Path,
     mark_ms: int,
@@ -691,6 +1073,8 @@ def verschiebe_auf_leiseste_stelle(
     ffmpeg_path: Path,
     nur_rueckwaerts: bool = False,
     search_window_start_ms: int | None = None,
+    such_min_ms: int | None = None,
+    such_max_ms: int | None = None,
     timeout_seconds: int = 120,
     process_runner: ProcessRunner | None = None,
 ) -> LevelSnap:
@@ -715,8 +1099,29 @@ def verschiebe_auf_leiseste_stelle(
     mit Suchweite :data:`SEARCH_WINDOW_MS`; ``search_window_start_ms`` wirkt
     dort nicht.
 
+    ``such_min_ms``/``such_max_ms`` (Auftrag shorts-pegel-wortgrenze, Nachtrag
+    N1/N2, je einzeln optional): harte, am Ton gemessene Schranken - die
+    korrigierte Marke liegt niemals frueher als ``such_min_ms`` und niemals
+    spaeter als ``such_max_ms``. Stellen ausserhalb ``[such_min_ms,
+    such_max_ms]`` werden von der Auswahl ausgeschlossen. Das Suchfenster wird
+    dazu NUR in der Richtung erweitert, in der die jeweilige Schranke
+    tatsaechlich liegt - ``such_min_ms`` (Untergrenze) weitet das Fenster
+    hoechstens VORWAERTS aus (relevant fuer die ENDgrenze, deren gemessenes
+    Lautende mehrere hundert ms nach der Marke liegen kann), ``such_max_ms``
+    (Obergrenze) hoechstens RUECKWAERTS. NIE in die jeweils andere Richtung:
+    eine rueckwaertige Ausweitung fuer ``such_min_ms`` wuerde sonst genau dort
+    suchen, wo :func:`finde_stillevorlauf` bewusst eine lange Stille
+    uebersprungen hat, und diese Verschiebung wieder rueckgaengig machen.
+    Wird das Fenster dadurch leer (``such_max_ms <= such_min_ms`` oder keine
+    Messstelle passt hinein), bleibt die Marke UNVERAENDERT stehen
+    (:data:`VERFAHREN_WORTGRENZE_STEHT`) - kein Ausweichen, keine Naeherung.
+    Ohne beide Parameter (Vorgabe, ``None``) ist das Verhalten exakt wie zuvor
+    - der alte Aufrufweg ohne Wortgrenzen bleibt unveraendert.
+
     Wirft :class:`LevelCutFailed`, wenn ffmpeg scheitert oder das Fenster keine
-    einzige vollstaendige Messung hergibt. KEIN Rueckfall auf ``mark_ms``.
+    einzige vollstaendige Messung hergibt. KEIN Rueckfall auf ``mark_ms``
+    (ausser im ausdruecklich benannten ``such_min_ms``/``such_max_ms``-Fall
+    oben).
     """
     if mark_ms < 0:
         raise LevelCutFailed("marke_negativ", f"Zeitmarke liegt vor Dateianfang: {mark_ms} ms")
@@ -735,6 +1140,25 @@ def verschiebe_auf_leiseste_stelle(
 
     # Der erste 40-ms-Ausschnitt liegt mittig um (mark - window_before_ms),
     # beginnt also eine halbe Ausschnittslaenge davor.
+    fetch_lo_ms = mark_ms - window_before_ms
+    fetch_hi_ms = mark_ms + window_after_ms
+    # such_min_ms ist eine UNTERGRENZE des Ergebnisses - das Fenster muss nur
+    # so weit VORWAERTS reichen, dass such_min_ms ueberhaupt eine gueltige
+    # Messstelle ist (relevant fuer die ENDgrenze, wo das gemessene Lautende
+    # mehrere hundert ms nach der Marke liegen kann). NIE rueckwaerts
+    # ausweiten: rueckwaerts ist such_min_ms nur eine Schranke, keine Suche -
+    # eine Ausweitung wuerde sonst gerade dort suchen, wo Stillevorlauf
+    # (Auftrag shorts-stillevorlauf) bewusst eine lange Stille uebersprungen
+    # hat, und diese Verschiebung wieder rueckgaengig machen.
+    if such_min_ms is not None and such_min_ms > fetch_hi_ms:
+        fetch_hi_ms = such_min_ms
+    # such_max_ms spiegelbildlich: nur so weit RUECKWAERTS ausweiten, dass es
+    # ueberhaupt eine gueltige Messstelle gibt, nie vorwaerts.
+    if such_max_ms is not None and such_max_ms < fetch_lo_ms:
+        fetch_lo_ms = such_max_ms
+    window_before_ms = max(0, mark_ms - fetch_lo_ms)
+    window_after_ms = max(0, fetch_hi_ms - mark_ms)
+
     fetch_start_ms = max(0, mark_ms - window_before_ms - MEASURE_MS // 2)
     fetch_duration_ms = window_before_ms + window_after_ms + MEASURE_MS
 
@@ -778,9 +1202,44 @@ def verschiebe_auf_leiseste_stelle(
             f"Tonspur ist im Fenster um {mark_ms} ms durchgehend stumm: {media_path}",
         )
 
-    chosen, verfahren, quiet_region_ms = _choose_cut_point(levels)
     # Stelle i misst mittig um (fetch_start + i*STEP + MEASURE_MS/2).
-    corrected_ms = fetch_start_ms + chosen * STEP_MS + MEASURE_MS // 2
+    def _position(index: int) -> int:
+        return fetch_start_ms + index * STEP_MS + MEASURE_MS // 2
+
+    # "such_max_ms <= such_min_ms" ist IMMER ein leeres Fenster (Pause null
+    # oder negativ) - unabhaengig davon, ob zufaellig eine einzelne Messstelle
+    # genau auf diesen einen Punkt faellt.
+    leeres_fenster = (
+        such_min_ms is not None and such_max_ms is not None and such_max_ms <= such_min_ms
+    )
+
+    lo_idx = 0
+    hi_idx = len(levels) - 1
+    if such_min_ms is not None:
+        # kleinster Index mit Position >= such_min_ms (Aufrundung).
+        offset = such_min_ms - fetch_start_ms - MEASURE_MS // 2
+        lo_idx = max(lo_idx, -(-offset // STEP_MS))
+    if such_max_ms is not None:
+        # groesster Index mit Position <= such_max_ms (Abrundung).
+        offset = such_max_ms - fetch_start_ms - MEASURE_MS // 2
+        hi_idx = min(hi_idx, offset // STEP_MS)
+
+    if leeres_fenster or ((such_min_ms is not None or such_max_ms is not None) and lo_idx > hi_idx):
+        nearest = min(range(len(levels)), key=lambda i: abs(_position(i) - mark_ms))
+        return LevelSnap(
+            original_ms=mark_ms,
+            corrected_ms=mark_ms,
+            shift_ms=0,
+            level_db=levels[nearest],
+            window_mean_db=_mean_level_db(levels),
+            verfahren=VERFAHREN_WORTGRENZE_STEHT,
+            quiet_region_ms=0,
+        )
+
+    sub_levels = levels[lo_idx : hi_idx + 1]
+    chosen_sub, verfahren, quiet_region_ms = _choose_cut_point(sub_levels)
+    chosen = chosen_sub + lo_idx
+    corrected_ms = _position(chosen)
     return LevelSnap(
         original_ms=mark_ms,
         corrected_ms=corrected_ms,

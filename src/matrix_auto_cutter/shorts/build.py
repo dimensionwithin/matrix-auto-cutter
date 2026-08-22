@@ -86,15 +86,19 @@ from matrix_auto_cutter.shorts.frame_map import (
 from matrix_auto_cutter.shorts.inventory import discover_ffprobe
 from matrix_auto_cutter.shorts.level_cut import (
     VERFAHREN_BEREICHSMITTE,
+    VERFAHREN_WORT_EINSATZ,
     LevelCutFailed,
     LevelSnap,
     StilleVorlauf,
     finde_stillevorlauf,
+    finde_worteinsatz_ton,
+    finde_wortende_ton,
     verschiebe_auf_leiseste_stelle,
 )
 from matrix_auto_cutter.shorts.loop_point import (
     GEEIGNET,
     GRENZWERTIG,
+    LOOP_PAD_MS,
     MIN_SPAN_MS,
     LoopBoundaries,
     LoopPointError,
@@ -1301,11 +1305,41 @@ def _apply_level_correction(
     mehrere Werte gegeneinander baut, ohne diese Funktion zu verdoppeln. Die
     ENDgrenze ist davon unberuehrt.
 
+    Auftrag shorts-pegel-wortgrenze, Nachtrag N1/TEIL 3: aus ``boundaries``
+    (die ``rasten_auf_wortgrenzen`` bereits aus der Wortliste des ganzen
+    Videos berechnet hat, samt ``pause_before_ms``/``pause_after_ms``) werden
+    die REINEN Wortgrenzen (ohne :data:`loop_point.LOOP_PAD_MS`-Polster)
+    zurueckgerechnet und daraus am TON gemessene Schranken bestimmt -
+    :func:`level_cut.finde_wortende_ton` (Lautende der Endgrenze, Ausklang des
+    Vorgaengerwortes fuer die Startgrenze) und
+    :func:`level_cut.finde_worteinsatz_ton` (Einsatz des ersten enthaltenen
+    Wortes, TEIL 3). Der jeweilige Ausklang geht als ``such_min_ms`` an
+    :func:`verschiebe_auf_leiseste_stelle`: die leiseste-Stelle-Suche darf eine
+    Grenze nicht mehr VOR das gemessene Lautende schieben. Der Worteinsatz
+    (nur an der Startgrenze) ist dagegen ein ZIEL, keine blosse obere Schranke
+    fuer dieselbe Suche - eine Schranke wuerde nur verhindern, dass die Suche
+    darueber hinaus waehlt, sie aber nicht dorthin zwingen; liegt der Einsatz
+    spaeter als das (weiterhin nur rueckwaerts gesuchte) Ergebnis der
+    Pegelkorrektur, wird er stattdessen uebernommen (:data:`level_cut.VERFAHREN_WORT_EINSATZ`).
+    LOOP_PAD_MS selbst bleibt unveraendert (VERBOTEN, siehe Auftrag).
+
     Schlaegt eine Messung fehl, bleiben die gerasteten Grenzen stehen und der
     Kandidat wird "ohne Pegelkorrektur" gebaut: Ein Messfehler soll keinen
     Kandidaten kosten. Die Module selbst fallen nicht still zurueck - der
     Rueckfall wird hier bewusst und vermerkt entschieden.
     """
+    # Die reinen (ungepolsterten) Wortgrenzen aus den gemessenen Pausen
+    # zurueckrechnen - siehe loop_point.rasten_auf_wortgrenzen:
+    # padded_start = new_start - min(LOOP_PAD_MS, pause_before_ms)
+    # padded_end   = new_end   + min(LOOP_PAD_MS, pause_after_ms)
+    pause_before_ms = boundaries.pause_before_ms
+    pause_after_ms = boundaries.pause_after_ms
+    start_pad_ms = LOOP_PAD_MS if pause_before_ms is None else min(LOOP_PAD_MS, pause_before_ms)
+    end_pad_ms = LOOP_PAD_MS if pause_after_ms is None else min(LOOP_PAD_MS, pause_after_ms)
+    new_start_ms = boundaries.start_ms + start_pad_ms
+    new_end_ms = boundaries.end_ms - end_pad_ms
+    prev_word_end_ms = None if pause_before_ms is None else new_start_ms - pause_before_ms
+
     effective_start_ms = boundaries.start_ms
     stille_ergebnis: StilleVorlauf | None = None
     try:
@@ -1320,18 +1354,56 @@ def _apply_level_correction(
             if stille_ergebnis.verschoben:
                 effective_start_ms = stille_ergebnis.corrected_ms
 
+        start_floor_ms = None
+        if prev_word_end_ms is not None:
+            start_floor_ms = finde_wortende_ton(
+                rendered_video_path,
+                prev_word_end_ms,
+                ffmpeg_path=ffmpeg_path,
+                erweiterte_suche=False,
+                timeout_seconds=LEVEL_CUT_TIMEOUT_SECONDS,
+            )
+        start_ceiling_ms = finde_worteinsatz_ton(
+            rendered_video_path,
+            new_start_ms,
+            ffmpeg_path=ffmpeg_path,
+            nicht_vor_ms=start_floor_ms,
+            timeout_seconds=LEVEL_CUT_TIMEOUT_SECONDS,
+        )
+        end_floor_ms = finde_wortende_ton(
+            rendered_video_path,
+            new_end_ms,
+            ffmpeg_path=ffmpeg_path,
+            timeout_seconds=LEVEL_CUT_TIMEOUT_SECONDS,
+        )
+
         start_snap = verschiebe_auf_leiseste_stelle(
             rendered_video_path,
             effective_start_ms,
             ffmpeg_path=ffmpeg_path,
             nur_rueckwaerts=True,
             search_window_start_ms=search_window_start_ms,
+            such_min_ms=start_floor_ms,
             timeout_seconds=LEVEL_CUT_TIMEOUT_SECONDS,
         )
+        # TEIL 3: der gemessene Worteinsatz ist ein ZIEL, keine blosse obere
+        # Schranke fuer die leiseste-Stelle-Suche - eine Schranke allein wuerde
+        # nur verhindern, dass die Suche DARUEBER hinaus waehlt, sie zwingt sie
+        # aber nicht dorthin. Liegt der Einsatz spaeter als das Ergebnis der
+        # (weiterhin nur rueckwaerts suchenden) Pegelkorrektur, gewinnt er.
+        if start_ceiling_ms > start_snap.corrected_ms:
+            start_snap = replace(
+                start_snap,
+                corrected_ms=start_ceiling_ms,
+                shift_ms=start_ceiling_ms - start_snap.original_ms,
+                verfahren=VERFAHREN_WORT_EINSATZ,
+                quiet_region_ms=0,
+            )
         end_snap = verschiebe_auf_leiseste_stelle(
             rendered_video_path,
             boundaries.end_ms,
             ffmpeg_path=ffmpeg_path,
+            such_min_ms=end_floor_ms,
             timeout_seconds=LEVEL_CUT_TIMEOUT_SECONDS,
         )
     except LevelCutFailed as exc:

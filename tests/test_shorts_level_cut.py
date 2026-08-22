@@ -19,19 +19,27 @@ from matrix_auto_cutter.shorts.level_cut import (
     MIN_PAUSE_MS,
     SEARCH_WINDOW_MS,
     SEARCH_WINDOW_START_MS,
+    START_EINSATZ_SUCHE_MS,
     STEP_MS,
     STILLE_ABSTAND_DB,
     STILLE_UNTERBRECHUNG_MAX_MS,
     TIE_TOLERANCE_DB,
     VERFAHREN_BEREICHSMITTE,
     VERFAHREN_TIEFSTER_PUNKT,
+    VERFAHREN_WORTGRENZE_STEHT,
     VORLAUF_MAX_MS,
     VORLAUF_REST_MS,
     VORLAUF_SUCHE_MAX_MS,
+    WORTENDE_FALLBACK_MS,
+    WORTENDE_SUCHE_MAX_MS,
+    WORTENDE_SUCHE_MS,
+    WORTENDE_UNTERBRECHUNG_MAX_MS,
     LevelCutFailed,
     ProcessResult,
     _combine_to_measure_window,
     finde_stillevorlauf,
+    finde_worteinsatz_ton,
+    finde_wortende_ton,
     verschiebe_auf_leiseste_stelle,
 )
 
@@ -817,3 +825,257 @@ def test_stillevorlauf_stumme_spanne_haelt_an() -> None:
         finde_stillevorlauf(MEDIA, 10_000, 30_000, ffmpeg_path=FFMPEG, process_runner=runner)
 
     assert excinfo.value.code == "kein_ton"
+
+
+# ---------------------------------------------------------------------------
+# Auftrag shorts-pegel-wortgrenze (TEIL 2/3, Nachtrag N1/N2):
+# such_min_ms/such_max_ms auf verschiebe_auf_leiseste_stelle.
+# ---------------------------------------------------------------------------
+
+
+def test_alter_aufrufweg_ohne_wortgrenzen_unveraendert() -> None:
+    """Ohne such_min_ms/such_max_ms verhaelt sich die Funktion exakt wie vor
+    dem Nachtrag - Pruefstein "der alte Aufrufweg ist unveraendert"."""
+    mark_ms = 10_000
+    dip_at_index = (SEARCH_WINDOW_MS + 100) // STEP_MS
+    levels = _flat_with_dip(dip_at_index)
+
+    ohne_neue_parameter = verschiebe_auf_leiseste_stelle(
+        MEDIA, mark_ms, ffmpeg_path=FFMPEG, process_runner=_runner_for(levels)
+    )
+    mit_none_explizit = verschiebe_auf_leiseste_stelle(
+        MEDIA,
+        mark_ms,
+        ffmpeg_path=FFMPEG,
+        such_min_ms=None,
+        such_max_ms=None,
+        process_runner=_runner_for(levels),
+    )
+
+    assert ohne_neue_parameter == mit_none_explizit
+    assert ohne_neue_parameter.shift_ms == 100
+    assert ohne_neue_parameter.verfahren == VERFAHREN_TIEFSTER_PUNKT
+
+
+def test_such_grenzen_pause_null_verschiebt_nicht() -> None:
+    """TEIL 2: such_max_ms <= such_min_ms (Pause null) - die Marke bleibt
+    UNVERAENDERT stehen, kein Ausweichen, keine Naeherung."""
+    mark_ms = 10_000
+    runner = _runner_for(_flat_with_dip((SEARCH_WINDOW_MS + 100) // STEP_MS))
+
+    snap = verschiebe_auf_leiseste_stelle(
+        MEDIA,
+        mark_ms,
+        ffmpeg_path=FFMPEG,
+        such_min_ms=mark_ms,
+        such_max_ms=mark_ms,
+        process_runner=runner,
+    )
+
+    assert snap.corrected_ms == mark_ms
+    assert snap.shift_ms == 0
+    assert snap.verfahren == VERFAHREN_WORTGRENZE_STEHT
+
+
+def test_such_grenzen_negative_pause_verschiebt_nicht() -> None:
+    """such_max_ms < such_min_ms (die Pause ist rechnerisch negativ) - dasselbe
+    Verhalten wie bei Pause null."""
+    mark_ms = 10_000
+    runner = _runner_for(_flat_with_dip((SEARCH_WINDOW_MS + 100) // STEP_MS))
+
+    snap = verschiebe_auf_leiseste_stelle(
+        MEDIA,
+        mark_ms,
+        ffmpeg_path=FFMPEG,
+        such_min_ms=mark_ms + 20,
+        such_max_ms=mark_ms - 20,
+        process_runner=runner,
+    )
+
+    assert snap.corrected_ms == mark_ms
+    assert snap.shift_ms == 0
+    assert snap.verfahren == VERFAHREN_WORTGRENZE_STEHT
+
+
+def test_such_grenzen_ueber_200ms_verschiebt_wie_bisher() -> None:
+    """Eine Pause ueber 200 ms schraenkt die Suche nicht ein - dieselbe
+    leiseste Stelle wie ohne such_min_ms/such_max_ms."""
+    mark_ms = 10_000
+    dip_at_index = (SEARCH_WINDOW_MS + 100) // STEP_MS
+    levels = _flat_with_dip(dip_at_index)
+
+    unclamped = verschiebe_auf_leiseste_stelle(
+        MEDIA, mark_ms, ffmpeg_path=FFMPEG, process_runner=_runner_for(levels)
+    )
+    # Bewusst innerhalb von SEARCH_WINDOW_MS (250 ms): eine WEITERE Schranke
+    # wuerde das Fenster erweitern und damit einen zweiten ffmpeg-Aufruf mit
+    # einer anderen Blockzahl noetig machen, als dieser gefakte Runner liefert
+    # - hier geht es nur darum, dass Schranken ueber 200 ms das Ergebnis nicht
+    # beeinflussen, nicht um die Fenstererweiterung selbst.
+    clamped = verschiebe_auf_leiseste_stelle(
+        MEDIA,
+        mark_ms,
+        ffmpeg_path=FFMPEG,
+        such_min_ms=mark_ms - 220,
+        such_max_ms=mark_ms + 220,
+        process_runner=_runner_for(levels),
+    )
+
+    assert clamped.corrected_ms == unclamped.corrected_ms == mark_ms + 100
+    assert clamped.verfahren == unclamped.verfahren == VERFAHREN_TIEFSTER_PUNKT
+
+
+# ---------------------------------------------------------------------------
+# Auftrag shorts-pegel-wortgrenze, Nachtrag N1: finde_wortende_ton /
+# finde_worteinsatz_ton.
+# ---------------------------------------------------------------------------
+
+
+def _wortende_raw_blocks(*, erweitert: bool = True) -> int:
+    vorwaerts_ms = WORTENDE_SUCHE_MAX_MS if erweitert else WORTENDE_SUCHE_MS
+    fetch_duration_ms = WORTENDE_SUCHE_MS + vorwaerts_ms + MEASURE_MS
+    return fetch_duration_ms // STEP_MS
+
+
+def _worteinsatz_raw_blocks() -> int:
+    fetch_duration_ms = WORTENDE_SUCHE_MS + START_EINSATZ_SUCHE_MS + MEASURE_MS
+    return fetch_duration_ms // STEP_MS
+
+
+def test_wortende_bereits_leise_bleibt_marke() -> None:
+    """Ist es an der Whisper-Marke schon leise, gilt die Marke selbst als Lautende."""
+    whisper_end_ms = 20_000
+    raw_blocks = _wortende_raw_blocks()
+    levels = [-60.0] * raw_blocks
+    anchor_index = round((WORTENDE_SUCHE_MS - MEASURE_MS // 2) / STEP_MS)
+    # Lauter Kontext VOR der Marke, damit ueberhaupt ein aussagekraeftiger
+    # Sprechpegel bestimmbar ist - ohne ihn waere die Schwelle nur relativ zu
+    # sich selbst und "durchgehend leise" liesse sich nicht von "durchgehend
+    # laut" unterscheiden.
+    for i in range(0, anchor_index):
+        levels[i] = -15.0
+
+    ende = finde_wortende_ton(
+        MEDIA, whisper_end_ms, ffmpeg_path=FFMPEG, process_runner=_runner_for(levels)
+    )
+
+    assert ende == whisper_end_ms
+
+
+def test_wortende_findet_dauerhaften_uebergang() -> None:
+    """Laut an der Marke, dann dauerhaft leise - das Lautende liegt am Uebergang."""
+    whisper_end_ms = 20_000
+    raw_blocks = _wortende_raw_blocks()
+    levels = [-15.0] * raw_blocks
+    anchor_index = round((WORTENDE_SUCHE_MS - MEASURE_MS // 2) / STEP_MS)
+    uebergang_index = anchor_index + 5  # 50 ms nach der Marke
+    for i in range(uebergang_index, raw_blocks):
+        levels[i] = -60.0
+
+    ende = finde_wortende_ton(
+        MEDIA, whisper_end_ms, ffmpeg_path=FFMPEG, process_runner=_runner_for(levels)
+    )
+
+    assert ende > whisper_end_ms, "der Uebergang liegt NACH der Marke"
+    assert ende < whisper_end_ms + WORTENDE_SUCHE_MS, "der Uebergang liegt im Fenster"
+
+
+def test_wortende_ignoriert_kurzen_ausreisser() -> None:
+    """Ein Ausreisser unter WORTENDE_UNTERBRECHUNG_MAX_MS beendet den lauten Lauf nicht."""
+    whisper_end_ms = 20_000
+    raw_blocks = _wortende_raw_blocks()
+    levels = [-15.0] * raw_blocks
+    anchor_index = round((WORTENDE_SUCHE_MS - MEASURE_MS // 2) / STEP_MS)
+    # Ein einzelner 10-ms-Block leise, deutlich unter der 20-ms-Toleranz.
+    kurzer_ausreisser = anchor_index + 3
+    levels[kurzer_ausreisser] = -60.0
+    assert WORTENDE_UNTERBRECHUNG_MAX_MS >= 2 * STEP_MS, "Testannahme: 1 Block wird ueberbrueckt"
+
+    ende = finde_wortende_ton(
+        MEDIA, whisper_end_ms, ffmpeg_path=FFMPEG, process_runner=_runner_for(levels)
+    )
+
+    assert ende == whisper_end_ms + WORTENDE_FALLBACK_MS, (
+        "kein dauerhafter Uebergang gefunden - der Ausreisser wurde ueberbrueckt, "
+        "der Ton bleibt bis zum Fensterrand laut"
+    )
+
+
+def test_wortende_fallback_wenn_kein_uebergang() -> None:
+    """Bleibt der Ton durchgehend laut, greift der konservative Fallback."""
+    whisper_end_ms = 20_000
+    levels = [-15.0] * _wortende_raw_blocks()  # durchgehend laut
+
+    ende = finde_wortende_ton(
+        MEDIA, whisper_end_ms, ffmpeg_path=FFMPEG, process_runner=_runner_for(levels)
+    )
+
+    assert ende == whisper_end_ms + WORTENDE_FALLBACK_MS
+
+
+def test_wortende_ohne_erweiterte_suche_deckelt_frueher() -> None:
+    """``erweiterte_suche=False`` (Startgrenze/Ausklang) sucht nur bis WORTENDE_SUCHE_MS,
+    nicht bis WORTENDE_SUCHE_MAX_MS - derselbe Fallback greift entsprechend frueher."""
+    whisper_end_ms = 20_000
+    levels = [-15.0] * _wortende_raw_blocks(erweitert=False)  # durchgehend laut
+
+    ende = finde_wortende_ton(
+        MEDIA,
+        whisper_end_ms,
+        ffmpeg_path=FFMPEG,
+        erweiterte_suche=False,
+        process_runner=_runner_for(levels),
+    )
+
+    assert ende == whisper_end_ms + WORTENDE_FALLBACK_MS
+
+
+def test_worteinsatz_bereits_laut_bleibt_marke() -> None:
+    """Ist an der Marke (bzw. ``nicht_vor_ms``) bereits Ton, ist kein Vorruecken noetig."""
+    whisper_start_ms = 20_000
+    levels = [-15.0] * _worteinsatz_raw_blocks()  # durchgehend laut
+
+    einsatz = finde_worteinsatz_ton(
+        MEDIA, whisper_start_ms, ffmpeg_path=FFMPEG, process_runner=_runner_for(levels)
+    )
+
+    assert einsatz == whisper_start_ms
+
+
+def test_worteinsatz_findet_einsatz_nach_nicht_vor_ms() -> None:
+    """Leise bis ``nicht_vor_ms``, dann dauerhaft laut - der Einsatz liegt danach."""
+    whisper_start_ms = 20_000
+    nicht_vor_ms = whisper_start_ms + 30
+    raw_blocks = _worteinsatz_raw_blocks()
+    levels = [-60.0] * raw_blocks
+    fetch_start_ms = max(0, whisper_start_ms - WORTENDE_SUCHE_MS - MEASURE_MS // 2)
+    anchor_index = round((nicht_vor_ms - fetch_start_ms - MEASURE_MS // 2) / STEP_MS)
+    einsatz_index = anchor_index + 4  # 40 ms nach nicht_vor_ms
+    for i in range(einsatz_index, raw_blocks):
+        levels[i] = -15.0
+    # etwas Kontext-Lautstaerke vor der Marke, sonst ist der Sprechpegel nicht bestimmbar.
+    for i in range(0, anchor_index):
+        levels[i] = -15.0
+
+    einsatz = finde_worteinsatz_ton(
+        MEDIA,
+        whisper_start_ms,
+        ffmpeg_path=FFMPEG,
+        nicht_vor_ms=nicht_vor_ms,
+        process_runner=_runner_for(levels),
+    )
+
+    assert einsatz > nicht_vor_ms, "der Einsatz liegt NACH nicht_vor_ms, nicht an der Marke"
+    assert einsatz <= whisper_start_ms + START_EINSATZ_SUCHE_MS
+
+
+def test_worteinsatz_fallback_wenn_kein_einsatz() -> None:
+    """Bleibt der Ton bis zum Fensterrand leise, bleibt die Whisper-Marke die Obergrenze."""
+    whisper_start_ms = 20_000
+    levels = [-60.0] * _worteinsatz_raw_blocks()  # durchgehend leise
+
+    einsatz = finde_worteinsatz_ton(
+        MEDIA, whisper_start_ms, ffmpeg_path=FFMPEG, process_runner=_runner_for(levels)
+    )
+
+    assert einsatz == whisper_start_ms
