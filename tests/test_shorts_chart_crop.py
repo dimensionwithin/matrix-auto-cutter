@@ -62,6 +62,23 @@ def test_load_offsets_missing_file_is_empty(tmp_path: Path) -> None:
     assert cc.load_offsets(tmp_path / "does-not-exist.json") == {}
 
 
+def test_load_offsets_liest_datei_mit_bom(tmp_path: Path) -> None:
+    """Der Notausgang muss auch aus PowerShell 5.1 lesbar sein - die schreibt MIT BOM."""
+    path = tmp_path / "ausschnitt.json"
+    path.write_bytes(
+        b"\xef\xbb\xbf" + json.dumps({"schema_version": "1.0", "versatz": {"6": 700}}).encode()
+    )
+    assert path.read_bytes().startswith(b"\xef\xbb\xbf")
+    assert cc.load_offsets(path) == {6: 700}
+
+
+def test_load_offsets_liest_datei_ohne_bom_unveraendert(tmp_path: Path) -> None:
+    path = tmp_path / "ausschnitt.json"
+    path.write_bytes(json.dumps({"schema_version": "1.0", "versatz": {"6": 700}}).encode())
+    assert not path.read_bytes().startswith(b"\xef\xbb\xbf")
+    assert cc.load_offsets(path) == {6: 700}
+
+
 def test_load_offsets_reads_valid_mapping(tmp_path: Path) -> None:
     path = tmp_path / "ausschnitt.json"
     _touch(

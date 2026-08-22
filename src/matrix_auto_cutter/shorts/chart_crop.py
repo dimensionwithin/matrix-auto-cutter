@@ -111,11 +111,17 @@ def load_offsets(path: Path) -> dict[int, int]:
     ``X_OFFSET_DEFAULT`` an (siehe :func:`offset_for_candidate`). Ein
     vorhandener, aber ungueltiger Eintrag bricht dagegen mit einer konkreten
     Meldung ab statt ihn stillschweigend zu klemmen.
+
+    Gelesen wird mit ``utf-8-sig``, nicht mit ``utf-8``: Diese Datei ist der
+    NOTAUSGANG, den der Nutzer von Hand schreibt, wenn eine Kurve aus Stufe 3b
+    einmal danebenliegt - und PowerShell 5.1 schreibt per Vorgabe MIT BOM.
+    Mit ``utf-8`` fiele der Notausgang genau dann aus, wenn er gebraucht wird.
+    ``utf-8-sig`` liest Dateien ohne BOM unveraendert mit.
     """
     if not path.is_file():
         return {}
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         raise AusschnittSchemaError(f"{path} ist kein gueltiges JSON: {exc}") from exc
     if not isinstance(payload, dict):

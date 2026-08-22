@@ -458,8 +458,22 @@ VERSATZ_SPANNE_PX = X_OFFSET_MAX_3B - X_OFFSET_MIN_3B
 # Teil 3, Punkt 4 - Zustandsfuehrung der Kurve. Alle Startwerte benannt.
 # ---------------------------------------------------------------------------
 
-TRITTZONE_RAND_PX = 100
-"""Randstreifen des Ausschnitts: solange der Median tiefer drin liegt, haelt das Bild."""
+TRITTZONE_RAND_PX = 300
+"""Die EMPFINDLICHKEIT: wie nah der Zeiger an die Ausschnittkante kommen darf,
+bevor gefahren wird.
+
+Randstreifen des Ausschnitts an BEIDEN Seiten; solange der Median tiefer drin
+liegt, haelt das Bild. 300 von :data:`chart_crop.CROP_WIDTH` = 1728 sind 17 %,
+und der Nutzer hat 10 bis 20 % verlangt.
+
+STELLWERT DES NUTZERS, keine gemessene Groesse. Wer ihn aendert, aendert, wie
+frueh sich der Ausschnitt in Bewegung setzt - nicht, wie genau gemessen wird.
+Der Ausloeser bleibt eine SCHWELLE: kein stufenloses Nachfuehren im
+Randstreifen, kein Zucken bei kleinen Bewegungen.
+
+Zusammen mit :data:`RESERVE_PX` gilt die Invariante
+``2 * TRITTZONE_RAND_PX + RESERVE_PX <= CROP_WIDTH - 1`` - siehe dort.
+"""
 
 AUSTRITT_VERZOEGERUNG_MS = 300
 """So lange muss ein Austritt anhalten, bevor gefahren wird - gegen kurze Wischer."""
@@ -467,14 +481,49 @@ AUSTRITT_VERZOEGERUNG_MS = 300
 MINDESTVERWEILDAUER_MS = 1000
 """So lange nach dem Ende einer Fahrt beginnt keine neue."""
 
-RESERVE_PX = 150
-"""Zusatzabstand zur Austrittskante nach der Fahrt - das Ziel ist NICHT die Mitte."""
+RESERVE_PX = 250
+"""Der VORLAUF: wie weit der Ausschnitt ueber den Zeiger hinaus in dessen
+Bewegungsrichtung schiebt.
 
-FAHRT_MIN_MS = 350
-"""Dauer der kuerzesten Fahrt (Weg 0)."""
+Zusatzabstand zur Austrittskante nach der Fahrt - das Ziel ist NICHT die Mitte.
+Zusammen mit :data:`TRITTZONE_RAND_PX` steht der Zeiger nach einer Fahrt
+300 + 250 = 550 px von der Austrittskante entfernt (bisher 250).
 
-FAHRT_MAX_MS = 700
-"""Dauer der laengsten Fahrt (Weg :data:`VERSATZ_SPANNE_PX`)."""
+STELLWERT DES NUTZERS, keine gemessene Groesse.
+
+DIE INVARIANTE, die beide Werte aneinander bindet: Nach einer Fahrt muss der
+Zeiger vom GEGENUEBERLIEGENDEN Rand weiter entfernt sein als
+:data:`TRITTZONE_RAND_PX` - sonst loeste jede Fahrt sofort die Gegenfahrt aus
+und das Bild flatterte. Der Zeiger steht nach der Fahrt
+``TRITTZONE_RAND_PX + RESERVE_PX`` von der Austrittskante entfernt, also
+``CROP_WIDTH - 1 - (TRITTZONE_RAND_PX + RESERVE_PX)`` vom gegenueberliegenden
+Rand. Verlangt ist damit
+
+    2 * TRITTZONE_RAND_PX + RESERVE_PX <= CROP_WIDTH - 1
+
+Heute: 2 * 300 + 250 = 850 <= 1727. Der Zeiger steht nach einer Fahrt 1177 px
+vom gegenueberliegenden Rand entfernt, also 877 px innerhalb dessen
+Trittzonengrenze. Die ``assert``-Zeile unten haelt das fest.
+"""
+
+assert 2 * TRITTZONE_RAND_PX + RESERVE_PX <= CROP_WIDTH - 1, (
+    "Invariante verletzt: eine Fahrt wuerde sofort die Gegenfahrt ausloesen - siehe RESERVE_PX"
+)
+
+FAHRT_MIN_MS = 250
+"""Dauer der kuerzesten Fahrt (Weg 0).
+
+STELLWERT DES NUTZERS, keine gemessene Groesse.
+"""
+
+FAHRT_MAX_MS = 450
+"""Dauer der laengsten Fahrt (Weg :data:`VERSATZ_SPANNE_PX`).
+
+STELLWERT DES NUTZERS, keine gemessene Groesse. Der volle Weg von 350 px in
+450 ms ergibt bei Smoothstep eine Spitzengeschwindigkeit von rund 1170 px/s,
+also knapp 20 px je Frame bei 60 fps - die Grenze, ab der die Bewegung
+zwischen zwei Bildern zu ruckeln beginnt.
+"""
 
 AUSTRITT_LINKS = "links"
 AUSTRITT_RECHTS = "rechts"

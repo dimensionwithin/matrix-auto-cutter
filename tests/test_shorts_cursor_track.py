@@ -452,12 +452,33 @@ def test_linker_anschlag_liegt_rechts_der_avatarbox():
 
 
 def test_benannte_startwerte_stehen_wie_im_auftrag():
-    assert TRITTZONE_RAND_PX == 100
+    # Auftrag shorts-3b-toleranz: Rand 100 -> 300, Reserve 150 -> 250.
+    # Auftrag shorts-3b-fahrttempo: Fahrt 350/700 -> 250/450.
+    assert TRITTZONE_RAND_PX == 300
     assert AUSTRITT_VERZOEGERUNG_MS == 300
     assert MINDESTVERWEILDAUER_MS == 1000
-    assert RESERVE_PX == 150
-    assert FAHRT_MIN_MS == 350
-    assert FAHRT_MAX_MS == 700
+    assert RESERVE_PX == 250
+    assert FAHRT_MIN_MS == 250
+    assert FAHRT_MAX_MS == 450
+
+
+def test_invariante_eine_fahrt_loest_nicht_die_gegenfahrt_aus():
+    """Nach einer Fahrt muss der Zeiger vom GEGENUEBERLIEGENDEN Rand weiter weg sein
+    als der Randstreifen - sonst flatterte das Bild."""
+    abstand = TRITTZONE_RAND_PX + RESERVE_PX
+    vom_gegenrand = CROP_WIDTH - 1 - abstand
+    assert abstand == 550
+    assert vom_gegenrand == 1177
+    assert vom_gegenrand > TRITTZONE_RAND_PX
+    assert 2 * TRITTZONE_RAND_PX + RESERVE_PX <= CROP_WIDTH - 1
+
+    # Und dieselbe Aussage am gerechneten Ergebnis, fuer beide Richtungen.
+    for richtung in (AUSTRITT_LINKS, AUSTRITT_RECHTS):
+        for median in range(700, 2200, 37):
+            ziel = zielversatz(median, richtung)
+            if ziel in (X_OFFSET_MIN_3B, X_OFFSET_MAX_3B):
+                continue  # am Anschlag geklemmt, dort loest ein Austritt keine Fahrt aus
+            assert austrittsrichtung(ziel, median) is None
 
 
 def test_auf_geraden_versatz_rundet_ab_und_klemmt():
@@ -475,16 +496,17 @@ def test_auf_geraden_versatz_liefert_immer_einen_gueltigen_ausschnittversatz():
 
 
 def test_trittzone_laesst_beidseitig_den_rand_frei():
-    assert trittzone(416) == (516, 2043)
+    # Rand 300: bei Versatz 416 sind das die Spalten 716..1843.
+    assert trittzone(416) == (716, 1843)
     assert trittzone(0) == (TRITTZONE_RAND_PX, CROP_WIDTH - 1 - TRITTZONE_RAND_PX)
 
 
 def test_austrittsrichtung_erkennt_beide_seiten_und_das_halten():
     assert austrittsrichtung(416, 1200) is None
-    assert austrittsrichtung(416, 516) is None
-    assert austrittsrichtung(416, 2043) is None
-    assert austrittsrichtung(416, 515) == AUSTRITT_LINKS
-    assert austrittsrichtung(416, 2044) == AUSTRITT_RECHTS
+    assert austrittsrichtung(416, 716) is None
+    assert austrittsrichtung(416, 1843) is None
+    assert austrittsrichtung(416, 715) == AUSTRITT_LINKS
+    assert austrittsrichtung(416, 1844) == AUSTRITT_RECHTS
 
 
 def test_undefinierter_median_gilt_als_austritt_nach_links():
@@ -494,13 +516,14 @@ def test_undefinierter_median_gilt_als_austritt_nach_links():
 
 
 def test_zielversatz_setzt_die_reserve_an_die_austrittskante():
-    """Beide Mediane sind so gewaehlt, dass das Ziel ohne Rundung schon gerade ist."""
+    """Beide Mediane sind so gewaehlt, dass das Ziel weder klemmt noch gerundet wird."""
     abstand = TRITTZONE_RAND_PX + RESERVE_PX
-    ziel = zielversatz(900, AUSTRITT_LINKS)
-    assert ziel == auf_geraden_versatz(900 - abstand)
-    assert 900 - ziel == abstand  # Median steht 250 px von der LINKEN Kante
-    ziel = zielversatz(2201, AUSTRITT_RECHTS)
-    assert (ziel + CROP_WIDTH - 1) - 2201 == abstand  # 250 px von der RECHTEN Kante
+    assert abstand == 550
+    ziel = zielversatz(1200, AUSTRITT_LINKS)
+    assert ziel == auf_geraden_versatz(1200 - abstand)
+    assert 1200 - ziel == abstand  # Median steht 550 px von der LINKEN Kante
+    ziel = zielversatz(1801, AUSTRITT_RECHTS)
+    assert (ziel + CROP_WIDTH - 1) - 1801 == abstand  # 550 px von der RECHTEN Kante
 
 
 def test_zielversatz_weicht_durch_die_gerade_rundung_um_hoechstens_ein_pixel_ab():
@@ -515,8 +538,10 @@ def test_zielversatz_weicht_durch_die_gerade_rundung_um_hoechstens_ein_pixel_ab(
 
 
 def test_zielversatz_ist_nicht_die_mitte():
-    mitte = auf_geraden_versatz(900 - (CROP_WIDTH - 1) // 2)
-    assert zielversatz(900, AUSTRITT_LINKS) != mitte
+    # Median so gewaehlt, dass WEDER die Mitte NOCH das Ziel am Anschlag klemmt.
+    mitte = auf_geraden_versatz(1360 - (CROP_WIDTH - 1) // 2)
+    assert mitte == 496
+    assert zielversatz(1360, AUSTRITT_LINKS) == 810 != mitte
 
 
 def test_zielversatz_bei_undefiniertem_median_ist_der_linke_anschlag():
@@ -527,8 +552,8 @@ def test_zielversatz_bei_undefiniertem_median_ist_der_linke_anschlag():
 def test_anfangsversatz_zentriert_NICHT_sondern_bleibt_am_linken_anschlag():
     """N3: Liegt der Median am linken Anschlag schon in der Trittzone, bleibt es dabei."""
     links, rechts = trittzone(X_OFFSET_MIN_3B)
-    assert (links, rechts) == (582, 2109)
-    for median in (582, 1300, 1600, 2109):
+    assert (links, rechts) == (782, 1909)
+    for median in (782, 1300, 1600, 1909):
         assert anfangsversatz(median) == X_OFFSET_MIN_3B
     # Ausdruecklich NICHT die Mitte - die zentrierte Rahmung ist weggefallen.
     assert auf_geraden_versatz(1600 - (CROP_WIDTH - 1) // 2) == 736
@@ -558,6 +583,12 @@ def test_fahrtdauer_ist_linear_ueber_416_px_nicht_ueber_832():
 def test_fahrtdauer_ist_richtungsunabhaengig_und_nie_null():
     assert fahrtdauer_frames(-300) == fahrtdauer_frames(300)
     assert fahrtdauer_frames(0, fps=1) >= 1
+
+
+def test_fahrtdauer_bei_60fps_in_frames_nach_shorts_3b_fahrttempo():
+    """Auftrag shorts-3b-fahrttempo: Fahrt 350/700 ms -> 250/450 ms."""
+    assert fahrtdauer_frames(VERSATZ_SPANNE_PX, fps=FPS) == 27
+    assert fahrtdauer_frames(0, fps=FPS) == 15
 
 
 def test_ueberblendung_hat_ableitung_null_an_beiden_enden():
@@ -713,7 +744,7 @@ def test_mindestverweildauer_verhindert_eine_sofortige_zweite_fahrt():
 
 
 def _kurze_spanne_ohne_fahrt(laenge):
-    """Austritt nach rechts kurz vor Schluss - Weg 350 px, also 42 Frames Fahrtdauer."""
+    """Austritt nach rechts kurz vor Schluss - Weg 350 px, also 27 Frames Fahrtdauer."""
     return kurve(protokoll(sprung(1300, 2400, bei_ms=2000)), (0, laenge))
 
 
