@@ -1,0 +1,432 @@
+# shorts-kriterien.yaml — Fassung 0.6 (18. August 2026, abends)
+#
+# Diese Datei ist der Text, den ein lesendes Modell in Stufe 2 als Vorgabe
+# bekommt. Jede Aussage traegt, woher sie kommt und wie gut sie belegt ist.
+#
+# Aenderungen gegenueber 0.5 — Anlass ist der erste Zerlegungslauf im neuen
+# Format (Aufnahme 2026-08-18 08-51-21, 22 Kandidaten, 34 verworfene
+# Abschnitte). Der Nutzer hat die Karte durchgesehen und drei Luecken benannt:
+#
+#   1. NEU: polarisierung. Fassung 0.5 sagt, wie ein Short GEBAUT sein muss,
+#      aber nichts darueber, was ihn sehenswert macht. Kein einziges
+#      Kriterium fragte, ob eine Aussage dem widerspricht, was der Zuschauer
+#      glaubt. Dadurch fielen genau die staerksten Stellen heraus.
+#
+#   2. NEU: das_chart_zaehlt_als_kontext. 14 der 34 Ablehnungen begruendeten
+#      sich damit, dass Zeigewoerter aus dem Ausschnitt hinausweisen. Das
+#      Short ZEIGT aber das Chart in den oberen 900 Pixeln. Die Forderung
+#      "ohne Vorwissen verstaendlich" stammt aus der Zeit, als ein Short ein
+#      Erklaerkasten sein sollte, und ignorierte das mitlaufende Bild.
+#
+#   3. NEU: im_zweifel_mitgeben. Es gibt kein Tageslimit fuer Shorts. Ein
+#      guter Kandidat, der weggelassen wird, ist teurer als ein mittelmaessiger,
+#      den der Nutzer in fuenf Sekunden ablehnt.
+#
+#   4. grenze_liegt_auf_einer_sprechpause bekommt einen LAENGENVORBEHALT.
+#      Gemessen am Lauf vom 18.8.: 7 % der Grenzen liegen an einer Schnittfuge,
+#      Zufallserwartung 8,1 %. Das Kriterium traegt bei 8 bis 15 Sekunden nicht
+#      mehr. Es ist nicht widerlegt, es passt nicht zu dieser Laenge.
+#
+#   Die Laengenvorgabe aus 0.5 bleibt unveraendert: 8 bis 15 s, Obergrenze 20.
+#   Sie hat sich im ersten Lauf bestaetigt, siehe laenge.erster_lauf.
+
+herkunft:
+  aufnahmen:
+    - name: "2026-08-07 11-35-16"
+      rolle: "17 Nutzermarken, 21 Blindkandidaten, 21 Urteile (14 ja / 7 nein)"
+      regime: "alte Laengenvorgabe 30 bis 60 s"
+      stand: "2026-08-14"
+    - name: "2026-08-18 08-51-21"
+      rolle: "erster Zerlegungslauf im neuen Format, 22 Kandidaten, 34 verworfene Abschnitte"
+      regime: "neue Laengenvorgabe 8 bis 15 s"
+      stand: "2026-08-18"
+      offen: "noch keine Nutzerurteile -- die Kandidaten sind ungeprueft"
+  warnung: >
+    Alle URTEILE stammen weiterhin aus der ersten Aufnahme und aus dem alten
+    Laengenregime. Die zweite Aufnahme hat die Kriterien nur auf die Probe
+    gestellt, nicht bestaetigt. Erst der naechste Urteilsdurchgang misst, ob
+    0.6 traegt.
+
+# ---------------------------------------------------------------------------
+# Was ein Short ist
+# ---------------------------------------------------------------------------
+
+definition:
+  kern: >
+    EINE Aussage, in acht bis fuenfzehn Sekunden, die fuer sich steht. Wer nur
+    diese Sekunden sieht, muss folgen koennen -- und danach etwas denken oder
+    widersprechen wollen.
+  ein_gedanke_nicht_zwei: >
+    Der Ausschnitt traegt eine Aussage. Nicht Aussage plus Beleg plus
+    Einordnung. Wenn der Gedanke einen Beleg braucht, um ueberhaupt zu stehen,
+    ist er zu gross fuer ein Short und gehoert ins Langvideo.
+  belegt_durch_0_6: >
+    Erster eigener Beleg aus dem Lauf vom 18.8.: Vier Stellen scheiterten
+    ALLEIN an der 20-Sekunden-Grenze, und in drei von vier Faellen mit
+    derselben Bauform -- die These passt in den Zielbereich, die Aufloesung
+    passt nicht mehr dazu. Genau die Trennung, die dieses Kriterium verlangt.
+  die_luecke_ist_mittelgross: >
+    Der Zuschauer soll verstehen, WAS ihm fehlt -- nicht ratlos zurueckbleiben.
+    Eine Aussage ohne jeden Zusammenhang erzeugt keine Neugier, sondern ein
+    Weiterwischen. Belegt: In der Curiosity-Forschung ist eine MITTLERE
+    Wissensluecke am wirksamsten, nicht die groesstmoegliche
+    (Kang et al. 2009, Psychological Science 20; Frede et al. 2026).
+  was_fuer_sich_steht_heisst_nicht_selbsterklaerend: >
+    NEU IN 0.6, und die wichtigste Korrektur dieser Fassung. "Fuer sich
+    stehen" heisst: Die Aussage ist ohne den vorigen Satz angreifbar oder
+    zustimmungsfaehig. Es heisst NICHT, dass jeder Begriff darin erklaert
+    wird. "Retail wurde wrong-footed, alle gucken nur auf den letzten Zyklus"
+    steht fuer sich -- man kann widersprechen, ohne zu wissen, was davor kam.
+    In 0.5 fiel genau dieser Kandidat heraus, mit der Begruendung, er haenge
+    am Vorgaenger. Das war zu streng.
+
+# ---------------------------------------------------------------------------
+# Die Kriterien, nach Wirksamkeit sortiert
+# ---------------------------------------------------------------------------
+
+kriterien:
+
+  - name: polarisierung
+    staerke: unbelegt
+    stand: "neu in 0.6, Weisung des Nutzers vom 18.8."
+    regel: >
+      Eine Aussage, die dem widerspricht, was der Zuschauer glaubt, ist mehr
+      wert als eine, die ihm zustimmt. Suche die Stellen, an denen jemand
+      widersprechen WILL -- Angriff auf eine verbreitete Meinung, eine
+      unbequeme Behauptung, eine Zuschreibung an eine Gruppe.
+    prueffrage: "Koennte jemand das lesen und sofort dagegenhalten wollen?"
+    beispiele_aus_dem_lauf_18_8: >
+      Alle vier wurden in 0.5 VERWORFEN und waeren nach 0.6 Kandidaten:
+        "retail wurde wrong-footed, alle gucken nur auf den letzten Zyklus"
+        "Die versuchen euch mit Emotionen zu manipulieren"
+        "Damit ziehst du nur die falschen Leute an, die dich ausnutzen"
+        "Die Retail-YouTuber fingen erst an zu reden, als CNBC anfing"
+    warnung: >
+      Polarisierung ist KEIN Freibrief fuer Beleidigung oder fuer Behauptungen,
+      die der Sprecher so nicht gemeint hat. Der Ausschnitt muss wiedergeben,
+      was gesagt wurde, nicht zuspitzen, was gesagt wurde.
+    belegstaerke: >
+      Nicht gemessen. Beruht auf der Einschaetzung des Nutzers und darauf, dass
+      sein bislang bestlaufendes Short ein reines Informationsstueck war, das
+      nichts erklaerte. Der naechste Urteilsdurchgang prueft es.
+
+  - name: das_chart_zaehlt_als_kontext
+    staerke: mittel
+    stand: "neu in 0.6"
+    regel: >
+      Das fertige Short zeigt das Chart in den oberen 900 von 1920 Pixeln, mit
+      dem Ton und spaeter der Mausbewegung. Zeigewoerter -- "hier", "dort",
+      "diese Bereiche" -- sind deshalb ERLAUBT, solange der Zuschauer im Bild
+      sieht, worauf gezeigt wird.
+    grenze_der_regel: >
+      Nicht erlaubt bleibt, was das Bild nicht traegt:
+        - lange Aufzaehlungen von Fachbegriffen ohne Zwischenpunkt
+          (Wyckoff-Phasenketten ueber 40 s und mehr)
+        - Rueckbezug auf FRUEHERE Videos oder auf Gesagtes, das im Ausschnitt
+          nicht sichtbar wird
+        - Zahlen- und Levelketten, bei denen der Zuschauer mitrechnen muesste
+    belegt_durch: >
+      Im Lauf vom 18.8. wurden 14 von 34 Abschnitten mit "zeigt in den Chart"
+      verworfen. Der Nutzer hat widersprochen: Das Chart laeuft mit. Etwa die
+      Haelfte dieser 14 duerfte nach 0.6 tragen; die andere Haelfte faellt
+      unter die Grenze der Regel oben.
+
+  - name: ein_thema_je_short
+    staerke: stark
+    regel: >
+      Ein Short traegt EIN Thema. Laesst sich der Ausschnitt nur in zwei Titeln
+      zusammenfassen, ist er zu breit -- dann gehoert er ins Langvideo.
+    prueffrage: "Liesse sich der Ausschnitt in zwei Titel fassen?"
+    belegt_durch: >
+      Kandidat #5 (Finsternis-Muster, 56 s): vom Modell als "Belegkette plus
+      Aufloesung" begruendet, vom Nutzer beim Markieren am 11.8. uebersprungen
+      -- "da werden zwei verschiedene Themen innerhalb einem Short besprochen".
+      Am 14.8. zunaechst mit Ja beurteilt, dann korrigiert: "zu abgehackt
+      beziehungsweise zu lang". Beide Male dasselbe Urteil.
+
+  - name: im_zweifel_mitgeben
+    staerke: mittel
+    stand: "neu in 0.6, Weisung des Nutzers vom 18.8."
+    regel: >
+      Es gibt kein Tageslimit fuer Shorts. Bist du unsicher, ob ein Kandidat
+      traegt, gib ihn AUS -- mit sicherheit "mittel" oder "niedrig" und einer
+      ehrlichen Begruendung. Der Nutzer sortiert in Sekunden aus.
+    begruendung: >
+      Ein guter Kandidat, den du weglaesst, ist verloren -- niemand sieht
+      diese Stelle je wieder an. Ein mittelmaessiger, den du mitgibst, kostet
+      fuenf Sekunden Urteilszeit. Die Kosten sind nicht symmetrisch.
+    grenze: >
+      Das gilt fuer INHALTLICHE Unsicherheit, nicht fuer die formalen Regeln.
+      Ueber 20 Sekunden, mitten im Wort, verungluckter Satzbau, Anlauf am
+      Anfang -- das bleibt draussen. Grosszuegig heisst nicht schlampig.
+
+  - name: kuerzestes_was_noch_fuer_sich_steht
+    staerke: stark
+    regel: >
+      Bei verschachtelten Moeglichkeiten gewinnt die kurze Fassung -- aber
+      "das kuerzeste, was noch fuer sich steht", nicht "so kurz wie moeglich".
+    belegt_durch: >
+      Drei Verschachtelungen, drei Mal dasselbe Ergebnis, ohne Ausnahme:
+        #8 (56 s) nein  <->  #9 (38 s) ja
+        #11 (53 s) nein <->  #10 (34 s) ja
+        #18 (75 s) nein <->  #16 (28 s) ja UND #17 (47 s) ja
+      Aus der laengsten Fassung wurden zwei eigenstaendige Shorts statt einem.
+    folge: >
+      Verschachtelte Kandidaten duerfen ausgegeben werden, die kurzen sind
+      aber die Vorschlaege. Die lange Fassung kommt als Fussnote mit.
+
+  - name: kein_anlauf_am_anfang
+    staerke: mittel
+    regel: >
+      Ein Short beginnt mit dem ersten Wort, das den Gedanken TRAEGT. Was davor
+      steht -- Fuellwoerter, Raeuspern, ein angehaengtes Satzende vom vorigen
+      Thema -- gehoert nicht dazu.
+    belegt_durch: >
+      Kandidat #10 vom 7.8., gebaut am 18.8.: Die Marke lag mitten im
+      Fuellwort "Ähm," (464980 bis 466140). Im fertigen Short hoert man
+      "Ähm, na, ..." vor dem Inhalt -- rund 1,5 Sekunden. Urteil des Nutzers:
+      "Wenn jemand drei Sekunden auf den Content warten muss, wischt er
+      weiter." Bei 15 Sekunden Gesamtlaenge ist das ein Zehntel des Shorts.
+    ausdruecklich_keine_wortliste: >
+      Das ist eine BEDEUTUNGSFRAGE, kein Filter. Dieselbe Wendung kann Anlauf
+      oder Pointe sein: "Weisst du, was ich mein?" am Anfang ist Fuellsel, am
+      Ende ist es die Ansprache, auf die alles hinauslaeuft. Dasselbe gilt fuer
+      "richtig?". Entscheide im Einzelfall, streiche nicht nach Liste.
+
+  - name: kein_angefangener_gedanke_am_ende
+    staerke: mittel
+    regel: >
+      Der Ausschnitt endet, wenn der Gedanke fertig ist -- nicht, wenn der
+      naechste beginnt. Ein vollstaendiges Wort, das schon zum folgenden Thema
+      gehoert, ist ein Fehler, auch wenn es sauber geschnitten ist.
+    belegt_durch: >
+      Kandidat #14 vom 7.8.: Die Zerlegung endete korrekt nach "reversed.",
+      das Werkzeug rastete jedoch vorwaerts und nahm "Anschliessend, als" mit
+      -- zwei vollstaendige Woerter des naechsten Gedankens. Der Nutzer hoerte
+      den Bruch sofort. Das Werkzeug ist am 18.8. korrigiert; das Kriterium
+      bleibt, weil eine zu weit hinten gesetzte Marke von keinem Werkzeug zu
+      reparieren ist.
+
+  - name: der_gedanke_muss_fertig_sein
+    staerke: mittel
+    regel: >
+      Der letzte Gedanke ist zu Ende gesprochen. Ein fehlendes Satzzeichen
+      schadet nicht, ein fehlendes WORT schon.
+    belegt_durch: >
+      Kandidat #19 vom 7.8. abgelehnt mit der Notiz "ende abgeschinitten".
+      Der Text bricht ab bei "Ich glaube nicht, dass das wieder passieren" --
+      das "wird" fehlt.
+      Abzugrenzen vom widerlegten Kriterium unten: Der Nutzer schneidet
+      regelmaessig mitten im Satz und stoert sich nicht daran. Er stoert sich,
+      wenn der Gedanke unfertig bleibt.
+
+  - name: grenzsicherheit_melden
+    staerke: mittel
+    regel: >
+      Ein Kandidat mit unsicheren Grenzen wird MIT WARNUNG ausgegeben, nicht
+      weggelassen. Die Entscheidung gehoert dem Nutzer.
+    belegt_durch: >
+      Kandidat #6 vom 7.8. trug "mittel" wegen entarteter Zeitmarken im
+      Transkript und wurde abgelehnt. Inhaltlich brauchbar, nur schlecht
+      geschnitten.
+
+  - name: die_sicherheitsstufe_traegt
+    staerke: stark
+    regel: >
+      Die Selbsteinschaetzung des zerlegenden Modells sagt das Nutzerurteil
+      weitgehend voraus. Sie taugt zur Vorsortierung.
+    belegt_durch: >
+      Ohne die drei Verschachtelungs-Elternfassungen:
+        hoch    13 von 13 angenommen
+        mittel   1 von  4
+        niedrig  0 von  1
+      Kein einziger HOCH-Kandidat wurde wegen seines Inhalts abgelehnt.
+    besonders_wichtig_in_0_6: >
+      Mit im_zweifel_mitgeben steigt die Zahl der "mittel"-Kandidaten
+      absichtlich. Die Stufe wird damit zum Hauptwerkzeug der Vorsortierung --
+      setze sie ehrlich, nicht wohlwollend.
+
+  - name: grenze_liegt_auf_einer_sprechpause
+    staerke: schwach_bei_dieser_laenge
+    stand: "in 0.4 stark, in 0.6 mit Laengenvorbehalt"
+    regel: >
+      Wo der Sprecher Luft holt, liegt eine Fuge. Bei LANGEN Ausschnitten ein
+      starkes Signal.
+    belegt_durch_alt: >
+      34 Nutzergrenzen bei 30-bis-60-Sekunden-Kandidaten: 59 % innerhalb 1,5 s
+      einer Schnittkante gegen 26 % an Zufallspunkten. Die blinde Zerlegung
+      traf mit 46 % ihrer Grenzen unter 0,5 s an eine Kante (Zufall 11 %).
+    laengenvorbehalt_0_6: >
+      Bei 8 bis 15 Sekunden traegt es nicht mehr. Gemessen am Lauf vom 18.8.:
+      7 % der 44 Grenzen liegen innerhalb 1,5 s einer Fuge, Zufallserwartung
+      8,1 % -- kein Unterschied. Grund: 33 Schnittfugen auf 20 Minuten sind
+      eine alle 37 Sekunden; ein Zwoelfsekuender enthaelt im Mittel keine
+      einzige. Nicht widerlegt, sondern fuer diese Laenge unbrauchbar.
+      Bei kurzen Ausschnitten traegt allein der Textsinn.
+
+  - name: themenwechselformel_am_anfang
+    staerke: schwach
+    regel: >
+      Formeln wie "Lasst uns ganz kurz noch ueber X reden" markieren einen
+      Anfang.
+    belegt_durch: "4 von 17 Anfaengen (24 %) gegen 7 % an Zufallspunkten."
+    hinweis: "Reales, aber duennes Signal. Taugt zur Rangfolge, nicht als Filter."
+
+# ---------------------------------------------------------------------------
+# Wie die Marken zu setzen sind -- betrifft das Werkzeug, nicht den Inhalt
+# ---------------------------------------------------------------------------
+
+setzung_der_marken:
+  stand: "seit 18.8.2026"
+  regel: >
+    Setze die Marken so, dass ALLES Gewollte darin liegt. Das Werkzeug zieht
+    sie danach auf Wortgrenzen ZUSAMMEN und sucht innerhalb von 250 ms die
+    leiseste Stelle. Es erweitert sie nie.
+  folge_fuer_die_zerlegung: >
+    Eine Marke, die ein gewolltes Wort nur zur Haelfte erfasst, verliert es --
+    ausser die Marke liegt hoechstens 150 ms hinter dessen Anfang. Eine Marke,
+    die ein UNgewolltes Wort mit erfasst, behaelt es. Im Zweifel also lieber
+    knapp innerhalb setzen als knapp ausserhalb.
+
+# ---------------------------------------------------------------------------
+# Widerlegt -- nicht wieder aufnehmen
+# ---------------------------------------------------------------------------
+
+widerlegt:
+
+  - name: ohne_vorwissen_vollstaendig_verstaendlich
+    stand_in: "0.4 und 0.5, definition.kern"
+    urteil: >
+      Zu streng formuliert. Im Lauf vom 18.8. fielen dadurch 14 von 34
+      Abschnitten wegen Zeigewoertern und vier weitere wegen fehlender
+      Bezugswoerter heraus -- darunter die staerksten Aussagen der ganzen
+      Aufnahme. Ersetzt durch zwei praezisere Regeln:
+      definition.was_fuer_sich_steht_heisst_nicht_selbsterklaerend und
+      kriterien.das_chart_zaehlt_als_kontext.
+
+  - name: offener_schluss_erzeugt_wiederholung
+    stand_in: "Arbeitsthese vom 17.8."
+    messung: >
+      Nicht durch eigene Messung widerlegt, sondern durch Literatur. Die
+      Metaanalyse zum Zeigarnik-Effekt (Ghibellini & Meier 2025, Humanities
+      and Social Sciences Communications 12, Art. 962) findet fuer den
+      Erinnerungsvorteil unterbrochener Aufgaben ein Verhaeltnis von 0,99 --
+      praktisch keinen Effekt, d_z = 0,15. Die Information-Gap-Theorie stuetzt,
+      dass eine Wissensluecke zur SUCHE motiviert; sie sagt nicht, dass
+      dieselbe Information ein zweites Mal konsumiert wird.
+    urteil: >
+      Als Hack nicht belegt. Der Kerngedanke -- kurz halten, nicht alles
+      erklaeren -- bleibt richtig, aber weil kuerzere Clips messbar oefter
+      wiederholt werden und weil das Langvideo seinen Sinn behalten muss.
+
+  - name: endet_mit_vollstaendigem_satz
+    messung_small: "7 von 17 Enden innerhalb 1,5 s eines Satzendes (Zufall 16 %)"
+    messung_medium: "8 von 17 (47 %), aber der Zufallswert stieg auf 29 % -- der Abstand schrumpft."
+    urteil: >
+      Widerlegt. Der Nutzer schneidet nach der Pointe, nicht nach dem Punkt.
+    ersetzt_durch: "der_gedanke_muss_fertig_sein"
+
+  - name: nennung_eines_instruments_am_anfang
+    messung: "6 von 17 (35 %) gegen 24 % an Zufallspunkten."
+    urteil: "Kein tragfaehiger Unterschied. Der Sprecher nennt durchgehend Coins."
+
+  - name: anrede_am_anfang
+    messung: "1 von 17, und dort erst 1 s NACH der Grenze."
+    urteil: "Widerlegt."
+
+  - name: frage_am_anfang
+    messung: "0 von 17."
+    urteil: "Widerlegt."
+
+# ---------------------------------------------------------------------------
+# Laenge -- unveraendert aus 0.5, im ersten Lauf bestaetigt
+# ---------------------------------------------------------------------------
+
+laenge:
+  ziel_s: [8, 15]
+  obergrenze_s: 20
+  harte_untergrenze_s: 5
+  grundsatz: >
+    Die Laenge ist eine BEDINGUNG, nicht nur ein Ergebnis. Findet sich der
+    Gedanke nicht in 20 Sekunden, ist es kein Short -- dann ist es
+    Langvideomaterial.
+
+  erster_lauf:
+    stand: "18.8.2026, Aufnahme 2026-08-18 08-51-21"
+    ergebnis: >
+      22 Kandidaten, Median 11,8 s, 18 im Zielbereich, 3 zwischen 15 und 20 s,
+      1 unter 8 s, keiner darueber.
+    bestaetigung_der_obergrenze: >
+      Vier Stellen scheiterten allein an der 20-Sekunden-Grenze -- alle
+      zwischen 22 und 25 s, KEINE zwischen 20 und 22 s. Direkt oberhalb der
+      Grenze liegt eine Luecke. Eine willkuerlich gesetzte Grenze haette Faelle
+      knapp darueber. Sie bleibt.
+    dichteunterschied: >
+      16 Kandidaten entfielen auf 1045 s Chartanalyse, 6 auf 170 s freie Rede
+      -- also 65 s je Kandidat gegen 28 s. Freie Rede ist mehr als doppelt so
+      ergiebig. Hinweis fuer kuenftige Aufnahmen, nicht fuer die Zerlegung.
+
+  belegt_durch_extern:
+    quelle: >
+      Zhao et al. (2024), KDD '24, "Counteracting Duration Bias in Video
+      Recommendation via Counterfactual Watch Time", DOI 10.1145/3637528.3671817,
+      Abb. 3. Kuaishou/KuaiRand- und WeChat-Logs.
+    befund: >
+      Anteil und Ausmass der Wiederholung nehmen mit steigender Videolaenge
+      monoton ab. Der kuerzeste Bereich -- rund 0 bis 14 Sekunden -- ist
+      deutlich vom Rest abgesetzt.
+    belegstaerke: >
+      Mittel bis hoch fuer die RICHTUNG. Niedrig fuer die Uebertragung auf
+      YouTube Shorts -- die Daten stammen von Kuaishou und WeChat.
+    zusatz_youtube: >
+      YouTube zaehlt seit Maerz 2025 Wiederholungen in den oeffentlichen
+      Aufrufen. Die "Engaged views", auf denen Wiedergabedauer und -anteil
+      beruhen, schliessen Loops AUSDRUECKLICH aus.
+
+  gemessen_im_alten_regime:
+    hinweis: >
+      Gueltig fuer die Frage, welche Laengen der Nutzer akzeptierte, ALS die
+      Vorgabe 30 bis 60 Sekunden lautete. Sagt nichts ueber 8 bis 15 Sekunden.
+    marken: {median_s: 40, spanne_s: [19, 72], n: 17}
+    urteile:
+      angenommen_median_s: 34
+      angenommen_spanne_s: [15, 57]
+      abgelehnt_ohne_grenzfehler_s: [53, 56, 56, 75]
+    alte_schwellen: {obergrenze_s: 90, warnschwelle_s: 50, angestrebt_s: 40}
+
+  kuerzester_belegter_fall: >
+    Der kuerzeste vom Nutzer angenommene Kandidat ist 15 s lang und liegt damit
+    an der OBERGRENZE des Zielbereichs. Unterhalb von 15 Sekunden existiert
+    kein einziges Urteil. Das bleibt die groesste offene Stelle.
+
+  achtung_achse: >
+    Alle Zeiten liegen auf der GERENDERTEN Achse.
+
+# ---------------------------------------------------------------------------
+# Bekannte Grenzen
+# ---------------------------------------------------------------------------
+
+bekannte_grenzen:
+  - >
+    DIE WICHTIGSTE: Saemtliche Nutzerurteile stammen aus dem Bereich 15 bis 75
+    Sekunden. Der Zielbereich 8 bis 15 Sekunden ist durch externe Evidenz
+    gestuetzt und durch kein eigenes Urteil. Der naechste Urteilsdurchgang ist
+    der erste Test der Grundannahme.
+  - >
+    NEU IN 0.6: polarisierung und im_zweifel_mitgeben sind Weisungen des
+    Nutzers, nicht Messungen. das_chart_zaehlt_als_kontext beruht auf seinem
+    Widerspruch gegen 14 Ablehnungen, nicht auf einem Vergleich zweier Laeufe.
+    Alle drei sind beim naechsten Urteilsdurchgang zu pruefen.
+  - >
+    Das Transkript der Aufnahme 2026-08-18 08-51-21 enthaelt NULL Satzzeichen
+    und NULL Grossbuchstaben, obwohl Modell und Aufrufparameter mit der
+    Aufnahme vom 7.8. identisch sind (dort 143 Punkte, 243 Kommas). Ursache
+    ungeklaert. Fuer die Zerlegung heisst das: Verlass dich nicht auf
+    Interpunktion als Strukturhinweis, sie kann fehlen.
+  - >
+    Die Wortzeitstempel sind grob: 80 % der Wortuebergaenge tragen eine Luecke
+    von 0 ms. Wo eine echte Sprechpause liegt, entscheidet seit dem 18.8. eine
+    Pegelmessung im Ton, nicht das Transkript.
+  - >
+    Was der Nutzer NICHT will, steht nur teilweise hier. Sechs Kriterien sind
+    erst durch Nachfragen beim Sichten entstanden. Weitere werden so entstehen.
