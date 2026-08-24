@@ -152,6 +152,19 @@ def offset_for_candidate(offsets: dict[int, int], index: int) -> int:
 # trim/atrim plus setpts, Neukodierung, feste Ausgabe-Framerate.
 # ---------------------------------------------------------------------------
 
+TON_EINBLENDE_MS = 40
+"""Auftrag shorts-tonblende: Dauer der Ton-Einblende am Anfang des Kandidaten.
+
+40 ms sind kurz genug, um kein Wort hoerbar zu verschlucken, und lang genug,
+um einen harten Schnitt mitten im Klang unhoerbar zu machen - drei Fassungen
+der Punktsuche (Wortgrenzen, Schranke, Wortrandabstand) wurden trotzdem als
+"angeschnitten" gehoert, die gemessenen Pausen dieser Aufnahme sind im Median
+40 ms kurz, ein sauberer Schnittpunkt existiert dort nicht."""
+
+TON_AUSBLENDE_MS = 40
+"""Auftrag shorts-tonblende: Dauer der Ton-Ausblende am Ende des Kandidaten -
+dieselbe Begruendung wie :data:`TON_EINBLENDE_MS`."""
+
 
 SENDCMD_MAX_ZEICHEN = 24_000
 """Obergrenze fuer die Kommandoliste - darueber wird die Kommandozeile unter Windows eng.
@@ -272,6 +285,17 @@ def build_ffmpeg_filter_complex(
     Verfahren aus ``avatar_cut.build_ffmpeg_filter_complex``, hier auf einen
     einzelnen Ausschnitt statt mehrere Keep-Segmente angewendet - kein
     ``concat`` noetig, es gibt nur eine Spanne je Kandidat.
+
+    Auftrag shorts-tonblende: NACH ``atrim``/``asetpts`` blendet die Tonspur
+    an beiden Enden weich ein/aus (``afade``, :data:`TON_EINBLENDE_MS`/
+    :data:`TON_AUSBLENDE_MS`) - hier und nirgends sonst, weil hier der
+    Kandidatenton geschnitten und direkt danach neu kodiert wird (siehe
+    :func:`build_ffmpeg_arguments`); jede spaetere Stufe der Shorts-Linie
+    kopiert den Ton nur noch unveraendert durch (``-c:a copy`` in ``canvas``,
+    ``avatar_canvas``, ``subtitle_burn``). Die Blende liegt INNERHALB der
+    schon per ``atrim`` geschnittenen Spanne (verlaengert sie nicht) und
+    betrifft ausschliesslich die Audiospur - Framezahl und Bildfilter (Video)
+    sind davon unberuehrt.
     """
     if end_frame <= start_frame:
         raise ValueError(f"end_frame ({end_frame}) muss nach start_frame ({start_frame}) liegen")
@@ -282,11 +306,24 @@ def build_ffmpeg_filter_complex(
         )
     start_s = start_frame / fps
     end_s = end_frame / fps
+    clip_duration_s = end_s - start_s
+    einblende_s = TON_EINBLENDE_MS / 1000
+    ausblende_s = TON_AUSBLENDE_MS / 1000
+    if clip_duration_s < einblende_s + ausblende_s:
+        raise ValueError(
+            f"Kandidatenspanne ({clip_duration_s:.3f} s) ist kuerzer als Ein- plus "
+            f"Ausblende ({einblende_s + ausblende_s:.3f} s)"
+        )
+    ausblende_start_s = clip_duration_s - ausblende_s
     video = (
         f"[0:v]trim=start_frame={start_frame}:end_frame={end_frame},"
         f"setpts=PTS-STARTPTS,{crop_scale_filter(x_offset, kurve=kurve, fps=fps)}[v0]"
     )
-    audio = f"[0:a]atrim=start={start_s:.9f}:end={end_s:.9f},asetpts=PTS-STARTPTS[a0]"
+    audio = (
+        f"[0:a]atrim=start={start_s:.9f}:end={end_s:.9f},asetpts=PTS-STARTPTS,"
+        f"afade=t=in:st=0:d={einblende_s:.9f},"
+        f"afade=t=out:st={ausblende_start_s:.9f}:d={ausblende_s:.9f}[a0]"
+    )
     return f"{video};{audio}", "[v0]", "[a0]"
 
 

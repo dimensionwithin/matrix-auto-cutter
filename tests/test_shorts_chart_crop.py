@@ -160,6 +160,66 @@ def test_build_ffmpeg_filter_complex_rejects_non_positive_span() -> None:
         cc.build_ffmpeg_filter_complex(start_frame=100, end_frame=100, x_offset=0, fps=60)
 
 
+# --- Auftrag shorts-tonblende: Ton-Ein-/Ausblende NACH atrim/asetpts, bevor die
+# Neukodierung greift - Bild/Framezahl bleiben davon vollstaendig unberuehrt. ---
+
+
+def test_ton_blende_konstanten_sind_40_ms() -> None:
+    assert cc.TON_EINBLENDE_MS == 40
+    assert cc.TON_AUSBLENDE_MS == 40
+
+
+def test_build_ffmpeg_filter_complex_haengt_afade_an_die_tonspur() -> None:
+    """Die Audiokette bekommt nach ``atrim``/``asetpts`` eine Ein- und eine
+    Ausblende - Start/Dauer aus denselben ``start_s``/``end_s``, die auch
+    ``atrim`` speist (keine neue Messung)."""
+    fps = 60
+    start_frame, end_frame = 7555, 8415
+    filter_complex, video_label, audio_label = cc.build_ffmpeg_filter_complex(
+        start_frame=start_frame, end_frame=end_frame, x_offset=416, fps=fps
+    )
+    assert video_label == "[v0]"
+    assert audio_label == "[a0]"
+    _video_teil, _, audio_teil = filter_complex.partition(";")
+    clip_duration_s = (end_frame - start_frame) / fps
+    einblende_s = cc.TON_EINBLENDE_MS / 1000
+    ausblende_s = cc.TON_AUSBLENDE_MS / 1000
+    ausblende_start_s = clip_duration_s - ausblende_s
+    # afade folgt NACH atrim/asetpts, nicht davor - sonst wuerde die Blende an
+    # der falschen (ungeschnittenen) Achse ansetzen.
+    atrim_index = audio_teil.index("atrim")
+    asetpts_index = audio_teil.index("asetpts")
+    afade_in_index = audio_teil.index("afade=t=in")
+    afade_out_index = audio_teil.index("afade=t=out")
+    assert atrim_index < asetpts_index < afade_in_index < afade_out_index
+    assert f"afade=t=in:st=0:d={einblende_s:.9f}" in audio_teil
+    assert f"afade=t=out:st={ausblende_start_s:.9f}:d={ausblende_s:.9f}" in audio_teil
+
+
+def test_build_ffmpeg_filter_complex_video_teil_unveraendert_durch_die_blende() -> None:
+    """Die Blende betrifft ausschliesslich die Audiospur - der Videofilterteil
+    (und damit die Framezahl) ist bit-identisch mit dem Stand vor der Blende."""
+    kwargs = dict(start_frame=7555, end_frame=8415, x_offset=416, fps=60)
+    filter_complex, _, _ = cc.build_ffmpeg_filter_complex(**kwargs)
+    video_teil, _, _ = filter_complex.partition(";")
+    assert video_teil == (
+        "[0:v]trim=start_frame=7555:end_frame=8415,"
+        "setpts=PTS-STARTPTS,crop=1728:1440:416:0,scale=1080:900[v0]"
+    )
+    assert "afade" not in video_teil
+
+
+def test_build_ffmpeg_filter_complex_rejects_span_kuerzer_als_die_blenden() -> None:
+    """Eine Spanne, die kuerzer ist als Ein- plus Ausblende zusammen, ist ein
+    Fehler - keine stillschweigend negative/ueberlappende Blende."""
+    fps = 60
+    zu_kurze_frames = round(fps * (cc.TON_EINBLENDE_MS + cc.TON_AUSBLENDE_MS) / 1000 / 2)
+    with pytest.raises(ValueError):
+        cc.build_ffmpeg_filter_complex(
+            start_frame=0, end_frame=zu_kurze_frames, x_offset=0, fps=fps
+        )
+
+
 def test_build_ffmpeg_arguments_uses_expected_shape() -> None:
     arguments = cc.build_ffmpeg_arguments(
         Path("ffmpeg.exe"),

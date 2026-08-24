@@ -85,15 +85,21 @@ from matrix_auto_cutter.shorts.frame_map import (
 )
 from matrix_auto_cutter.shorts.inventory import discover_ffprobe
 from matrix_auto_cutter.shorts.level_cut import (
+    MIN_NACHKLANG_MS,
     VERFAHREN_BEREICHSMITTE,
-    VERFAHREN_WORT_EINSATZ,
+    VERFAHREN_TONBLENDE_GROSSZUEGIG,
+    VERFAHREN_WORTRAND_KOLLISION,
     LevelCutFailed,
     LevelSnap,
     StilleVorlauf,
+    finde_nachbarrand_ausklang,
+    finde_nachbarrand_einsatz,
     finde_stillevorlauf,
     finde_worteinsatz_ton,
     finde_wortende_ton,
-    verschiebe_auf_leiseste_stelle,
+    finde_wortrand_anfang,
+    finde_wortrand_ende,
+    miss_pegel_bei_marke,
 )
 from matrix_auto_cutter.shorts.loop_point import (
     GEEIGNET,
@@ -1280,6 +1286,7 @@ def _apply_level_correction(
     ffmpeg_path: Path,
     search_window_start_ms: int | None = None,
     stillevorlauf_aktiv: bool = True,
+    end_min_nachklang_ms: int | None = None,
 ) -> tuple[int, int, LevelCorrectionInfo]:
     """Schiebe beide gerasteten Grenzen auf die jeweils leiseste Stelle - Punkt 5.
 
@@ -1295,32 +1302,56 @@ def _apply_level_correction(
     Pegelmessung unten (150 ms) nicht erreicht. Wird eine gefunden, gilt die
     verschobene Marke als Ausgangspunkt fuer die anschliessende Pegelmessung.
 
-    Die STARTgrenze sucht nur rueckwaerts (Auftrag shorts-pegelschnitt-richtung):
-    eine Korrektur nach spaeter schneidet sonst das erste Wort an. Die ENDgrenze
-    sucht weiterhin in beide Richtungen - dort war das Verhalten schon richtig.
+    ``search_window_start_ms`` (Auftrag shorts-pegelfenster-vergleich) ist seit
+    Auftrag shorts-tonblende OHNE WIRKUNG in dieser Funktion: es reichte das
+    Suchfenster der :func:`level_cut.verschiebe_auf_leiseste_stelle`-Suche an
+    der STARTgrenze durch, und genau diese Suche entfaellt jetzt im
+    Normalfall (die Startgrenze wird direkt gesetzt, siehe unten) - der
+    Parameter bleibt nur der Signatur/CLI zuliebe erhalten (unveraendert
+    durchgereicht bis hierher), nicht weil er noch etwas bewirkt.
 
-    ``search_window_start_ms`` (Auftrag shorts-pegelfenster-vergleich) reicht,
-    wenn gesetzt, das Suchfenster der STARTgrenze durch (sonst
-    :data:`level_cut.SEARCH_WINDOW_START_MS`) - fuer den Pruefstein, der
-    mehrere Werte gegeneinander baut, ohne diese Funktion zu verdoppeln. Die
-    ENDgrenze ist davon unberuehrt.
+    Auftrag shorts-tonblende: drei Fassungen der reinen Punktsuche
+    (shorts-wortgrenzen, shorts-endgrenze-schranke, shorts-wortrand-abstand)
+    klangen weiterhin angeschnitten - zwischen zwei Woertern fluessiger Rede
+    liegt selten ein wirklich sauberer Schnittpunkt (gemessene Pausen dieser
+    Aufnahme im Median 40 ms). Statt die Grenze weiter vor das Wort zu
+    schieben, bleibt das Wort jetzt bewusst GANZ in der gebauten Spanne, und
+    eine kurze Ton-Ein-/Ausblende (:data:`chart_crop.TON_EINBLENDE_MS`/
+    :data:`chart_crop.TON_AUSBLENDE_MS`, in ``chart_crop.build_ffmpeg_filter_complex``
+    angewandt) macht den harten Schnitt am Rand unhoerbar. Beide Grenzen
+    werden weiterhin ueber :func:`level_cut.finde_wortrand_ende`/
+    :func:`level_cut.finde_wortrand_anfang` (Pausengrund-Verfahren, TEIL 1)
+    bestimmt - nur die WAHL der tatsaechlichen Grenze aus diesen gemessenen
+    Wortraendern hat sich geaendert, keine neue Messung:
 
-    Auftrag shorts-pegel-wortgrenze, Nachtrag N1/TEIL 3: aus ``boundaries``
-    (die ``rasten_auf_wortgrenzen`` bereits aus der Wortliste des ganzen
-    Videos berechnet hat, samt ``pause_before_ms``/``pause_after_ms``) werden
-    die REINEN Wortgrenzen (ohne :data:`loop_point.LOOP_PAD_MS`-Polster)
-    zurueckgerechnet und daraus am TON gemessene Schranken bestimmt -
-    :func:`level_cut.finde_wortende_ton` (Lautende der Endgrenze, Ausklang des
-    Vorgaengerwortes fuer die Startgrenze) und
-    :func:`level_cut.finde_worteinsatz_ton` (Einsatz des ersten enthaltenen
-    Wortes, TEIL 3). Der jeweilige Ausklang geht als ``such_min_ms`` an
-    :func:`verschiebe_auf_leiseste_stelle`: die leiseste-Stelle-Suche darf eine
-    Grenze nicht mehr VOR das gemessene Lautende schieben. Der Worteinsatz
-    (nur an der Startgrenze) ist dagegen ein ZIEL, keine blosse obere Schranke
-    fuer dieselbe Suche - eine Schranke wuerde nur verhindern, dass die Suche
-    darueber hinaus waehlt, sie aber nicht dorthin zwingen; liegt der Einsatz
-    spaeter als das (weiterhin nur rueckwaerts gesuchte) Ergebnis der
-    Pegelkorrektur, wird er stattdessen uebernommen (:data:`level_cut.VERFAHREN_WORT_EINSATZ`).
+    * ENDgrenze: DIREKT ``wahres_wortende + max(MIN_NACHKLANG_MS,
+      end_min_nachklang_ms)``, gedeckelt auf hoechstens den wahren Anfang des
+      naechsten Wortes (nicht mehr dessen Whisper-Marke - bei
+      ``pause_after_ms = 0`` ist die echte Pause nicht null, nur in den
+      Whisper-Zahlen unsichtbar). Kein Suchen mehr
+      (:func:`level_cut.verschiebe_auf_leiseste_stelle` entfaellt hier) -
+      Verfahren :data:`level_cut.VERFAHREN_TONBLENDE_GROSSZUEGIG`.
+    * STARTgrenze: DIREKT ``wahrer_wortanfang - chart_crop.TON_EINBLENDE_MS``,
+      gedeckelt auf mindestens das wahre Ende des vorigen Wortes (ebenso am
+      Ton gemessen, nicht dessen Whisper-Marke). Ebenfalls kein Suchen mehr -
+      Verfahren :data:`level_cut.VERFAHREN_TONBLENDE_GROSSZUEGIG`.
+    * Kollidieren beide Seiten (der direkte Wert wuerde vor bzw. an den
+      wahren Rand des Nachbarworts selbst reichen - kein Platz mehr), gilt
+      unveraendert die Mitte zwischen wahrem Wortende und wahrem Anfang des
+      Nachbarn (:data:`level_cut.VERFAHREN_WORTRAND_KOLLISION`) - kein
+      Fallback auf eine Whisper-Marke.
+    * Findet :func:`level_cut.finde_wortrand_ende`/
+      :func:`level_cut.finde_wortrand_anfang` keinen Bereich (selten - kein
+      Pausengrund im Suchfenster), fallen die beiden Funktionen auf die
+      aelteren, threshold-basierten :func:`level_cut.finde_wortende_ton`/
+      :func:`level_cut.finde_worteinsatz_ton` zurueck.
+
+    Die frueheren Konstanten :data:`level_cut.WORTRAND_ABSTAND_ENDE_MS`/
+    :data:`level_cut.WORTRAND_ABSTAND_ANFANG_MS` (Auftrag
+    shorts-wortrand-abstand) werden in dieser Formel nicht mehr verwendet -
+    ihre WERTE bleiben unveraendert stehen (siehe dort), nur der Gebrauch
+    hier entfaellt, weil die Blende den Uebergang jetzt traegt.
+
     LOOP_PAD_MS selbst bleibt unveraendert (VERBOTEN, siehe Auftrag).
 
     Schlaegt eine Messung fehl, bleiben die gerasteten Grenzen stehen und der
@@ -1340,7 +1371,6 @@ def _apply_level_correction(
     new_end_ms = boundaries.end_ms - end_pad_ms
     prev_word_end_ms = None if pause_before_ms is None else new_start_ms - pause_before_ms
 
-    effective_start_ms = boundaries.start_ms
     stille_ergebnis: StilleVorlauf | None = None
     try:
         if stillevorlauf_aktiv:
@@ -1351,61 +1381,180 @@ def _apply_level_correction(
                 ffmpeg_path=ffmpeg_path,
                 timeout_seconds=LEVEL_CUT_TIMEOUT_SECONDS,
             )
-            if stille_ergebnis.verschoben:
-                effective_start_ms = stille_ergebnis.corrected_ms
 
-        start_floor_ms = None
-        if prev_word_end_ms is not None:
-            start_floor_ms = finde_wortende_ton(
-                rendered_video_path,
-                prev_word_end_ms,
-                ffmpeg_path=ffmpeg_path,
-                erweiterte_suche=False,
+        # Auftrag shorts-wortrand-abstand: der whisper-Anfang des naechsten
+        # (bzw. Ende des vorigen) Wortes dient nur noch als ANKER fuer die
+        # Pausengrund-Suchen - die eigentlichen Schranken sind die daraus
+        # gemessenen wahren Wortraender, nicht mehr die Whisper-Marken selbst.
+        next_word_start_ms = None if pause_after_ms is None else new_end_ms + pause_after_ms
+
+        # Eigenes Wortende/eigener Wortanfang - Pausengrund-Verfahren, mit
+        # Rueckfall auf die aeltere, threshold-basierte Messung, falls kein
+        # Pausengrund-Bereich im Suchfenster liegt.
+        own_true_end_ms = finde_wortrand_ende(
+            rendered_video_path, new_end_ms, ffmpeg_path=ffmpeg_path,
+            timeout_seconds=LEVEL_CUT_TIMEOUT_SECONDS,
+        )
+        if own_true_end_ms is None:
+            own_true_end_ms = finde_wortende_ton(
+                rendered_video_path, new_end_ms, ffmpeg_path=ffmpeg_path,
+                ober_grenze_ms=next_word_start_ms, timeout_seconds=LEVEL_CUT_TIMEOUT_SECONDS,
+            )
+        # Anker fuer die eigene Anlauf-Suche: normalerweise die reine
+        # Wortgrenze - AUSSER der Stillevorlauf hat gerade gegriffen
+        # (``verschoben``): dann steht new_start_ms auf einer whisper-Marke,
+        # die selbst um bis zu :data:`level_cut.VORLAUF_SUCHE_MAX_MS`
+        # danebenliegt (Auftrag shorts-stillevorlauf) - die enge, lokale
+        # Wortrand-Suche (+-150/60 ms) wuerde dort blind in der falschen
+        # Stille suchen. Der Stillevorlauf hat den echten Sprechbeginn schon
+        # robust (bis 3000 ms) gefunden - dessen Ergebnis ist der bessere Anker.
+        anfang_anker_ms = (
+            stille_ergebnis.corrected_ms
+            if stille_ergebnis is not None and stille_ergebnis.verschoben
+            else new_start_ms
+        )
+        own_true_start_ms = finde_wortrand_anfang(
+            rendered_video_path, anfang_anker_ms, ffmpeg_path=ffmpeg_path,
+            timeout_seconds=LEVEL_CUT_TIMEOUT_SECONDS,
+        )
+        if own_true_start_ms is None:
+            own_true_start_ms = finde_worteinsatz_ton(
+                rendered_video_path, new_start_ms, ffmpeg_path=ffmpeg_path,
                 timeout_seconds=LEVEL_CUT_TIMEOUT_SECONDS,
             )
-        start_ceiling_ms = finde_worteinsatz_ton(
-            rendered_video_path,
-            new_start_ms,
-            ffmpeg_path=ffmpeg_path,
-            nicht_vor_ms=start_floor_ms,
-            timeout_seconds=LEVEL_CUT_TIMEOUT_SECONDS,
-        )
-        end_floor_ms = finde_wortende_ton(
-            rendered_video_path,
-            new_end_ms,
-            ffmpeg_path=ffmpeg_path,
-            timeout_seconds=LEVEL_CUT_TIMEOUT_SECONDS,
-        )
 
-        start_snap = verschiebe_auf_leiseste_stelle(
-            rendered_video_path,
-            effective_start_ms,
-            ffmpeg_path=ffmpeg_path,
-            nur_rueckwaerts=True,
-            search_window_start_ms=search_window_start_ms,
-            such_min_ms=start_floor_ms,
-            timeout_seconds=LEVEL_CUT_TIMEOUT_SECONDS,
-        )
-        # TEIL 3: der gemessene Worteinsatz ist ein ZIEL, keine blosse obere
-        # Schranke fuer die leiseste-Stelle-Suche - eine Schranke allein wuerde
-        # nur verhindern, dass die Suche DARUEBER hinaus waehlt, sie zwingt sie
-        # aber nicht dorthin. Liegt der Einsatz spaeter als das Ergebnis der
-        # (weiterhin nur rueckwaerts suchenden) Pegelkorrektur, gewinnt er.
-        if start_ceiling_ms > start_snap.corrected_ms:
-            start_snap = replace(
-                start_snap,
-                corrected_ms=start_ceiling_ms,
-                shift_ms=start_ceiling_ms - start_snap.original_ms,
-                verfahren=VERFAHREN_WORT_EINSATZ,
+        # Nachbarwoerter: wahres Ende des vorigen (Schranke der Startgrenze)
+        # und wahrer Anfang des naechsten (Schranke der Endgrenze) - jeweils
+        # am eigenen wahren Wortrand gedeckelt, sonst koennte die Suche ueber
+        # das eigene, kurze Wort hinweglaufen (Befund: "angekommen." vor
+        # kandidat-00, ungedeckelt 31140 - hinter dem Anfang von "Na," selbst).
+        # Auftrag shorts-nachbarrand: bei einer Nullpause (pause_before_ms/
+        # pause_after_ms <= 0) liegt die whisper-Marke des Nachbarworts exakt
+        # auf der eigenen, ungekorrigierten Wortgrenze - die Pausengrund-Suche
+        # um DIESE Marke (finde_wortrand_ende/finde_wortrand_anfang) trifft
+        # dann oft nur den eigenen Ausklang/Anlauf statt die tatsaechliche
+        # Pause zum Nachbarn. In diesem Fall sucht zuerst die neue,
+        # unabhaengige Suche ab dem schon gemessenen EIGENEN wahren Wortrand
+        # (finde_nachbarrand_ausklang/finde_nachbarrand_einsatz); liefert sie
+        # keinen Treffer (oder ist die Pause > 0 bzw. unbekannt), gilt
+        # unveraendert das bisherige Verfahren.
+        neighbor_true_end_ms = None
+        if prev_word_end_ms is not None:
+            if pause_before_ms is not None and pause_before_ms <= 0:
+                neighbor_true_end_ms = finde_nachbarrand_ausklang(
+                    rendered_video_path, own_true_start_ms, ffmpeg_path=ffmpeg_path,
+                    timeout_seconds=LEVEL_CUT_TIMEOUT_SECONDS,
+                )
+            if neighbor_true_end_ms is None:
+                neighbor_true_end_ms = finde_wortrand_ende(
+                    rendered_video_path, prev_word_end_ms, ffmpeg_path=ffmpeg_path,
+                    ober_grenze_ms=own_true_start_ms, timeout_seconds=LEVEL_CUT_TIMEOUT_SECONDS,
+                )
+            if neighbor_true_end_ms is None:
+                neighbor_true_end_ms = prev_word_end_ms
+        neighbor_true_start_ms = None
+        if next_word_start_ms is not None:
+            if pause_after_ms is not None and pause_after_ms <= 0:
+                neighbor_true_start_ms = finde_nachbarrand_einsatz(
+                    rendered_video_path, own_true_end_ms, ffmpeg_path=ffmpeg_path,
+                    timeout_seconds=LEVEL_CUT_TIMEOUT_SECONDS,
+                )
+            if neighbor_true_start_ms is None:
+                neighbor_true_start_ms = finde_wortrand_anfang(
+                    rendered_video_path, next_word_start_ms, ffmpeg_path=ffmpeg_path,
+                    unter_grenze_ms=own_true_end_ms, timeout_seconds=LEVEL_CUT_TIMEOUT_SECONDS,
+                )
+            if neighbor_true_start_ms is None:
+                neighbor_true_start_ms = next_word_start_ms
+
+        # --- Startgrenze (Auftrag shorts-tonblende): grosszuegig DIREKT
+        # gesetzt statt gesucht - das Wort darf ganz in der Spanne bleiben,
+        # weil die neue Ton-Einblende (chart_crop.TON_EINBLENDE_MS) den
+        # Uebergang jetzt selbst weich macht. Keine neue Messung, nur eine
+        # andere Wahl innerhalb der schon gemessenen Wortraender. Kollidiert
+        # der direkte Wert mit dem wahren Ende des vorigen Wortes (kein Platz
+        # mehr), gilt weiterhin die Mitte (VERFAHREN_WORTRAND_KOLLISION,
+        # unveraendert).
+        start_floor_ms = own_true_start_ms - chart_crop.TON_EINBLENDE_MS
+        if neighbor_true_end_ms is not None and neighbor_true_end_ms >= start_floor_ms:
+            kollision_start_ms = (neighbor_true_end_ms + own_true_start_ms) // 2
+            level_db, window_mean_db = miss_pegel_bei_marke(
+                rendered_video_path, kollision_start_ms, ffmpeg_path=ffmpeg_path,
+                timeout_seconds=LEVEL_CUT_TIMEOUT_SECONDS,
+            )
+            start_snap = LevelSnap(
+                original_ms=boundaries.start_ms,
+                corrected_ms=kollision_start_ms,
+                shift_ms=kollision_start_ms - boundaries.start_ms,
+                level_db=level_db,
+                window_mean_db=window_mean_db,
+                verfahren=VERFAHREN_WORTRAND_KOLLISION,
                 quiet_region_ms=0,
             )
-        end_snap = verschiebe_auf_leiseste_stelle(
-            rendered_video_path,
-            boundaries.end_ms,
-            ffmpeg_path=ffmpeg_path,
-            such_min_ms=end_floor_ms,
-            timeout_seconds=LEVEL_CUT_TIMEOUT_SECONDS,
-        )
+        else:
+            start_ms = (
+                start_floor_ms
+                if neighbor_true_end_ms is None
+                else max(start_floor_ms, neighbor_true_end_ms)
+            )
+            level_db, window_mean_db = miss_pegel_bei_marke(
+                rendered_video_path, start_ms, ffmpeg_path=ffmpeg_path,
+                timeout_seconds=LEVEL_CUT_TIMEOUT_SECONDS,
+            )
+            start_snap = LevelSnap(
+                original_ms=boundaries.start_ms,
+                corrected_ms=start_ms,
+                shift_ms=start_ms - boundaries.start_ms,
+                level_db=level_db,
+                window_mean_db=window_mean_db,
+                verfahren=VERFAHREN_TONBLENDE_GROSSZUEGIG,
+                quiet_region_ms=0,
+            )
+
+        # --- Endgrenze (Auftrag shorts-tonblende): spiegelbildlich
+        # grosszuegig DIREKT gesetzt statt gesucht - die Ton-Ausblende
+        # (chart_crop.TON_AUSBLENDE_MS) traegt den Uebergang. Der
+        # Mindestnachklang (MIN_NACHKLANG_MS, ``end_min_nachklang_ms`` wenn
+        # gesetzt) bleibt die einzige Reserve zum wahren Wortende. Kollidiert
+        # der direkte Wert mit dem wahren Anfang des naechsten Wortes (kein
+        # Platz mehr), gilt weiterhin die Mitte (VERFAHREN_WORTRAND_KOLLISION,
+        # unveraendert).
+        nachklang_ms = MIN_NACHKLANG_MS if end_min_nachklang_ms is None else end_min_nachklang_ms
+        end_floor_ms = own_true_end_ms + nachklang_ms
+        if neighbor_true_start_ms is not None and end_floor_ms >= neighbor_true_start_ms:
+            kollision_end_ms = (own_true_end_ms + neighbor_true_start_ms) // 2
+            level_db, window_mean_db = miss_pegel_bei_marke(
+                rendered_video_path, kollision_end_ms, ffmpeg_path=ffmpeg_path,
+                timeout_seconds=LEVEL_CUT_TIMEOUT_SECONDS,
+            )
+            end_snap = LevelSnap(
+                original_ms=boundaries.end_ms,
+                corrected_ms=kollision_end_ms,
+                shift_ms=kollision_end_ms - boundaries.end_ms,
+                level_db=level_db,
+                window_mean_db=window_mean_db,
+                verfahren=VERFAHREN_WORTRAND_KOLLISION,
+                quiet_region_ms=0,
+            )
+        else:
+            end_ms = (
+                end_floor_ms
+                if neighbor_true_start_ms is None
+                else min(end_floor_ms, neighbor_true_start_ms)
+            )
+            level_db, window_mean_db = miss_pegel_bei_marke(
+                rendered_video_path, end_ms, ffmpeg_path=ffmpeg_path,
+                timeout_seconds=LEVEL_CUT_TIMEOUT_SECONDS,
+            )
+            end_snap = LevelSnap(
+                original_ms=boundaries.end_ms,
+                corrected_ms=end_ms,
+                shift_ms=end_ms - boundaries.end_ms,
+                level_db=level_db,
+                window_mean_db=window_mean_db,
+                verfahren=VERFAHREN_TONBLENDE_GROSSZUEGIG,
+                quiet_region_ms=0,
+            )
     except LevelCutFailed as exc:
         return (
             boundaries.start_ms,
@@ -1594,6 +1743,7 @@ def run_shorts_build(
     timeout_seconds: int = 1800,
     search_window_start_ms: int | None = None,
     stillevorlauf_aktiv: bool = True,
+    end_min_nachklang_ms: int | None = None,
     arbeitskopie_aktiv: bool = True,
     parallel: int = PARALLEL_DEFAULT,
     framecount_cache_aktiv: bool = True,
@@ -1607,6 +1757,12 @@ def run_shorts_build(
 
     ``search_window_start_ms`` reicht (Auftrag shorts-pegelfenster-vergleich)
     unveraendert an :func:`_apply_level_correction` durch - siehe dort.
+
+    ``end_min_nachklang_ms`` reicht (Auftrag shorts-endgrenze-schranke)
+    unveraendert an :func:`_apply_level_correction` durch - ``None`` (Vorgabe)
+    nimmt :data:`level_cut.MIN_NACHKLANG_MS`. Fuer den Pruefstein, der zwei
+    Fassungen von kandidat-00 gegeneinander baut (Mindestnachklang gegen die
+    maximal von TEIL 1 erlaubte Grenze), ohne diese Funktion zu verdoppeln.
 
     ``stillevorlauf_aktiv`` (Auftrag shorts-stillevorlauf, Standard an): schaltet
     die Stillevorlauf-Pruefung an der STARTgrenze ab - ``--kein-stillevorlauf``
@@ -1735,6 +1891,7 @@ def run_shorts_build(
             timeout_seconds=timeout_seconds,
             search_window_start_ms=search_window_start_ms,
             stillevorlauf_aktiv=stillevorlauf_aktiv,
+            end_min_nachklang_ms=end_min_nachklang_ms,
             parallel=parallel,
             wache=wache,
             notizen=notizen,
@@ -1774,6 +1931,7 @@ def _kandidat_verarbeiten(
     timeout_seconds: int,
     search_window_start_ms: int | None,
     stillevorlauf_aktiv: bool,
+    end_min_nachklang_ms: int | None,
     wache: _ProzessWache,
     notizen: _Laufnotizen,
 ) -> tuple[CandidateOutcome, bool]:
@@ -1870,6 +2028,7 @@ def _kandidat_verarbeiten(
         ffmpeg_path=ffmpeg_path,
         search_window_start_ms=search_window_start_ms,
         stillevorlauf_aktiv=stillevorlauf_aktiv,
+        end_min_nachklang_ms=end_min_nachklang_ms,
     )
 
     # Stufe 3b auf der TATSAECHLICH gebauten Spanne, nicht auf den rohen
@@ -1978,6 +2137,7 @@ def _build_all_candidates(
     timeout_seconds: int,
     search_window_start_ms: int | None,
     stillevorlauf_aktiv: bool,
+    end_min_nachklang_ms: int | None,
     parallel: int,
     wache: _ProzessWache,
     notizen: _Laufnotizen,
@@ -2015,6 +2175,7 @@ def _build_all_candidates(
             timeout_seconds=timeout_seconds,
             search_window_start_ms=search_window_start_ms,
             stillevorlauf_aktiv=stillevorlauf_aktiv,
+            end_min_nachklang_ms=end_min_nachklang_ms,
             wache=wache,
             notizen=notizen,
         )

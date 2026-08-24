@@ -16,7 +16,9 @@ from matrix_auto_cutter.shorts.level_cut import (
     _ASTATS_KEY,
     _BLOCKS_PER_MEASURE,
     MEASURE_MS,
+    MIN_NACHKLANG_MS,
     MIN_PAUSE_MS,
+    NACHBARRAND_SUCHE_MS,
     SEARCH_WINDOW_MS,
     SEARCH_WINDOW_START_MS,
     START_EINSATZ_SUCHE_MS,
@@ -26,7 +28,9 @@ from matrix_auto_cutter.shorts.level_cut import (
     TIE_TOLERANCE_DB,
     VERFAHREN_BEREICHSMITTE,
     VERFAHREN_TIEFSTER_PUNKT,
+    VERFAHREN_TONBLENDE_GROSSZUEGIG,
     VERFAHREN_WORTGRENZE_STEHT,
+    VERFAHREN_WORTRAND_KOLLISION,
     VORLAUF_MAX_MS,
     VORLAUF_REST_MS,
     VORLAUF_SUCHE_MAX_MS,
@@ -34,12 +38,19 @@ from matrix_auto_cutter.shorts.level_cut import (
     WORTENDE_SUCHE_MAX_MS,
     WORTENDE_SUCHE_MS,
     WORTENDE_UNTERBRECHUNG_MAX_MS,
+    WORTRAND_SUCHE_ANFANG_RUECK_MS,
+    WORTRAND_SUCHE_ANFANG_VOR_MS,
+    WORTRAND_SUCHE_ENDE_MS,
     LevelCutFailed,
     ProcessResult,
     _combine_to_measure_window,
+    finde_nachbarrand_ausklang,
+    finde_nachbarrand_einsatz,
     finde_stillevorlauf,
     finde_worteinsatz_ton,
     finde_wortende_ton,
+    finde_wortrand_anfang,
+    finde_wortrand_ende,
     verschiebe_auf_leiseste_stelle,
 )
 
@@ -1030,6 +1041,204 @@ def test_wortende_ohne_erweiterte_suche_deckelt_frueher() -> None:
     assert ende == whisper_end_ms + WORTENDE_FALLBACK_MS
 
 
+def test_wortende_ober_grenze_ms_deckelt_gefundenen_uebergang() -> None:
+    """Auftrag shorts-endgrenze-schranke, TEIL 1: ``ober_grenze_ms`` deckelt
+    einen gefundenen Uebergang, der spaeter als die Schranke liegt - z. B.
+    ein Verschlusslaut im naechsten Wort, den die Suche sonst faelschlich
+    als Lautende naehme (Befund: kandidat-06, 271090 statt 270690)."""
+    whisper_end_ms = 20_000
+    raw_blocks = _wortende_raw_blocks()
+    levels = [-15.0] * raw_blocks
+    anchor_index = round((WORTENDE_SUCHE_MS - MEASURE_MS // 2) / STEP_MS)
+    uebergang_index = anchor_index + 5  # 50 ms nach der Marke
+    for i in range(uebergang_index, raw_blocks):
+        levels[i] = -60.0
+
+    ungedeckelt = finde_wortende_ton(
+        MEDIA, whisper_end_ms, ffmpeg_path=FFMPEG, process_runner=_runner_for(levels)
+    )
+    ober_grenze_ms = whisper_end_ms + 10  # noch VOR dem gefundenen Uebergang
+    gedeckelt = finde_wortende_ton(
+        MEDIA,
+        whisper_end_ms,
+        ffmpeg_path=FFMPEG,
+        ober_grenze_ms=ober_grenze_ms,
+        process_runner=_runner_for(levels),
+    )
+
+    assert ungedeckelt > ober_grenze_ms, "Testannahme: der ungedeckelte Uebergang liegt spaeter"
+    assert gedeckelt == ober_grenze_ms
+
+
+def test_wortende_ober_grenze_ms_deckelt_fallback() -> None:
+    """``ober_grenze_ms`` deckelt auch den konservativen Fallback, nicht nur
+    einen gefundenen Uebergang."""
+    whisper_end_ms = 20_000
+    levels = [-15.0] * _wortende_raw_blocks()  # durchgehend laut -> Fallback
+
+    ungedeckelt = finde_wortende_ton(
+        MEDIA, whisper_end_ms, ffmpeg_path=FFMPEG, process_runner=_runner_for(levels)
+    )
+    ober_grenze_ms = whisper_end_ms + 10  # deutlich vor whisper_end_ms + WORTENDE_FALLBACK_MS
+    gedeckelt = finde_wortende_ton(
+        MEDIA,
+        whisper_end_ms,
+        ffmpeg_path=FFMPEG,
+        ober_grenze_ms=ober_grenze_ms,
+        process_runner=_runner_for(levels),
+    )
+
+    assert ungedeckelt == whisper_end_ms + WORTENDE_FALLBACK_MS
+    assert ungedeckelt > ober_grenze_ms, "Testannahme: der Fallback liegt spaeter als der Deckel"
+    assert gedeckelt == ober_grenze_ms
+
+
+def test_wortende_ober_grenze_ms_none_lautet_unveraendert() -> None:
+    """``ober_grenze_ms=None`` (Vorgabe) - der alte Aufrufweg bleibt exakt erhalten."""
+    whisper_end_ms = 20_000
+    levels = [-15.0] * _wortende_raw_blocks()
+
+    mit_none = finde_wortende_ton(
+        MEDIA,
+        whisper_end_ms,
+        ffmpeg_path=FFMPEG,
+        ober_grenze_ms=None,
+        process_runner=_runner_for(levels),
+    )
+    ohne_parameter = finde_wortende_ton(
+        MEDIA, whisper_end_ms, ffmpeg_path=FFMPEG, process_runner=_runner_for(levels)
+    )
+
+    assert mit_none == ohne_parameter == whisper_end_ms + WORTENDE_FALLBACK_MS
+
+
+# ---------------------------------------------------------------------------
+# Auftrag shorts-wortrand-abstand: finde_wortrand_ende/finde_wortrand_anfang -
+# das Pausengrund-Verfahren (echte Pause statt Schwelle relativ zum Sprechpegel).
+# ---------------------------------------------------------------------------
+
+
+def _wortrand_ende_raw_blocks() -> int:
+    # +_BLOCKS_PER_MEASURE - 1: dieselbe rollende 40-ms-Kombination
+    # (_combine_to_measure_window) wie bei allen anderen Verfahren im Modul -
+    # ohne dieses Polster fehlen der kombinierten Reihe die letzten Bloecke.
+    return (WORTRAND_SUCHE_ENDE_MS + MEASURE_MS) // STEP_MS + _BLOCKS_PER_MEASURE - 1
+
+
+def _wortrand_anfang_raw_blocks() -> int:
+    return (
+        (WORTRAND_SUCHE_ANFANG_RUECK_MS + WORTRAND_SUCHE_ANFANG_VOR_MS + MEASURE_MS) // STEP_MS
+        + _BLOCKS_PER_MEASURE
+        - 1
+    )
+
+
+def test_wortrand_ende_findet_fruehesten_pausengrund_bereich() -> None:
+    """Der FRUEHESTE Bereich zaehlt, nicht der tiefste oder laengste - ein
+    spaeterer Bereich koennte zu einem dazwischenliegenden Wort gehoeren."""
+    word_end_ms = 20_000
+    levels = [-15.0] * _wortrand_ende_raw_blocks()
+    # erster Bereich ab Block 20 (200 ms nach der Marke), 20 Bloecke (200 ms)
+    # leise - erfuellt PAUSENGRUND_MIN_PAUSE_ENDE_MS (80 ms) klar, auch nach
+    # der rollenden 40-ms-Kombination.
+    for i in range(20, 40):
+        levels[i] = -45.0
+    # zweiter, tieferer Bereich weiter hinten - darf NICHT gewaehlt werden.
+    for i in range(60, 80):
+        levels[i] = -60.0
+
+    ergebnis = finde_wortrand_ende(
+        MEDIA, word_end_ms, ffmpeg_path=FFMPEG, process_runner=_runner_for(levels)
+    )
+
+    assert ergebnis == word_end_ms + 200, "der fruehere Bereich muss gewinnen"
+
+
+def test_wortrand_ende_ober_grenze_ms_deckelt() -> None:
+    """``ober_grenze_ms`` deckelt das Ergebnis - noetig, wenn dieses Wort das
+    VORIGE Wort an einer Startgrenze ist und die Suche sonst ueber das
+    naechste Wort hinweglaufen koennte."""
+    word_end_ms = 20_000
+    levels = [-15.0] * _wortrand_ende_raw_blocks()
+    for i in range(50, 70):
+        levels[i] = -60.0
+
+    ungedeckelt = finde_wortrand_ende(
+        MEDIA, word_end_ms, ffmpeg_path=FFMPEG, process_runner=_runner_for(levels)
+    )
+    ober_grenze_ms = word_end_ms + 100
+    gedeckelt = finde_wortrand_ende(
+        MEDIA,
+        word_end_ms,
+        ffmpeg_path=FFMPEG,
+        ober_grenze_ms=ober_grenze_ms,
+        process_runner=_runner_for(levels),
+    )
+
+    assert ungedeckelt > ober_grenze_ms, "Testannahme: der Bereich liegt spaeter als der Deckel"
+    assert gedeckelt == ober_grenze_ms
+
+
+def test_wortrand_ende_none_wenn_kein_bereich() -> None:
+    """Durchgehend laut - kein Pausengrund-Bereich im Suchfenster, kein Fallback."""
+    levels = [-15.0] * _wortrand_ende_raw_blocks()
+
+    ergebnis = finde_wortrand_ende(
+        MEDIA, 20_000, ffmpeg_path=FFMPEG, process_runner=_runner_for(levels)
+    )
+
+    assert ergebnis is None
+
+
+def test_wortrand_anfang_findet_spaetesten_pausengrund_bereich() -> None:
+    """Der SPAETESTE (dem Wortanfang naechstgelegene) Bereich zaehlt - die
+    Ruecksuche ist eng gefuehrt, deshalb ist Verunreinigung durch ein weiter
+    entferntes Wort unwahrscheinlich, aber die Auswahlregel bleibt konsistent
+    zu :func:`finde_wortrand_ende`."""
+    word_start_ms = 20_000
+    levels = [-15.0] * _wortrand_anfang_raw_blocks()
+    anchor_index = WORTRAND_SUCHE_ANFANG_RUECK_MS // STEP_MS  # Index der Marke selbst
+    # leiser Bereich unmittelbar vor der Marke, 15 Bloecke (150 ms) - erfuellt
+    # PAUSENGRUND_MIN_PAUSE_ANFANG_MS (30 ms) klar, auch nach der rollenden
+    # 40-ms-Kombination (_combine_to_measure_window).
+    for i in range(anchor_index - 15, anchor_index):
+        levels[i] = -45.0
+
+    ergebnis = finde_wortrand_anfang(
+        MEDIA, word_start_ms, ffmpeg_path=FFMPEG, process_runner=_runner_for(levels)
+    )
+
+    # die rollende Kombination zieht den gemessenen Rand um MEASURE_MS/2 nach
+    # innen - 19960 statt exakt 20000, siehe Docstring von
+    # :func:`_combine_to_measure_window`.
+    assert ergebnis == word_start_ms - 40
+
+
+def test_wortrand_anfang_unter_grenze_ms_deckelt() -> None:
+    """``unter_grenze_ms`` deckelt das Ergebnis nach unten - noetig, wenn
+    dieses Wort das NAECHSTE Wort an einer Endgrenze ist."""
+    word_start_ms = 20_000
+    levels = [-15.0] * _wortrand_anfang_raw_blocks()
+    anchor_index = WORTRAND_SUCHE_ANFANG_RUECK_MS // STEP_MS
+    for i in range(anchor_index - 15, anchor_index - 5):
+        levels[i] = -45.0
+
+    ungedeckelt = finde_wortrand_anfang(
+        MEDIA, word_start_ms, ffmpeg_path=FFMPEG, process_runner=_runner_for(levels)
+    )
+    unter_grenze_ms = word_start_ms - 50
+    gedeckelt = finde_wortrand_anfang(
+        MEDIA,
+        word_start_ms,
+        ffmpeg_path=FFMPEG,
+        unter_grenze_ms=unter_grenze_ms,
+        process_runner=_runner_for(levels),
+    )
+
+    assert ungedeckelt < unter_grenze_ms, "Testannahme: der Bereich liegt frueher als der Deckel"
+    assert gedeckelt == unter_grenze_ms
+
+
 def test_worteinsatz_bereits_laut_bleibt_marke() -> None:
     """Ist an der Marke (bzw. ``nicht_vor_ms``) bereits Ton, ist kein Vorruecken noetig."""
     whisper_start_ms = 20_000
@@ -1079,3 +1288,170 @@ def test_worteinsatz_fallback_wenn_kein_einsatz() -> None:
     )
 
     assert einsatz == whisper_start_ms
+
+
+# ---------------------------------------------------------------------------
+# Auftrag shorts-tonblende: das neue Verfahrenskennzeichen fuer die direkt
+# gesetzte (nicht gesuchte) Grenze - die eigentliche Formel lebt in
+# ``build._apply_level_correction`` (siehe tests/test_shorts_build.py), hier
+# nur der Vertrag des Kennzeichens selbst.
+# ---------------------------------------------------------------------------
+
+
+def test_verfahren_tonblende_grosszuegig_ist_ein_eigenes_kennzeichen() -> None:
+    """Das neue Verfahren ist ein eigener, von den bisherigen unterscheidbarer
+    String - so bleibt im Baubericht sichtbar, dass hier direkt gewaehlt statt
+    gesucht wurde (Auftrag shorts-tonblende, ersetzt VERFAHREN_WORTRAND_KOLLISION
+    im Nicht-Kollisionsfall)."""
+    assert VERFAHREN_TONBLENDE_GROSSZUEGIG == "tonblende_grosszuegig"
+    andere_verfahren = {
+        VERFAHREN_BEREICHSMITTE,
+        VERFAHREN_TIEFSTER_PUNKT,
+        VERFAHREN_WORTGRENZE_STEHT,
+        VERFAHREN_WORTRAND_KOLLISION,
+    }
+    assert VERFAHREN_TONBLENDE_GROSSZUEGIG not in andere_verfahren
+    # MIN_NACHKLANG_MS bleibt unveraendert im Modul stehen - es wird nur nicht
+    # mehr zusammen mit WORTRAND_ABSTAND_ENDE_MS gemaximt (siehe build.py),
+    # sondern ist an der Endgrenze jetzt der alleinige Nachklangwert.
+    assert MIN_NACHKLANG_MS == 60
+
+
+# ---------------------------------------------------------------------------
+# Auftrag shorts-nachbarrand: finde_nachbarrand_einsatz/finde_nachbarrand_ausklang -
+# der wahre Nachbarrand bei einer Nullpause (pause_after_ms/pause_before_ms
+# <= 0), unabhaengig vom schon gemessenen EIGENEN wahren Wortrand gesucht.
+# ---------------------------------------------------------------------------
+
+
+def _nachbarrand_raw_blocks() -> int:
+    # Generoes bemessen (wie die bestehenden _wortrand_*_raw_blocks-Helfer) -
+    # der Test-Runner ignoriert die tatsaechlich angefragte Fenstergroesse und
+    # liefert schlicht die uebergebene Liste zurueck.
+    return (NACHBARRAND_SUCHE_MS + MEASURE_MS) // STEP_MS + _BLOCKS_PER_MEASURE - 1
+
+
+def test_nachbarrand_einsatz_findet_fruehesten_bereich_und_gibt_dessen_ende_zurueck() -> None:
+    """Anders als :func:`finde_wortrand_ende` (das den ANFANG des fruehesten
+    Pausengrund-Bereichs zurueckgibt - das eigene Wortende) gibt
+    :func:`finde_nachbarrand_einsatz` dessen ENDE zurueck - den wahren Einsatz
+    des Nachbarworts NACH der Pause."""
+    own_true_end_ms = 20_000
+    levels = [-15.0] * 70
+    # Kombinierter Index i entspricht own_true_end_ms + i*STEP_MS (siehe
+    # finde_nachbarrand_einsatz: fetch_start_ms = own_true_end_ms - MEASURE_MS/2).
+    # Die rollende 40-ms-Kombination (_combine_to_measure_window) braucht
+    # RAW-Bloecke i..i+3 durchgehend leise, damit der KOMBINIERTE Bereich lang
+    # genug wird - ein 11-Roh-Block-Lauf (5..15) ergibt genau die geforderten
+    # 8 kombinierten Bloecke (80 ms, PAUSENGRUND_MIN_PAUSE_ENDE_MS).
+    for i in range(5, 16):
+        levels[i] = -45.0
+    # ein zweiter, spaeterer Bereich - darf NICHT gewaehlt werden (der
+    # FRUEHESTE Bereich zaehlt, wie bei finde_wortrand_ende).
+    for i in range(30, 50):
+        levels[i] = -60.0
+
+    ergebnis = finde_nachbarrand_einsatz(
+        MEDIA, own_true_end_ms, ffmpeg_path=FFMPEG, process_runner=_runner_for(levels)
+    )
+
+    assert ergebnis == own_true_end_ms + 120, (
+        "das ENDE des fruehesten kombinierten Bereichs (Index 12 -> "
+        "own_true_end_ms + 120 ms), nicht dessen Anfang (das waere wieder das "
+        "eigene Wortende)"
+    )
+
+
+def test_nachbarrand_einsatz_none_wenn_kein_bereich() -> None:
+    """Durchgehend laut - kein Pausengrund-Bereich innerhalb NACHBARRAND_SUCHE_MS,
+    kein Fallback (der Aufrufer faellt dann auf das bisherige Verfahren zurueck)."""
+    levels = [-15.0] * _nachbarrand_raw_blocks()
+
+    ergebnis = finde_nachbarrand_einsatz(
+        MEDIA, 20_000, ffmpeg_path=FFMPEG, process_runner=_runner_for(levels)
+    )
+
+    assert ergebnis is None
+
+
+def test_nachbarrand_einsatz_ober_grenze_ms_deckelt() -> None:
+    """``ober_grenze_ms`` deckelt das Ergebnis nach oben."""
+    own_true_end_ms = 20_000
+    levels = [-15.0] * 70
+    for i in range(15, 26):  # 11 Roh-Bloecke -> 8 kombinierte Bloecke, siehe oben
+        levels[i] = -45.0
+
+    ungedeckelt = finde_nachbarrand_einsatz(
+        MEDIA, own_true_end_ms, ffmpeg_path=FFMPEG, process_runner=_runner_for(levels)
+    )
+    ober_grenze_ms = own_true_end_ms + 50
+    gedeckelt = finde_nachbarrand_einsatz(
+        MEDIA,
+        own_true_end_ms,
+        ffmpeg_path=FFMPEG,
+        ober_grenze_ms=ober_grenze_ms,
+        process_runner=_runner_for(levels),
+    )
+
+    assert ungedeckelt > ober_grenze_ms, "Testannahme: der Bereich liegt spaeter als der Deckel"
+    assert gedeckelt == ober_grenze_ms
+
+
+def test_nachbarrand_ausklang_findet_spaetesten_bereich_und_gibt_dessen_anfang_zurueck() -> None:
+    """Anders als :func:`finde_wortrand_anfang` (das das ENDE des spaetesten
+    Pausengrund-Bereichs zurueckgibt - den eigenen Wortanfang) gibt
+    :func:`finde_nachbarrand_ausklang` dessen ANFANG zurueck - den wahren
+    Ausklang des Vorgaengerworts VOR der Pause."""
+    own_true_start_ms = 20_000
+    levels = [-15.0] * _nachbarrand_raw_blocks()
+    anchor_index = NACHBARRAND_SUCHE_MS // STEP_MS  # Index der Marke own_true_start_ms selbst
+    # spaetester (der Marke naechstgelegener) Bereich, 8 Bloecke (80 ms).
+    for i in range(anchor_index - 10, anchor_index - 2):
+        levels[i] = -45.0
+    # ein frueherer Bereich - darf NICHT gewaehlt werden.
+    for i in range(anchor_index - 22, anchor_index - 14):
+        levels[i] = -60.0
+
+    ergebnis = finde_nachbarrand_ausklang(
+        MEDIA, own_true_start_ms, ffmpeg_path=FFMPEG, process_runner=_runner_for(levels)
+    )
+
+    assert ergebnis == own_true_start_ms - 100, (
+        "der ANFANG des spaetesten Bereichs, nicht dessen Ende (das waere "
+        "wieder der eigene Wortanfang)"
+    )
+
+
+def test_nachbarrand_ausklang_none_wenn_kein_bereich() -> None:
+    """Durchgehend laut - kein Pausengrund-Bereich innerhalb NACHBARRAND_SUCHE_MS."""
+    levels = [-15.0] * _nachbarrand_raw_blocks()
+
+    ergebnis = finde_nachbarrand_ausklang(
+        MEDIA, 20_000, ffmpeg_path=FFMPEG, process_runner=_runner_for(levels)
+    )
+
+    assert ergebnis is None
+
+
+def test_nachbarrand_ausklang_unter_grenze_ms_deckelt() -> None:
+    """``unter_grenze_ms`` deckelt das Ergebnis nach unten."""
+    own_true_start_ms = 20_000
+    levels = [-15.0] * _nachbarrand_raw_blocks()
+    anchor_index = NACHBARRAND_SUCHE_MS // STEP_MS
+    for i in range(anchor_index - 22, anchor_index - 14):
+        levels[i] = -45.0
+
+    ungedeckelt = finde_nachbarrand_ausklang(
+        MEDIA, own_true_start_ms, ffmpeg_path=FFMPEG, process_runner=_runner_for(levels)
+    )
+    unter_grenze_ms = own_true_start_ms - 100
+    gedeckelt = finde_nachbarrand_ausklang(
+        MEDIA,
+        own_true_start_ms,
+        ffmpeg_path=FFMPEG,
+        unter_grenze_ms=unter_grenze_ms,
+        process_runner=_runner_for(levels),
+    )
+
+    assert ungedeckelt < unter_grenze_ms, "Testannahme: der Bereich liegt frueher als der Deckel"
+    assert gedeckelt == unter_grenze_ms

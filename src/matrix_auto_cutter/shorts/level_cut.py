@@ -160,6 +160,44 @@ von der leiseste-Stelle-Suche selbst gewaehlt (siehe Aufrufstelle in
 ``build._apply_level_correction``: der Einsatz gewinnt, wenn er spaeter liegt
 als das Ergebnis der rueckwaertigen leiseste-Stelle-Suche)."""
 
+VERFAHREN_LAUTENDE_STEHT = "lautende_steht"
+"""Auftrag shorts-endgrenze-schranke, TEIL 1: das Fenster zwischen dem
+gemessenen Lautende und dem whisper-Anfang des naechsten Wortes ist leer oder
+negativ (das naechste Wort folgt ohne messbare Pause) - die Endgrenze bleibt
+am gemessenen Lautende stehen. Kein Suchen, kein Fallback, keine Naeherung
+darueber hinaus (siehe Aufrufstelle in ``build._apply_level_correction``)."""
+
+VERFAHREN_FENSTER_AUSGESCHOEPFT = "fenster_ausgeschoepft"
+"""Auftrag shorts-endgrenze-schranke, TEIL 2: der Mindestnachklang
+(:data:`MIN_NACHKLANG_MS`) passt nicht mehr in das Fenster aus TEIL 1
+(``[gemessenes Lautende, whisper-Anfang des naechsten Wortes]``) - die
+Endgrenze wandert bis an das obere Ende dieses Fensters (unmittelbar vor das
+naechste Wort), nicht darueber hinaus (siehe Aufrufstelle in
+``build._apply_level_correction``)."""
+
+VERFAHREN_WORTRAND_KOLLISION = "wortrand_kollision"
+"""Auftrag shorts-wortrand-abstand, TEIL 2: der noetige Sicherheitsabstand
+(:data:`WORTRAND_ABSTAND_ENDE_MS`/:data:`WORTRAND_ABSTAND_ANFANG_MS`) passt
+nicht zwischen das wahre Wortende des eigenen Wortes und den wahren Anfang
+des Nachbarworts (oder umgekehrt an der Startgrenze) - die Grenze liegt dann
+auf der Mitte zwischen beiden wahren Wortraendern. Kein Fallback auf eine
+Whisper-Marke (siehe Aufrufstelle in ``build._apply_level_correction``)."""
+
+VERFAHREN_TONBLENDE_GROSSZUEGIG = "tonblende_grosszuegig"
+"""Auftrag shorts-tonblende: die Grenze wurde DIREKT auf den grosszuegigen
+Wert gesetzt (``own_true_end_ms + MIN_NACHKLANG_MS`` an der Endgrenze,
+``own_true_start_ms - chart_crop.TON_EINBLENDE_MS`` an der Startgrenze,
+jeweils am wahren Rand des Nachbarworts gedeckelt) statt wie zuvor die
+leiseste Stelle im Fenster zu SUCHEN (:func:`verschiebe_auf_leiseste_stelle`).
+Moeglich, weil die neue Ton-Ein-/Ausblende
+(``chart_crop.TON_EINBLENDE_MS``/``chart_crop.TON_AUSBLENDE_MS``) den
+Uebergang jetzt selbst weich macht - drei Fassungen der reinen Punktsuche
+klangen trotzdem angeschnitten (siehe :data:`chart_crop.TON_EINBLENDE_MS`),
+deshalb darf das Wort bewusst ganz in der gebauten Spanne bleiben, statt den
+Schnitt weiter vor ihm zu suchen. Keine neue Messung - nur eine andere Wahl
+innerhalb der schon gemessenen Wortraender (siehe Aufrufstelle in
+``build._apply_level_correction``)."""
+
 
 class LevelCutFailed(RuntimeError):
     """Die Pegelmessung ist fehlgeschlagen - fail closed, kein stiller Rueckfall.
@@ -830,6 +868,141 @@ assert WORTENDE_UNTERBRECHUNG_MAX_MS % STEP_MS == 0, (
     "WORTENDE_UNTERBRECHUNG_MAX_MS muss ein Vielfaches von STEP_MS sein"
 )
 
+MIN_NACHKLANG_MS = 60
+"""Auftrag shorts-endgrenze-schranke, TEIL 2: Mindestabstand zwischen dem
+gemessenen Lautende und der tatsaechlich geschnittenen Endgrenze.
+
+Ein Wort, das im selben Augenblick endet wie das Video, wirkt beim Sprung in
+die Schleife abgeschnitten, auch wenn es vollstaendig ist - der Ohreindruck
+braucht etwas Luft NACH dem letzten Laut, nicht nur einen Schnitt, der ihn
+gerade eben nicht mehr anschneidet. Am Nutzerurteil gemessen (Bericht
+``shorts-kandidat-00-endgrenze/BERICHT-2026-08-23.md``): kandidat-00 hatte
+nur 10 ms Nachklang (Lautende 45870, gebaute Grenze 45880) und klang
+abgehackt; kandidat-04 (Lautende 120390, Grenze 120480, 90 ms) und
+kandidat-08 (Lautende 347145, Grenze 347300, 155 ms) klangen beide gut. 60 ms
+liegt klar ueber dem beanstandeten Wert (10 ms) und klar unter den beiden
+gebilligten (90/155 ms) - die Mitte zwischen "zu wenig" und "beobachtet
+ausreichend", nicht deren Obergrenze.
+
+Die Schranke aus TEIL 1 (:data:`VERFAHREN_LAUTENDE_STEHT`/
+:data:`VERFAHREN_FENSTER_AUSGESCHOEPFT`) gewinnt immer: passt der
+Mindestnachklang nicht mehr in das Fenster bis zum naechsten Wort, wird das
+Fenster nur bis zu dessen Anfang ausgeschoepft, nie darueber hinaus (siehe
+Aufrufstelle in ``build._apply_level_correction``)."""
+
+PAUSENGRUND_ABSTAND_DB = QUIET_REGION_DEPTH_DB
+"""Auftrag shorts-wortrand-abstand, TEIL 1: wie tief ein Bereich unter dem
+Fenstermittel liegen muss, um als echte Pause (statt Wortrand) zu gelten -
+dieselbe Konstante wie :data:`QUIET_REGION_DEPTH_DB` (6 dB), hier fuer das
+Pausengrund-Verfahren wiederverwendet statt neu erfunden."""
+
+PAUSENGRUND_MIN_PAUSE_ENDE_MS = 80
+"""Mindestlaenge, ab der ein leiser Bereich nach einem Wortende als echte
+Pause zaehlt (Auftrag shorts-wortrand-abstand, :func:`finde_wortrand_ende`) -
+etwas kuerzer als :data:`MIN_PAUSE_MS` (100 ms), weil hier per Definition
+bereits NACH dem Wortende gesucht wird (keine Lautluecken IM Wort mehr
+moeglich, die abzugrenzen waeren)."""
+
+PAUSENGRUND_MIN_PAUSE_ANFANG_MS = 30
+"""Mindestlaenge, ab der ein leiser Bereich vor einem Wortanfang als echte
+Pause zaehlt (:func:`finde_wortrand_anfang`) - kuerzer als bei Wortenden
+(:data:`PAUSENGRUND_MIN_PAUSE_ENDE_MS`), weil die Ruecksuche bewusst eng
+gefuehrt wird (siehe dort) und ein Wortanfang typischerweise schneller
+anschwillt, als ein Wortende ausklingt."""
+
+WORTRAND_SUCHE_ENDE_MS = WORTENDE_SUCHE_MAX_MS
+"""Suchweite vorwaerts fuer :func:`finde_wortrand_ende` - dieselbe wie die
+erweiterte Suche von :func:`finde_wortende_ton` (800 ms), damit beide
+Verfahren denselben Bereich abdecken."""
+
+WORTRAND_SUCHE_ANFANG_RUECK_MS = WORTENDE_SUCHE_MS
+"""Suchweite rueckwaerts fuer :func:`finde_wortrand_anfang` (150 ms) -
+dieselbe wie der Kontext von :func:`finde_wortende_ton`/
+:func:`finde_worteinsatz_ton`."""
+
+WORTRAND_SUCHE_ANFANG_VOR_MS = 60
+"""Suchweite vorwaerts (ueber die Whisper-Marke hinaus) fuer
+:func:`finde_wortrand_anfang` - bewusst eng: eine breitere Vorwaertssuche
+lief bei kurzen Woertern (Befund unten, Fall "Boden"/"der") regelmaessig in
+die Pause NACH dem Wort statt in dessen eigenen, kurzen Anlauf."""
+
+WORTRAND_ABSTAND_ENDE_MS = 390
+"""Auftrag shorts-wortrand-abstand, TEIL 2: Sicherheitsabstand zwischen dem
+per Pausengrund-Verfahren gemessenen wahren Wortende
+(:func:`finde_wortrand_ende`) und der fruehesten erlaubten Endgrenze.
+
+Aus TEIL 1 abgeleitet, auf das gemessene MAXIMUM aufgerundet (nicht den
+Median - ein zu kurzer Abstand schneidet hoerbar an, ein zu langer kostet
+nur Stille). Messreihe (Zweiband, 10-ms-Raster, Aufnahme
+2026-08-21 10-46-08), Differenz = wahres Wortende minus heutige Schwelle:
+
+Zehn Wortenden mit Whisper-Pause > 200 ms (Median -47, Min -400, Max 425 -
+zwei davon, "der" und "Numerologie", erwiesen sich als durch ein
+dazwischenliegendes, von Whisper nicht erkanntes drittes Wort verunreinigt
+und tragen NICHT zum Maximum bei, siehe Bericht TEIL 1):
+Gedanken -40, aus -65, das -55, der +425 (verunreinigt), Numerologie +365
+(verunreinigt), den -80, totally -40, Boden +485 (verunreinigt), na +240,
+hier -10.
+
+Die vier konkreten Faelle des Nutzers, hier massgeblich (kein
+Whisper-Pause, exakt der Fall, den TEIL 2 behebt):
+"klarer." (kandidat-04): heutig 120000, wahr 120390, **+390**.
+"richtig?" (kandidat-00, spaetere Fassung): heutig 46000, wahr 46230, +230.
+
+**390 ms ist das Maximum der unverunreinigten Messungen** (die drei
+verunreinigten Ausreisser bei "der"/"Numerologie"/"Boden" sind keine echten
+Wortraender, sondern ein Messfehler durch eine von Whisper uebersehene
+Pause NACH einem dazwischenliegenden Wort - siehe Bericht, TEIL 1)."""
+
+WORTRAND_ABSTAND_ANFANG_MS = 130
+"""Auftrag shorts-wortrand-abstand, TEIL 2: Sicherheitsabstand zwischen dem
+per Pausengrund-Verfahren gemessenen wahren Wortanfang
+(:func:`finde_wortrand_anfang`) und der spaetesten erlaubten Startgrenze.
+
+Messreihe (Differenz = heutige Schwelle minus wahrer Anfang): zehn
+Wortanfaenge mit Whisper-Pause > 200 ms (Median 35, Min -60, Max 130):
+diesen +10, Angst -30, gekommen -20, eingesehen -40, diese -50, oben +110,
+und +60, die +90, das +130, damit -60.
+
+Die zwei konkreten Faelle: "Na," (kandidat-00): heutig 31000 (whisper-Marke
+selbst, kein Vorruecken durch die heutige Suche), wahr 30940, **+130** (auf
+den tatsaechlich GEBAUTEN Wert 31070 bezogen: +130). "Nachdem" (kandidat-01,
+gilt als gut): heutig 63090 (gebauter Wert), wahr 63060, nur +30 - bestaetigt
+den Nutzereindruck.
+
+**130 ms ist das Maximum** - Generik und "Na"-Fall stimmen ueberein, keine
+Verunreinigung wie bei den Wortenden festgestellt (die engere Ruecksuche
+von :data:`WORTRAND_SUCHE_ANFANG_VOR_MS` verhindert das)."""
+
+assert WORTRAND_ABSTAND_ENDE_MS % STEP_MS == 0, (
+    "WORTRAND_ABSTAND_ENDE_MS muss ein Vielfaches von STEP_MS sein"
+)
+assert WORTRAND_ABSTAND_ANFANG_MS % STEP_MS == 0, (
+    "WORTRAND_ABSTAND_ANFANG_MS muss ein Vielfaches von STEP_MS sein"
+)
+
+assert MIN_NACHKLANG_MS % STEP_MS == 0, "MIN_NACHKLANG_MS muss ein Vielfaches von STEP_MS sein"
+
+NACHBARRAND_SUCHE_MS = 250
+"""Auftrag shorts-nachbarrand: Suchweite fuer :func:`finde_nachbarrand_einsatz`/
+:func:`finde_nachbarrand_ausklang`, wenn ``pause_after_ms``/``pause_before_ms``
+an einer Kandidatengrenze null oder negativ ist.
+
+Bei einer Nullpause liegt die whisper-Marke des Nachbarworts (``next_word_start_ms``/
+``prev_word_end_ms``) exakt auf der eigenen, noch ungekorrigierten Wortgrenze -
+:func:`finde_wortrand_anfang`/:func:`finde_wortrand_ende`, um diese Marke
+herum gesucht, trifft dann oft das eigene Wortende/den eigenen Wortanfang
+statt die tatsaechliche Pause zum Nachbarn (siehe Auftragsbeschreibung
+shorts-nachbarrand). Diese beiden Funktionen suchen deshalb unabhaengig vom
+schon gemessenen EIGENEN wahren Wortrand aus weiter - 250 ms ist dieselbe
+Groessenordnung wie :data:`SEARCH_WINDOW_MS`, reichlich fuer eine echte
+Sprechpause, aber eng genug, um nicht in ein weiteres, dazwischenliegendes
+Wort hineinzulaufen."""
+
+assert NACHBARRAND_SUCHE_MS % STEP_MS == 0, (
+    "NACHBARRAND_SUCHE_MS muss ein Vielfaches von STEP_MS sein"
+)
+
 
 def _sprechpegel_aus_fenster(finite_levels: Sequence[float]) -> float:
     """Sprechpegel eines (kleinen) Fensters.
@@ -884,6 +1057,7 @@ def finde_wortende_ton(
     *,
     ffmpeg_path: Path,
     erweiterte_suche: bool = True,
+    ober_grenze_ms: int | None = None,
     timeout_seconds: int = 120,
     process_runner: ProcessRunner | None = None,
 ) -> int:
@@ -936,6 +1110,19 @@ def finde_wortende_ton(
     konservative Untergrenze - kein Ausweichen, keine Naeherung ueber diesen
     Stellwert hinaus.
 
+    ``ober_grenze_ms`` (Auftrag shorts-endgrenze-schranke, TEIL 1): deckelt
+    JEDES Ergebnis dieser Funktion (die drei Faelle oben UND den Fallback) auf
+    hoechstens diesen Wert - unabhaengig davon, was die Suche selbst
+    gemessen haette. Ohne diesen Deckel kann die Suche (bei kandidat-06 belegt:
+    ``pause_after_ms=0``) ungebremst in den naechsten Satz hineinlaufen und
+    dort eine spaete, thematisch fremde Stille finden (271090, mitten im Wort
+    "nichts" - Befund ``shorts-kandidat-00-endgrenze/BERICHT-2026-08-23.md``).
+    Gedacht fuer den whisper-Anfang des naechsten, nicht mehr enthaltenen
+    Wortes: das Lautende eines Kandidaten darf nie hinter diesem Anfang
+    liegen, ganz gleich, was am Ton noch an spaeterer Stille zu finden waere.
+    ``None`` (Vorgabe) laesst die Suche unveraendert unbeschraenkt - der alte
+    Aufrufweg bleibt exakt erhalten.
+
     Gibt IMMER einen Wert zurueck (nie ``None``) - eine fehlgeschlagene
     Tonmessung wirft weiterhin :class:`LevelCutFailed`, wie im ganzen Modul.
     """
@@ -952,6 +1139,10 @@ def finde_wortende_ton(
         process_runner=runner,
         context="Wortende/Ausklang",
     )
+
+    def _gedeckelt(ergebnis_ms: int) -> int:
+        return ergebnis_ms if ober_grenze_ms is None else min(ergebnis_ms, ober_grenze_ms)
+
     # Der Sprechpegel (Kontext fuer die Schwelle) stuetzt sich nur auf das
     # engere Kontextfenster [-WORTENDE_SUCHE_MS, +WORTENDE_SUCHE_MS] - der
     # erweiterte Sicherheitsbereich danach gehoert noch zum selben Wort und
@@ -960,7 +1151,7 @@ def finde_wortende_ton(
     kontext_bloecke = 2 * WORTENDE_SUCHE_MS // STEP_MS + 1
     finite_levels = [level for level in levels[:kontext_bloecke] if level != -math.inf]
     if not finite_levels:
-        return whisper_end_ms + WORTENDE_FALLBACK_MS
+        return _gedeckelt(whisper_end_ms + WORTENDE_FALLBACK_MS)
 
     sprechpegel_db = _sprechpegel_aus_fenster(finite_levels)
     threshold_db = sprechpegel_db - STILLE_ABSTAND_DB
@@ -969,15 +1160,15 @@ def finde_wortende_ton(
 
     if levels[anchor_index] < threshold_db:
         # An der Whisper-Marke ist es bereits leise - kein Nachlauf noetig.
-        return whisper_end_ms
+        return _gedeckelt(whisper_end_ms)
 
     toleranz_bloecke = WORTENDE_UNTERBRECHUNG_MAX_MS // STEP_MS
     idx = _folge_bis_wechsel(
         levels, anchor_index, threshold_db, ab_index_laut=True, toleranz_bloecke=toleranz_bloecke
     )
     if idx is None:
-        return whisper_end_ms + WORTENDE_FALLBACK_MS
-    return fetch_start_ms + idx * STEP_MS + MEASURE_MS // 2
+        return _gedeckelt(whisper_end_ms + WORTENDE_FALLBACK_MS)
+    return _gedeckelt(fetch_start_ms + idx * STEP_MS + MEASURE_MS // 2)
 
 
 def finde_worteinsatz_ton(
@@ -1249,3 +1440,315 @@ def verschiebe_auf_leiseste_stelle(
         verfahren=verfahren,
         quiet_region_ms=quiet_region_ms,
     )
+
+
+def miss_pegel_bei_marke(
+    media_path: Path,
+    mark_ms: int,
+    *,
+    ffmpeg_path: Path,
+    timeout_seconds: int = 120,
+    process_runner: ProcessRunner | None = None,
+) -> tuple[float, float]:
+    """Miss Pegel und Fenstermittel an einer FESTEN Stelle, ohne zu suchen.
+
+    Auftrag shorts-endgrenze-schranke: TEIL 1 (:data:`VERFAHREN_LAUTENDE_STEHT`)
+    und TEIL 2 (:data:`VERFAHREN_FENSTER_AUSGESCHOEPFT`) setzen die Endgrenze
+    manchmal direkt auf eine vorgegebene Stelle (das gemessene Lautende oder
+    den whisper-Anfang des naechsten Wortes), statt sie wie
+    :func:`verschiebe_auf_leiseste_stelle` zu suchen - der Baubericht braucht
+    an dieser Stelle trotzdem einen echten, gemessenen Pegelwert. Dieselbe
+    Messung (Sprachband, 10-ms-Raster, 40-ms-Ausschnitte) wie
+    :func:`verschiebe_auf_leiseste_stelle`, nur ohne dessen Suche.
+
+    Gibt ``(Pegel an der ``mark_ms`` naechstgelegenen Messstelle,
+    Fenstermittel)`` zurueck.
+    """
+    runner = process_runner if process_runner is not None else _default_process_runner
+    fetch_start_ms = max(0, mark_ms - SEARCH_WINDOW_MS - MEASURE_MS // 2)
+    fetch_duration_ms = 2 * SEARCH_WINDOW_MS + MEASURE_MS
+    levels = _fetch_measured_levels(
+        media_path,
+        fetch_start_ms=fetch_start_ms,
+        fetch_duration_ms=fetch_duration_ms,
+        ffmpeg_path=ffmpeg_path,
+        timeout_seconds=timeout_seconds,
+        process_runner=runner,
+        context="Endgrenze/feste Stelle",
+    )
+
+    def _position(index: int) -> int:
+        return fetch_start_ms + index * STEP_MS + MEASURE_MS // 2
+
+    nearest = min(range(len(levels)), key=lambda i: abs(_position(i) - mark_ms))
+    return levels[nearest], _mean_level_db(levels)
+
+
+def finde_wortrand_ende(
+    media_path: Path,
+    word_end_ms: int,
+    *,
+    ffmpeg_path: Path,
+    ober_grenze_ms: int | None = None,
+    timeout_seconds: int = 120,
+    process_runner: ProcessRunner | None = None,
+) -> int | None:
+    """Bestimme das WAHRE Wortende am Ton - Pausengrund-Verfahren.
+
+    Auftrag shorts-wortrand-abstand, TEIL 1. Ein Wort ist im Ton kein Rechteck:
+    Anlaut und Ausklang sind leise und werden von der bisherigen Schwelle
+    (Sprechpegel minus :data:`STILLE_ABSTAND_DB`, siehe
+    :func:`finde_wortende_ton`) oft schon als Stille gewertet, obwohl der
+    Ausklang noch hoerbar zum Wort gehoert.
+    Dieses Verfahren sucht stattdessen die erste Stelle, an der der Pegel
+    unter den PAUSENGRUND faellt - den Pegel der echten Sprechpause danach,
+    nicht nur unter eine feste Schwelle relativ zum Sprechpegel.
+
+    Verfahren: miss den Pegel (Zweiband-Maximum wie :func:`finde_wortende_ton`,
+    10-ms-Raster) vorwaerts ab ``word_end_ms``, hoechstens
+    :data:`WORTRAND_SUCHE_ENDE_MS`. Suche darin - wie
+    :func:`verschiebe_auf_leiseste_stelle`s ``_choose_cut_point``, dieselbe
+    Konstante :data:`PAUSENGRUND_ABSTAND_DB` - den FRUEHESTEN Bereich, der
+    mindestens :data:`PAUSENGRUND_ABSTAND_DB` unter dem Fenstermittel liegt
+    UND mindestens :data:`PAUSENGRUND_MIN_PAUSE_ENDE_MS` lang ist (kuerzere
+    Bereiche sind Lautluecken im Ausklang selbst, keine echte Pause). Der
+    FRUEHESTE (nicht der tiefste oder laengste) Bereich zaehlt: ein spaeterer,
+    zufaellig tieferer oder laengerer Bereich koennte bereits zu einem
+    dazwischenliegenden, von whisper uebersehenen Wort gehoeren (Befund,
+    Auftrag shorts-wortrand-abstand TEIL 1: bei "der" und "Numerologie" hat
+    genau das die Messung verunreinigt, als der laengste statt der fruehesten
+    Bereich gewaehlt wurde).
+
+    Der Anfang dieses Bereichs ist das wahre Wortende.
+
+    ``ober_grenze_ms`` (Auftrag shorts-wortrand-abstand, TEIL 2): deckelt das
+    Ergebnis auf hoechstens diesen Wert - noetig, wenn dieses Wort nicht das
+    eigentliche Zielwort ist, sondern das VORIGE Wort an einer Startgrenze
+    (dessen wahres Ende als Schranke gebraucht wird): ohne Deckel kann die
+    Suche ueber ein kurzes, dazwischenliegendes Wort hinweglaufen, weil dessen
+    eigener Pegelverlauf keinen ausreichend langen "erneuten Peak" bildet, um
+    die Suche zu stoppen (Befund: "angekommen." vor kandidat-00, ungedeckelt
+    31140 - das liegt HINTER dem gemessenen Anfang von "Na," selbst).
+
+    Gibt ``None`` zurueck, wenn innerhalb der Suchweite kein solcher Bereich
+    existiert - kein Fallback, kein Ausweichen; der Aufrufer entscheidet dann
+    selbst (siehe ``build._apply_level_correction``).
+    """
+    runner = process_runner if process_runner is not None else _default_process_runner
+    fetch_start_ms = max(0, word_end_ms - MEASURE_MS // 2)
+    fetch_duration_ms = WORTRAND_SUCHE_ENDE_MS + MEASURE_MS
+    levels = _fetch_zweiband_levels(
+        media_path,
+        fetch_start_ms=fetch_start_ms,
+        fetch_duration_ms=fetch_duration_ms,
+        ffmpeg_path=ffmpeg_path,
+        timeout_seconds=timeout_seconds,
+        process_runner=runner,
+        context="Wortrand/Ende",
+    )
+    if not levels:
+        return None
+    mean_db = _mean_level_db(levels)
+    threshold_db = mean_db - PAUSENGRUND_ABSTAND_DB
+    min_blocks = PAUSENGRUND_MIN_PAUSE_ENDE_MS // STEP_MS
+    candidates = [
+        region
+        for region in _quiet_regions(levels, threshold_db)
+        if region[1] - region[0] + 1 >= min_blocks
+    ]
+    if not candidates:
+        return None
+    start_index, _end_index = min(candidates, key=lambda region: region[0])
+    ergebnis_ms = fetch_start_ms + start_index * STEP_MS + MEASURE_MS // 2
+    return ergebnis_ms if ober_grenze_ms is None else min(ergebnis_ms, ober_grenze_ms)
+
+
+def finde_wortrand_anfang(
+    media_path: Path,
+    word_start_ms: int,
+    *,
+    ffmpeg_path: Path,
+    unter_grenze_ms: int | None = None,
+    timeout_seconds: int = 120,
+    process_runner: ProcessRunner | None = None,
+) -> int | None:
+    """Bestimme den WAHREN Wortanfang am Ton - Pausengrund-Verfahren.
+
+    Auftrag shorts-wortrand-abstand, TEIL 1. Spiegelbildlich zu
+    :func:`finde_wortrand_ende`. Miss den Pegel vorwaerts ab
+    ``word_start_ms - WORTRAND_SUCHE_ANFANG_RUECK_MS`` bis
+    ``word_start_ms + WORTRAND_SUCHE_ANFANG_VOR_MS`` - bewusst eng
+    (150 ms zurueck, 60 ms vor): eine breitere Vorwaertssuche lief bei kurzen
+    Woertern regelmaessig ueber das Wort hinaus in die Pause DANACH (Befund:
+    Fall "Boden" bei einer fruehen Fassung dieses Verfahrens). Suche darin den
+    SPAETESTEN (dem Wortanfang naechstgelegenen) Bereich, der mindestens
+    :data:`PAUSENGRUND_ABSTAND_DB` unter dem Fenstermittel liegt und
+    mindestens :data:`PAUSENGRUND_MIN_PAUSE_ANFANG_MS` lang ist.
+
+    Das Ende dieses Bereichs ist der wahre Wortanfang.
+
+    ``unter_grenze_ms`` (Auftrag shorts-wortrand-abstand, TEIL 2): deckelt das
+    Ergebnis auf mindestens diesen Wert - spiegelbildlich zu ``ober_grenze_ms``
+    bei :func:`finde_wortrand_ende`, fuer denselben Fall an der Endgrenze
+    (dieses Wort ist das NAECHSTE Wort, dessen wahrer Anfang als Schranke
+    gebraucht wird).
+
+    Gibt ``None`` zurueck, wenn kein solcher Bereich existiert.
+    """
+    runner = process_runner if process_runner is not None else _default_process_runner
+    fetch_start_ms = max(0, word_start_ms - WORTRAND_SUCHE_ANFANG_RUECK_MS - MEASURE_MS // 2)
+    fetch_duration_ms = (
+        (word_start_ms - fetch_start_ms) + WORTRAND_SUCHE_ANFANG_VOR_MS + MEASURE_MS // 2
+    )
+    levels = _fetch_zweiband_levels(
+        media_path,
+        fetch_start_ms=fetch_start_ms,
+        fetch_duration_ms=fetch_duration_ms,
+        ffmpeg_path=ffmpeg_path,
+        timeout_seconds=timeout_seconds,
+        process_runner=runner,
+        context="Wortrand/Anfang",
+    )
+    if not levels:
+        return None
+    mean_db = _mean_level_db(levels)
+    threshold_db = mean_db - PAUSENGRUND_ABSTAND_DB
+    min_blocks = PAUSENGRUND_MIN_PAUSE_ANFANG_MS // STEP_MS
+    candidates = [
+        region
+        for region in _quiet_regions(levels, threshold_db)
+        if region[1] - region[0] + 1 >= min_blocks
+    ]
+    if not candidates:
+        return None
+    _start_index, end_index = max(candidates, key=lambda region: region[1])
+    ergebnis_ms = fetch_start_ms + end_index * STEP_MS + MEASURE_MS // 2
+    return ergebnis_ms if unter_grenze_ms is None else max(ergebnis_ms, unter_grenze_ms)
+
+
+def finde_nachbarrand_einsatz(
+    media_path: Path,
+    own_true_end_ms: int,
+    *,
+    ober_grenze_ms: int | None = None,
+    ffmpeg_path: Path,
+    timeout_seconds: int = 120,
+    process_runner: ProcessRunner | None = None,
+) -> int | None:
+    """Suche den wahren Einsatz des NAECHSTEN Wortes bei einer Nullpause.
+
+    Auftrag shorts-nachbarrand: greift nur, wenn ``pause_after_ms <= 0`` ist -
+    dann liegt ``next_word_start_ms`` (die whisper-Marke, um die
+    :func:`finde_wortrand_anfang` sonst suchen wuerde) exakt auf
+    ``own_true_end_ms`` bzw. der noch ungekorrigierten eigenen Wortgrenze, und
+    das enge Fenster jener Funktion (150 ms zurueck, 60 ms vor) trifft dann
+    oft nur den eigenen Ausklang statt die tatsaechliche Pause zum Nachbarn
+    (siehe Auftragsbeschreibung, Befund kandidat-01/kandidat-06).
+
+    Miss stattdessen den Pegel (Zweiband-Maximum wie :func:`finde_wortrand_ende`,
+    10-ms-Raster) VORWAERTS ab ``own_true_end_ms`` (dem schon gemessenen
+    eigenen wahren Wortende), hoechstens :data:`NACHBARRAND_SUCHE_MS`. Suche
+    darin - dieselben Kriterien wie :func:`finde_wortrand_ende`
+    (:data:`PAUSENGRUND_ABSTAND_DB`, :data:`PAUSENGRUND_MIN_PAUSE_ENDE_MS`) -
+    den FRUEHESTEN zusammenhaengenden Bereich, der als echte Pause zaehlt.
+
+    Anders als :func:`finde_wortrand_ende` ist hier aber nicht der ANFANG
+    dieses Bereichs gesucht (das waere wieder das eigene Wortende, das schon
+    bekannt ist), sondern dessen ENDE - der Punkt, an dem der Pegel nach der
+    Pause wieder dauerhaft ueber den Pausengrund steigt, also der wahre
+    Einsatz des Nachbarworts.
+
+    ``ober_grenze_ms`` deckelt das Ergebnis nach oben, falls uebergeben -
+    analog zu :func:`finde_wortrand_anfang`s ``unter_grenze_ms``.
+
+    Gibt ``None`` zurueck, wenn innerhalb der Suchweite kein solcher Bereich
+    existiert - der Aufrufer faellt dann auf das bisherige Verhalten zurueck
+    (Deckelung an der whisper-Marke ``next_word_start_ms``, siehe
+    ``build._apply_level_correction``).
+    """
+    runner = process_runner if process_runner is not None else _default_process_runner
+    fetch_start_ms = max(0, own_true_end_ms - MEASURE_MS // 2)
+    fetch_duration_ms = NACHBARRAND_SUCHE_MS + MEASURE_MS
+    levels = _fetch_zweiband_levels(
+        media_path,
+        fetch_start_ms=fetch_start_ms,
+        fetch_duration_ms=fetch_duration_ms,
+        ffmpeg_path=ffmpeg_path,
+        timeout_seconds=timeout_seconds,
+        process_runner=runner,
+        context="Nachbarrand/Einsatz",
+    )
+    if not levels:
+        return None
+    mean_db = _mean_level_db(levels)
+    threshold_db = mean_db - PAUSENGRUND_ABSTAND_DB
+    min_blocks = PAUSENGRUND_MIN_PAUSE_ENDE_MS // STEP_MS
+    candidates = [
+        region
+        for region in _quiet_regions(levels, threshold_db)
+        if region[1] - region[0] + 1 >= min_blocks
+    ]
+    if not candidates:
+        return None
+    _start_index, end_index = min(candidates, key=lambda region: region[0])
+    ergebnis_ms = fetch_start_ms + end_index * STEP_MS + MEASURE_MS // 2
+    return ergebnis_ms if ober_grenze_ms is None else min(ergebnis_ms, ober_grenze_ms)
+
+
+def finde_nachbarrand_ausklang(
+    media_path: Path,
+    own_true_start_ms: int,
+    *,
+    unter_grenze_ms: int | None = None,
+    ffmpeg_path: Path,
+    timeout_seconds: int = 120,
+    process_runner: ProcessRunner | None = None,
+) -> int | None:
+    """Suche den wahren Ausklang des VORIGEN Wortes bei einer Nullpause.
+
+    Auftrag shorts-nachbarrand: spiegelbildlich zu
+    :func:`finde_nachbarrand_einsatz`, greift nur, wenn ``pause_before_ms <= 0``
+    ist. Miss den Pegel RUECKWAERTS ab ``own_true_start_ms`` (dem schon
+    gemessenen eigenen wahren Wortanfang), hoechstens
+    :data:`NACHBARRAND_SUCHE_MS`. Suche darin - dieselben Kriterien wie
+    :func:`finde_wortrand_anfang` (:data:`PAUSENGRUND_ABSTAND_DB`,
+    :data:`PAUSENGRUND_MIN_PAUSE_ANFANG_MS`) - den SPAETESTEN (dem eigenen
+    Wortanfang naechstgelegenen) Bereich, der als echte Pause zaehlt.
+
+    Anders als :func:`finde_wortrand_anfang` ist hier aber nicht das ENDE
+    dieses Bereichs gesucht (das waere wieder der eigene Wortanfang), sondern
+    dessen ANFANG - der wahre Ausklang des Vorgaengerworts.
+
+    ``unter_grenze_ms`` deckelt das Ergebnis nach unten, falls uebergeben.
+
+    Gibt ``None`` zurueck, wenn kein solcher Bereich existiert - der Aufrufer
+    faellt dann auf das bisherige Verhalten zurueck (siehe
+    ``build._apply_level_correction``).
+    """
+    runner = process_runner if process_runner is not None else _default_process_runner
+    fetch_start_ms = max(0, own_true_start_ms - NACHBARRAND_SUCHE_MS - MEASURE_MS // 2)
+    fetch_duration_ms = (own_true_start_ms - fetch_start_ms) + MEASURE_MS // 2
+    levels = _fetch_zweiband_levels(
+        media_path,
+        fetch_start_ms=fetch_start_ms,
+        fetch_duration_ms=fetch_duration_ms,
+        ffmpeg_path=ffmpeg_path,
+        timeout_seconds=timeout_seconds,
+        process_runner=runner,
+        context="Nachbarrand/Ausklang",
+    )
+    if not levels:
+        return None
+    mean_db = _mean_level_db(levels)
+    threshold_db = mean_db - PAUSENGRUND_ABSTAND_DB
+    min_blocks = PAUSENGRUND_MIN_PAUSE_ANFANG_MS // STEP_MS
+    candidates = [
+        region
+        for region in _quiet_regions(levels, threshold_db)
+        if region[1] - region[0] + 1 >= min_blocks
+    ]
+    if not candidates:
+        return None
+    start_index, _end_index = max(candidates, key=lambda region: region[1])
+    ergebnis_ms = fetch_start_ms + start_index * STEP_MS + MEASURE_MS // 2
+    return ergebnis_ms if unter_grenze_ms is None else max(ergebnis_ms, unter_grenze_ms)

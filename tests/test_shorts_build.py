@@ -21,7 +21,7 @@ import pytest
 from matrix_auto_cutter.approval import ApprovalGateResult
 from matrix_auto_cutter.shorts import avatar_canvas, build, canvas, chart_crop, subtitle_burn
 from matrix_auto_cutter.shorts.candidates import load_candidates
-from matrix_auto_cutter.shorts.level_cut import LevelCutFailed, LevelSnap, StilleVorlauf
+from matrix_auto_cutter.shorts.level_cut import LevelCutFailed, StilleVorlauf
 from matrix_auto_cutter.shorts.scene_windows import SceneWindow
 
 
@@ -525,8 +525,16 @@ def test_run_shorts_build_end_to_end_with_faked_stages(tmp_path: Path, monkeypat
 # ---------------------------------------------------------------------------
 
 
-def _prepare_single_candidate_build(tmp_path: Path, monkeypatch) -> dict[str, object]:
-    """Ein minimaler, vollstaendig gefaelschter Baulauf mit genau einem Kandidaten."""
+def _prepare_single_candidate_build(
+    tmp_path: Path, monkeypatch, *, word_tokens: list[dict[str, object]] | None = None
+) -> dict[str, object]:
+    """Ein minimaler, vollstaendig gefaelschter Baulauf mit genau einem Kandidaten.
+
+    ``word_tokens`` (Auftrag shorts-endgrenze-schranke) ersetzt, wenn gesetzt,
+    die voreingestellte Wortliste - fuer Tests, die eine andere Pause zum
+    naechsten Wort brauchen (z. B. Pause null), ohne diese Funktion zu
+    verdoppeln.
+    """
     job_dir = tmp_path / "job"
     job_dir.mkdir()
     job_path = job_dir / "shorts-job.json"
@@ -556,7 +564,9 @@ def _prepare_single_candidate_build(tmp_path: Path, monkeypatch) -> dict[str, ob
     )
     _write_whole_video_transcript(
         job_dir,
-        [
+        word_tokens
+        if word_tokens is not None
+        else [
             _word_token(9000, 9200, " Vor"),
             _word_token(10000, 10300, " Start"),
             _word_token(15000, 15300, " Mitte"),
@@ -734,27 +744,21 @@ def test_run_shorts_build_measures_constant_values_once_across_candidates(
 def test_pegelkorrektur_verschiebt_beide_grenzen_und_wird_berichtet(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """Beide gerasteten Grenzen wandern; die Zahlen stehen je Grenze im Bericht."""
+    """Auftrag shorts-tonblende: beide Grenzen werden DIREKT gesetzt (kein
+    Suchen mehr) - die Zahlen stehen je Grenze im Bericht."""
     kwargs = _prepare_single_candidate_build(tmp_path, monkeypatch)
     gemessen: list[int] = []
 
-    def fake_snap(media_path, mark_ms, **k):
+    def fake_miss(media_path, mark_ms, **k):
         del media_path, k
         gemessen.append(mark_ms)
-        shift = -120 if mark_ms < 15000 else 80
-        return LevelSnap(
-            original_ms=mark_ms,
-            corrected_ms=mark_ms + shift,
-            shift_ms=shift,
-            level_db=-64.5,
-            window_mean_db=-30.25,
-            verfahren="bereichsmitte" if mark_ms < 15000 else "tiefster_punkt",
-            quiet_region_ms=140 if mark_ms < 15000 else 0,
-        )
+        return (-64.5, -30.25) if mark_ms < 15000 else (-58.0, -29.0)
 
-    monkeypatch.setattr(build, "verschiebe_auf_leiseste_stelle", fake_snap)
+    monkeypatch.setattr(build, "miss_pegel_bei_marke", fake_miss)
     monkeypatch.setattr(build, "finde_wortende_ton", lambda *a, **k: a[1])
     monkeypatch.setattr(build, "finde_worteinsatz_ton", lambda *a, **k: 0)
+    monkeypatch.setattr(build, "finde_wortrand_ende", lambda media, ms, **k: ms)
+    monkeypatch.setattr(build, "finde_wortrand_anfang", lambda media, ms, **k: ms)
 
     result = build.run_shorts_build(**kwargs)
 
@@ -764,79 +768,83 @@ def test_pegelkorrektur_verschiebt_beide_grenzen_und_wird_berichtet(
     assert outcome.pegelkorrektur is not None
     assert outcome.pegelkorrektur.applied is True
 
-    # Reihenfolge: gemessen wird auf den GERASTETEN Marken, nicht auf den rohen
-    # Werten aus kandidaten.json - erst rasten, dann Pegel.
-    assert gemessen == [9800, 20200], "loop_point rastet und polstert vor der Messung"
-    assert outcome.build_start_ms == 9800 - 120
-    assert outcome.build_end_ms == 20200 + 80
+    # own_true_start_ms = new_start_ms = 10000 (echot) -> direkt 10000-40 = 9960.
+    # own_true_end_ms = new_end_ms = 20000 (echot) -> direkt 20000+60 = 20060.
+    # Keine Suche mehr - gemessen wird direkt an den berechneten Grenzen.
+    assert gemessen == [9960, 20060]
+    assert outcome.build_start_ms == 9960
+    assert outcome.build_end_ms == 20060
 
     payload = build.build_report_payload(result)
     pegel = payload["candidates"][0]["pegelkorrektur"]
     assert pegel["angewendet"] is True
-    assert pegel["start"]["verschiebung_ms"] == -120
-    assert pegel["ende"]["verschiebung_ms"] == 80
+    assert pegel["start"]["verschiebung_ms"] == 9960 - 9800
+    assert pegel["ende"]["verschiebung_ms"] == 20060 - 20200
     assert pegel["start"]["pegel_db"] == -64.5
     assert pegel["start"]["fenstermittel_db"] == -30.25
     assert pegel["start"]["tiefe_unter_mittel_db"] == 34.25
-    # Auftrag shorts-pegelmedian: welches Verfahren griff, wie lang der Bereich war.
-    assert pegel["start"]["verfahren"] == "bereichsmitte"
-    assert pegel["start"]["leiser_bereich_ms"] == 140
-    assert pegel["ende"]["verfahren"] == "tiefster_punkt"
+    # Auftrag shorts-tonblende: neues Verfahren - direkt gesetzt statt gesucht.
+    assert pegel["start"]["verfahren"] == "tonblende_grosszuegig"
+    assert pegel["start"]["leiser_bereich_ms"] == 0
+    assert pegel["ende"]["verfahren"] == "tonblende_grosszuegig"
     assert pegel["ende"]["leiser_bereich_ms"] == 0
 
 
-def test_pegelkorrektur_sucht_bei_der_startgrenze_nur_rueckwaerts(
-    tmp_path: Path, monkeypatch
-) -> None:
-    """Auftrag shorts-pegelschnitt-richtung: nur die STARTgrenze sucht rueckwaerts."""
+def test_startgrenze_wird_grosszuegig_direkt_gesetzt(tmp_path: Path, monkeypatch) -> None:
+    """Auftrag shorts-tonblende: die Startgrenze wird DIREKT auf
+    ``wahrer_wortanfang - chart_crop.TON_EINBLENDE_MS`` gesetzt - kein Suchen
+    mehr (ersetzt das alte, an WORTRAND_ABSTAND_ANFANG_MS gedeckelte Suchen)."""
     kwargs = _prepare_single_candidate_build(tmp_path, monkeypatch)
-    aufrufe: list[tuple[int, bool]] = []
+    start_marken: list[int] = []
 
-    def fake_snap(media_path, mark_ms, *, nur_rueckwaerts=False, **k):
+    def fake_miss(media_path, mark_ms, **k):
         del media_path, k
-        aufrufe.append((mark_ms, nur_rueckwaerts))
-        return LevelSnap(mark_ms, mark_ms, 0, -60.0, -30.0)
+        if mark_ms < 15000:
+            start_marken.append(mark_ms)
+        return -60.0, -30.0
 
-    monkeypatch.setattr(build, "verschiebe_auf_leiseste_stelle", fake_snap)
+    monkeypatch.setattr(build, "miss_pegel_bei_marke", fake_miss)
     monkeypatch.setattr(build, "finde_wortende_ton", lambda *a, **k: a[1])
     monkeypatch.setattr(build, "finde_worteinsatz_ton", lambda *a, **k: 0)
+    monkeypatch.setattr(build, "finde_wortrand_ende", lambda media, ms, **k: ms)
+    monkeypatch.setattr(build, "finde_wortrand_anfang", lambda media, ms, **k: ms)
 
     result = build.run_shorts_build(**kwargs)
 
     assert isinstance(result, build.BuildResult)
-    assert aufrufe == [(9800, True), (20200, False)]
+    assert result.outcomes[0].status == "gebaut"
+    # own_true_start = new_start_ms = 10000 (echot) -> direkt 10000-40 = 9960.
+    # neighbor_true_end = prev_word_end_ms = 9200 (echot) -> kein Platzproblem.
+    assert start_marken == [9960]
+    assert result.outcomes[0].build_start_ms == 9960
 
 
-def test_worteinsatz_gewinnt_wenn_er_spaeter_liegt_als_die_pegelkorrektur(
-    tmp_path: Path, monkeypatch
-) -> None:
-    """Auftrag shorts-pegel-wortgrenze, TEIL 3: der gemessene Worteinsatz ist ein
-    ZIEL - liegt er spaeter als das Ergebnis der rueckwaertigen leiseste-Stelle-
-    Suche, wird er stattdessen uebernommen (VERFAHREN_WORT_EINSATZ)."""
+def test_endgrenze_wird_grosszuegig_direkt_gesetzt(tmp_path: Path, monkeypatch) -> None:
+    """Auftrag shorts-tonblende: die Endgrenze wird DIREKT auf
+    ``wahres_wortende + MIN_NACHKLANG_MS`` gesetzt - kein Suchen mehr (ersetzt
+    das alte, an WORTRAND_ABSTAND_ENDE_MS gedeckelte Suchen)."""
     kwargs = _prepare_single_candidate_build(tmp_path, monkeypatch)
+    end_marken: list[int] = []
 
-    def fake_snap(media_path, mark_ms, **k):
+    def fake_miss(media_path, mark_ms, **k):
         del media_path, k
-        # Die Pegelkorrektur selbst schiebt die Startgrenze weit zurueck.
-        shift = -300 if mark_ms < 15000 else 0
-        return LevelSnap(mark_ms, mark_ms + shift, shift, -60.0, -30.0)
+        if mark_ms >= 15000:
+            end_marken.append(mark_ms)
+        return -60.0, -30.0
 
-    monkeypatch.setattr(build, "verschiebe_auf_leiseste_stelle", fake_snap)
+    monkeypatch.setattr(build, "miss_pegel_bei_marke", fake_miss)
     monkeypatch.setattr(build, "finde_wortende_ton", lambda *a, **k: a[1])
-    # Der gemessene Einsatz liegt 50 ms NACH der (ungepolsterten) Wortmarke,
-    # also klar nach dem Ergebnis der Pegelkorrektur (mark_ms - 300).
-    monkeypatch.setattr(build, "finde_worteinsatz_ton", lambda *a, **k: a[1] + 50)
+    monkeypatch.setattr(build, "finde_worteinsatz_ton", lambda *a, **k: 0)
+    monkeypatch.setattr(build, "finde_wortrand_ende", lambda media, ms, **k: ms)
+    monkeypatch.setattr(build, "finde_wortrand_anfang", lambda media, ms, **k: ms)
 
     result = build.run_shorts_build(**kwargs)
 
     assert isinstance(result, build.BuildResult)
-    outcome = result.outcomes[0]
-    assert outcome.pegelkorrektur is not None
-    assert outcome.pegelkorrektur.start is not None
-    assert outcome.pegelkorrektur.start.verfahren == "wort_einsatz"
-    # finde_worteinsatz_ton wird mit new_start_ms (10000, ungepolstert) aufgerufen -
-    # Einsatz also 10000 + 50 = 10050, klar spaeter als 9800 - 300 = 9500.
-    assert outcome.build_start_ms == 10000 + 50
+    assert result.outcomes[0].status == "gebaut"
+    # own_true_end = new_end_ms = 20000 (echot) -> direkt 20000+60 = 20060.
+    assert end_marken == [20060]
+    assert result.outcomes[0].build_end_ms == 20060
 
 
 def test_pegelkorrektur_wird_auf_dem_gerenderten_video_gemessen(
@@ -846,14 +854,16 @@ def test_pegelkorrektur_wird_auf_dem_gerenderten_video_gemessen(
     kwargs = _prepare_single_candidate_build(tmp_path, monkeypatch)
     gemessene_dateien: list[Path] = []
 
-    def fake_snap(media_path, mark_ms, **k):
-        del k
+    def fake_miss(media_path, mark_ms, **k):
+        del mark_ms, k
         gemessene_dateien.append(media_path)
-        return LevelSnap(mark_ms, mark_ms, 0, -60.0, -30.0)
+        return -60.0, -30.0
 
-    monkeypatch.setattr(build, "verschiebe_auf_leiseste_stelle", fake_snap)
+    monkeypatch.setattr(build, "miss_pegel_bei_marke", fake_miss)
     monkeypatch.setattr(build, "finde_wortende_ton", lambda *a, **k: a[1])
     monkeypatch.setattr(build, "finde_worteinsatz_ton", lambda *a, **k: 0)
+    monkeypatch.setattr(build, "finde_wortrand_ende", lambda media, ms, **k: ms)
+    monkeypatch.setattr(build, "finde_wortrand_anfang", lambda media, ms, **k: ms)
 
     result = build.run_shorts_build(**kwargs)
 
@@ -868,11 +878,11 @@ def test_fehlgeschlagene_pegelmessung_kostet_keinen_kandidaten(
     """Messfehler: mit der gerasteten Grenze gebaut und als "ohne Pegelkorrektur" vermerkt."""
     kwargs = _prepare_single_candidate_build(tmp_path, monkeypatch)
 
-    def fake_snap(media_path, mark_ms, **k):
+    def fake_wortrand_ende(media_path, mark_ms, **k):
         del media_path, mark_ms, k
         raise LevelCutFailed("ffmpeg_fehlgeschlagen", "ffmpeg endete mit Code 1")
 
-    monkeypatch.setattr(build, "verschiebe_auf_leiseste_stelle", fake_snap)
+    monkeypatch.setattr(build, "finde_wortrand_ende", fake_wortrand_ende)
 
     result = build.run_shorts_build(**kwargs)
 
@@ -1032,7 +1042,7 @@ def test_run_shorts_build_arbeitskopie_wird_benutzt_und_am_ende_geloescht(
         build,
         "_apply_level_correction",
         lambda *, boundaries, rendered_video_path, ffmpeg_path, search_window_start_ms=None,
-        stillevorlauf_aktiv=True: (
+        stillevorlauf_aktiv=True, end_min_nachklang_ms=None: (
             boundaries.start_ms,
             boundaries.end_ms,
             build.LevelCorrectionInfo(False, None, None, None, None),
@@ -1108,12 +1118,24 @@ def test_pegelkorrektur_die_die_spanne_verkuerzt_wird_verworfen(
     """Eine Korrektur, die die Spanne unter MIN_SPAN_MS zieht, wird nicht uebernommen."""
     kwargs = _prepare_single_candidate_build(tmp_path, monkeypatch)
 
-    def fake_snap(media_path, mark_ms, **k):
-        del media_path, k
-        # Beide Grenzen auf dieselbe Stelle - Spanne 0 ms.
-        return LevelSnap(mark_ms, 15000, 15000 - mark_ms, -60.0, -30.0)
+    def fake_miss(media_path, mark_ms, **k):
+        del media_path, mark_ms, k
+        return -60.0, -30.0
 
-    monkeypatch.setattr(build, "verschiebe_auf_leiseste_stelle", fake_snap)
+    # Beide Grenzen landen (ueber die direkte Formel) auf derselben Stelle
+    # 15000 - Spanne 0 ms: own_true_end fest auf 15000-MIN_NACHKLANG_MS,
+    # own_true_start fest auf 15000+TON_EINBLENDE_MS. Die Mocks ignorieren das
+    # uebergebene ms und liefern damit auch fuer die Nachbarwort-Suche
+    # denselben Wert - die direkte Formel wertet beide Seiten dann auf 15000.
+    monkeypatch.setattr(
+        build, "finde_wortrand_ende", lambda media, ms, **k: 15000 - build.MIN_NACHKLANG_MS
+    )
+    monkeypatch.setattr(
+        build,
+        "finde_wortrand_anfang",
+        lambda media, ms, **k: 15000 + chart_crop.TON_EINBLENDE_MS,
+    )
+    monkeypatch.setattr(build, "miss_pegel_bei_marke", fake_miss)
     monkeypatch.setattr(build, "finde_wortende_ton", lambda *a, **k: a[1])
     monkeypatch.setattr(build, "finde_worteinsatz_ton", lambda *a, **k: 0)
 
@@ -1127,6 +1149,398 @@ def test_pegelkorrektur_die_die_spanne_verkuerzt_wird_verworfen(
     assert outcome.pegelkorrektur.fail_code == "pegelkorrektur_verkuerzt_spanne"
     assert outcome.build_start_ms == 9800
     assert outcome.build_end_ms == 20200
+
+
+# ---------------------------------------------------------------------------
+# Auftrag shorts-tonblende: die Grenzen werden DIREKT auf den grosszuegigen
+# Wert gesetzt (own_true_end_ms + MIN_NACHKLANG_MS bzw. own_true_start_ms -
+# chart_crop.TON_EINBLENDE_MS) statt die leiseste Stelle zu suchen - das Wort
+# darf ganz in der Spanne bleiben, weil die neue Ton-Ein-/Ausblende
+# (chart_crop.build_ffmpeg_filter_complex) den Uebergang jetzt traegt.
+# Kollidiert der direkte Wert mit dem Nachbarwort, gilt weiterhin die Mitte
+# zwischen beiden wahren Wortraendern (unveraendert, VERFAHREN_WORTRAND_KOLLISION).
+# ---------------------------------------------------------------------------
+
+
+def test_endgrenze_kollision_ergibt_mitte_der_wahren_wortraender(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Kollidieren beide Seiten - der direkte Wert (wahres Ende + MIN_NACHKLANG_MS)
+    wuerde bereits am oder hinter dem wahren Anfang des Nachbarworts liegen -,
+    gilt die Mitte zwischen wahrem Wortende und wahrem Anfang des Nachbarn.
+    Kein Fallback auf eine Whisper-Marke."""
+    kwargs = _prepare_single_candidate_build(
+        tmp_path,
+        monkeypatch,
+        word_tokens=[
+            _word_token(9000, 9200, " Vor"),
+            _word_token(10000, 10300, " Start"),
+            _word_token(15000, 15300, " Mitte"),
+            _word_token(19700, 20000, " Ende"),
+            _word_token(20050, 20250, " Nach"),  # nur 50 ms Pause - unter MIN_NACHKLANG_MS (60)
+        ],
+    )
+    miss_aufrufe: list[int] = []
+
+    def fake_miss(media_path, mark_ms, **k):
+        del media_path, k
+        miss_aufrufe.append(mark_ms)
+        return -12.0, -30.0
+
+    monkeypatch.setattr(build, "finde_wortende_ton", lambda *a, **k: a[1])
+    monkeypatch.setattr(build, "finde_worteinsatz_ton", lambda *a, **k: 0)
+    monkeypatch.setattr(build, "finde_wortrand_ende", lambda media, ms, **k: ms)
+    monkeypatch.setattr(build, "finde_wortrand_anfang", lambda media, ms, **k: ms)
+    monkeypatch.setattr(build, "miss_pegel_bei_marke", fake_miss)
+
+    result = build.run_shorts_build(**kwargs)
+
+    assert isinstance(result, build.BuildResult)
+    outcome = result.outcomes[0]
+    assert outcome.status == "gebaut"
+    end_snap = outcome.pegelkorrektur.end
+    assert end_snap is not None
+    assert end_snap.verfahren == "wortrand_kollision"
+    # eigenes wahres Ende 20000, wahrer Anfang von "Nach" 20050 -> Mitte 20025.
+    assert end_snap.corrected_ms == 20025
+    assert outcome.build_end_ms == 20025
+    # Startgrenze (direkter Wert, kein Platzproblem) und Endgrenze (Kollision)
+    # messen beide ueber miss_pegel_bei_marke - genau zwei Aufrufe.
+    assert miss_aufrufe == [9960, 20025]
+
+
+def test_startgrenze_kollision_ergibt_mitte_der_wahren_wortraender(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Wie oben, an der Startgrenze: der direkte Wert (wahrer Anfang minus
+    TON_EINBLENDE_MS) wuerde bereits am oder hinter dem wahren Ende des
+    vorigen Wortes liegen - Mitte zwischen wahrem Ende des vorigen Wortes und
+    eigenem wahrem Anfang."""
+    kwargs = _prepare_single_candidate_build(
+        tmp_path,
+        monkeypatch,
+        word_tokens=[
+            _word_token(9000, 9970, " Vor"),  # nur 30 ms Pause - unter TON_EINBLENDE_MS (40)
+            _word_token(10000, 10300, " Start"),
+            _word_token(15000, 15300, " Mitte"),
+            _word_token(19700, 20000, " Ende"),
+            _word_token(20800, 21100, " Nach"),
+        ],
+    )
+    miss_aufrufe: list[int] = []
+
+    def fake_miss(media_path, mark_ms, **k):
+        del media_path, k
+        miss_aufrufe.append(mark_ms)
+        return -12.0, -30.0
+
+    monkeypatch.setattr(build, "finde_wortende_ton", lambda *a, **k: a[1])
+    monkeypatch.setattr(build, "finde_worteinsatz_ton", lambda *a, **k: 0)
+    monkeypatch.setattr(build, "finde_wortrand_ende", lambda media, ms, **k: ms)
+    monkeypatch.setattr(build, "finde_wortrand_anfang", lambda media, ms, **k: ms)
+    monkeypatch.setattr(build, "miss_pegel_bei_marke", fake_miss)
+
+    result = build.run_shorts_build(**kwargs)
+
+    assert isinstance(result, build.BuildResult)
+    outcome = result.outcomes[0]
+    assert outcome.status == "gebaut"
+    start_snap = outcome.pegelkorrektur.start
+    assert start_snap is not None
+    assert start_snap.verfahren == "wortrand_kollision"
+    # wahres Ende von "Vor" 9970, eigener wahrer Anfang 10000 -> Mitte 9985.
+    assert start_snap.corrected_ms == 9985
+    assert outcome.build_start_ms == 9985
+    # Startgrenze (Kollision) und Endgrenze (direkter Wert) messen beide ueber
+    # miss_pegel_bei_marke - genau zwei Aufrufe.
+    assert miss_aufrufe == [9985, 20060]
+
+
+def test_endgrenze_end_min_nachklang_ms_ersetzt_min_nachklang_ms(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """``end_min_nachklang_ms`` ersetzt (nicht addiert zu) MIN_NACHKLANG_MS in
+    der direkten Endgrenzenformel - ein sehr grosser Wert erzwingt damit eine
+    Kollision, unabhaengig von :data:`level_cut.MIN_NACHKLANG_MS`."""
+    kwargs = _prepare_single_candidate_build(tmp_path, monkeypatch)
+
+    def fake_miss(media_path, mark_ms, **k):
+        del media_path, mark_ms, k
+        return -12.0, -30.0
+
+    monkeypatch.setattr(build, "finde_wortende_ton", lambda *a, **k: a[1])
+    monkeypatch.setattr(build, "finde_worteinsatz_ton", lambda *a, **k: 0)
+    monkeypatch.setattr(build, "finde_wortrand_ende", lambda media, ms, **k: ms)
+    monkeypatch.setattr(build, "finde_wortrand_anfang", lambda media, ms, **k: ms)
+    monkeypatch.setattr(build, "miss_pegel_bei_marke", fake_miss)
+
+    result = build.run_shorts_build(**kwargs, end_min_nachklang_ms=999_999)
+
+    assert isinstance(result, build.BuildResult)
+    outcome = result.outcomes[0]
+    assert outcome.status == "gebaut"
+    end_snap = outcome.pegelkorrektur.end
+    assert end_snap is not None
+    assert end_snap.verfahren == "wortrand_kollision"
+    # eigenes wahres Ende 20000, wahrer Anfang von "Nach" 20800 -> Mitte 20400.
+    assert end_snap.corrected_ms == 20400
+
+
+# ---------------------------------------------------------------------------
+# Auftrag shorts-nachbarrand: bei Nullpause (pause_after_ms/pause_before_ms
+# <= 0) liegt die whisper-Marke des Nachbarworts exakt auf der eigenen,
+# ungekorrigierten Wortgrenze - die alte Suche (finde_wortrand_anfang/
+# finde_wortrand_ende um diese Marke) trifft dann oft den eigenen statt den
+# fremden Wortrand. finde_nachbarrand_einsatz/finde_nachbarrand_ausklang
+# suchen in diesem Fall unabhaengig ab dem schon gemessenen EIGENEN wahren
+# Wortrand weiter.
+# ---------------------------------------------------------------------------
+
+
+def test_endgrenze_bei_nullpause_nutzt_nachbarrand_einsatz(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """``pause_after_ms == 0``: der Treffer von :func:`finde_nachbarrand_einsatz`
+    ersetzt die (bei Nullpause blinde) alte Suche um die whisper-Marke."""
+    kwargs = _prepare_single_candidate_build(
+        tmp_path,
+        monkeypatch,
+        word_tokens=[
+            _word_token(9000, 9200, " Vor"),
+            _word_token(10000, 10300, " Start"),
+            _word_token(15000, 15300, " Mitte"),
+            _word_token(19700, 20000, " Ende"),
+            _word_token(20000, 20300, " Nach"),  # pause_after_ms == 0
+        ],
+    )
+
+    def fake_miss(media_path, mark_ms, **k):
+        del media_path, k
+        return -12.0, -30.0
+
+    nachbarrand_aufrufe: list[int] = []
+
+    def fake_nachbarrand_einsatz(media_path, own_true_end_ms, **k):
+        del media_path, k
+        nachbarrand_aufrufe.append(own_true_end_ms)
+        return own_true_end_ms + 300
+
+    monkeypatch.setattr(build, "finde_wortende_ton", lambda *a, **k: a[1])
+    monkeypatch.setattr(build, "finde_worteinsatz_ton", lambda *a, **k: 0)
+    monkeypatch.setattr(build, "finde_wortrand_ende", lambda media, ms, **k: ms)
+    monkeypatch.setattr(build, "finde_wortrand_anfang", lambda media, ms, **k: ms)
+    monkeypatch.setattr(build, "finde_nachbarrand_einsatz", fake_nachbarrand_einsatz)
+    monkeypatch.setattr(build, "miss_pegel_bei_marke", fake_miss)
+
+    result = build.run_shorts_build(**kwargs)
+
+    assert isinstance(result, build.BuildResult)
+    outcome = result.outcomes[0]
+    assert outcome.status == "gebaut"
+    # eigenes wahres Ende 20000 -> nachbarrand-Treffer 20300, weit genug weg,
+    # damit der direkte Wert (20000+MIN_NACHKLANG_MS=20060) nicht kollidiert.
+    assert nachbarrand_aufrufe == [20000]
+    end_snap = outcome.pegelkorrektur.end
+    assert end_snap is not None
+    assert end_snap.verfahren == "tonblende_grosszuegig"
+    assert end_snap.corrected_ms == 20060
+    assert outcome.build_end_ms == 20060
+
+
+def test_endgrenze_bei_positiver_pause_ruft_nachbarrand_einsatz_nicht_auf(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """``pause_after_ms > 0`` (der Regelfall, z. B. kandidat-00/kandidat-04):
+    die neue Suche greift nicht - Regressionsschutz fuer die abgenommenen
+    Kandidaten."""
+    kwargs = _prepare_single_candidate_build(tmp_path, monkeypatch)  # pause_after_ms = 800
+
+    def fake_miss(media_path, mark_ms, **k):
+        del media_path, mark_ms, k
+        return -12.0, -30.0
+
+    def fail_if_called(*a, **k):
+        raise AssertionError("finde_nachbarrand_einsatz darf bei pause_after_ms > 0 nicht laufen")
+
+    monkeypatch.setattr(build, "finde_wortende_ton", lambda *a, **k: a[1])
+    monkeypatch.setattr(build, "finde_worteinsatz_ton", lambda *a, **k: 0)
+    monkeypatch.setattr(build, "finde_wortrand_ende", lambda media, ms, **k: ms)
+    monkeypatch.setattr(build, "finde_wortrand_anfang", lambda media, ms, **k: ms)
+    monkeypatch.setattr(build, "finde_nachbarrand_einsatz", fail_if_called)
+    monkeypatch.setattr(build, "miss_pegel_bei_marke", fake_miss)
+
+    result = build.run_shorts_build(**kwargs)
+
+    assert isinstance(result, build.BuildResult)
+    assert result.outcomes[0].status == "gebaut"
+    assert result.outcomes[0].build_end_ms == 20060
+
+
+def test_endgrenze_bei_nullpause_ohne_nachbarrand_treffer_faellt_zurueck(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """``pause_after_ms == 0``, aber :func:`finde_nachbarrand_einsatz` findet
+    nichts (``None``) - Rueckfall auf das bisherige Verfahren
+    (``finde_wortrand_anfang`` um die whisper-Marke)."""
+    kwargs = _prepare_single_candidate_build(
+        tmp_path,
+        monkeypatch,
+        word_tokens=[
+            _word_token(9000, 9200, " Vor"),
+            _word_token(10000, 10300, " Start"),
+            _word_token(15000, 15300, " Mitte"),
+            _word_token(19700, 20000, " Ende"),
+            _word_token(20000, 20300, " Nach"),  # pause_after_ms == 0
+        ],
+    )
+
+    def fake_miss(media_path, mark_ms, **k):
+        del media_path, k
+        return -12.0, -30.0
+
+    monkeypatch.setattr(build, "finde_wortende_ton", lambda *a, **k: a[1])
+    monkeypatch.setattr(build, "finde_worteinsatz_ton", lambda *a, **k: 0)
+    monkeypatch.setattr(build, "finde_wortrand_ende", lambda media, ms, **k: ms)
+    monkeypatch.setattr(build, "finde_wortrand_anfang", lambda media, ms, **k: ms)
+    monkeypatch.setattr(build, "finde_nachbarrand_einsatz", lambda *a, **k: None)
+    monkeypatch.setattr(build, "miss_pegel_bei_marke", fake_miss)
+
+    result = build.run_shorts_build(**kwargs)
+
+    assert isinstance(result, build.BuildResult)
+    outcome = result.outcomes[0]
+    assert outcome.status == "gebaut"
+    # neighbor_true_start_ms faellt auf finde_wortrand_anfang(next_word_start_ms)
+    # zurueck - unter der Identitaets-Attrappe also 20000 selbst, gleichauf mit
+    # dem eigenen wahren Ende -> Kollision, Mitte = 20000.
+    end_snap = outcome.pegelkorrektur.end
+    assert end_snap is not None
+    assert end_snap.verfahren == "wortrand_kollision"
+    assert end_snap.corrected_ms == 20000
+    assert outcome.build_end_ms == 20000
+
+
+def test_startgrenze_bei_nullpause_nutzt_nachbarrand_ausklang(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """``pause_before_ms == 0``: der Treffer von :func:`finde_nachbarrand_ausklang`
+    ersetzt die (bei Nullpause blinde) alte Suche um die whisper-Marke."""
+    kwargs = _prepare_single_candidate_build(
+        tmp_path,
+        monkeypatch,
+        word_tokens=[
+            _word_token(9000, 10000, " Vor"),  # pause_before_ms == 0
+            _word_token(10000, 10300, " Start"),
+            _word_token(15000, 15300, " Mitte"),
+            _word_token(19700, 20000, " Ende"),
+            _word_token(20800, 21100, " Nach"),
+        ],
+    )
+
+    def fake_miss(media_path, mark_ms, **k):
+        del media_path, k
+        return -12.0, -30.0
+
+    nachbarrand_aufrufe: list[int] = []
+
+    def fake_nachbarrand_ausklang(media_path, own_true_start_ms, **k):
+        del media_path, k
+        nachbarrand_aufrufe.append(own_true_start_ms)
+        return own_true_start_ms - 300
+
+    monkeypatch.setattr(build, "finde_wortende_ton", lambda *a, **k: a[1])
+    monkeypatch.setattr(build, "finde_worteinsatz_ton", lambda *a, **k: 0)
+    monkeypatch.setattr(build, "finde_wortrand_ende", lambda media, ms, **k: ms)
+    monkeypatch.setattr(build, "finde_wortrand_anfang", lambda media, ms, **k: ms)
+    monkeypatch.setattr(build, "finde_nachbarrand_ausklang", fake_nachbarrand_ausklang)
+    monkeypatch.setattr(build, "miss_pegel_bei_marke", fake_miss)
+
+    result = build.run_shorts_build(**kwargs)
+
+    assert isinstance(result, build.BuildResult)
+    outcome = result.outcomes[0]
+    assert outcome.status == "gebaut"
+    # eigener wahrer Anfang 10000 -> nachbarrand-Treffer 9700, weit genug weg,
+    # damit der direkte Wert (10000-TON_EINBLENDE_MS=9960) nicht kollidiert.
+    assert nachbarrand_aufrufe == [10000]
+    start_snap = outcome.pegelkorrektur.start
+    assert start_snap is not None
+    assert start_snap.verfahren == "tonblende_grosszuegig"
+    assert start_snap.corrected_ms == 9960
+    assert outcome.build_start_ms == 9960
+
+
+def test_startgrenze_bei_positiver_pause_ruft_nachbarrand_ausklang_nicht_auf(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """``pause_before_ms > 0`` (der Regelfall, z. B. kandidat-00/kandidat-04):
+    die neue Suche greift nicht - Regressionsschutz fuer die abgenommenen
+    Kandidaten."""
+    kwargs = _prepare_single_candidate_build(tmp_path, monkeypatch)  # pause_before_ms = 800
+
+    def fake_miss(media_path, mark_ms, **k):
+        del media_path, mark_ms, k
+        return -12.0, -30.0
+
+    def fail_if_called(*a, **k):
+        raise AssertionError("finde_nachbarrand_ausklang darf bei pause_before_ms > 0 nicht laufen")
+
+    monkeypatch.setattr(build, "finde_wortende_ton", lambda *a, **k: a[1])
+    monkeypatch.setattr(build, "finde_worteinsatz_ton", lambda *a, **k: 0)
+    monkeypatch.setattr(build, "finde_wortrand_ende", lambda media, ms, **k: ms)
+    monkeypatch.setattr(build, "finde_wortrand_anfang", lambda media, ms, **k: ms)
+    monkeypatch.setattr(build, "finde_nachbarrand_ausklang", fail_if_called)
+    monkeypatch.setattr(build, "miss_pegel_bei_marke", fake_miss)
+
+    result = build.run_shorts_build(**kwargs)
+
+    assert isinstance(result, build.BuildResult)
+    assert result.outcomes[0].status == "gebaut"
+    assert result.outcomes[0].build_start_ms == 9960
+
+
+def test_startgrenze_bei_nullpause_ohne_nachbarrand_treffer_faellt_zurueck(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """``pause_before_ms == 0``, aber :func:`finde_nachbarrand_ausklang` findet
+    nichts (``None``) - Rueckfall auf das bisherige Verfahren
+    (``finde_wortrand_ende`` um die whisper-Marke)."""
+    kwargs = _prepare_single_candidate_build(
+        tmp_path,
+        monkeypatch,
+        word_tokens=[
+            _word_token(9000, 10000, " Vor"),  # pause_before_ms == 0
+            _word_token(10000, 10300, " Start"),
+            _word_token(15000, 15300, " Mitte"),
+            _word_token(19700, 20000, " Ende"),
+            _word_token(20800, 21100, " Nach"),
+        ],
+    )
+
+    def fake_miss(media_path, mark_ms, **k):
+        del media_path, k
+        return -12.0, -30.0
+
+    monkeypatch.setattr(build, "finde_wortende_ton", lambda *a, **k: a[1])
+    monkeypatch.setattr(build, "finde_worteinsatz_ton", lambda *a, **k: 0)
+    monkeypatch.setattr(build, "finde_wortrand_ende", lambda media, ms, **k: ms)
+    monkeypatch.setattr(build, "finde_wortrand_anfang", lambda media, ms, **k: ms)
+    monkeypatch.setattr(build, "finde_nachbarrand_ausklang", lambda *a, **k: None)
+    monkeypatch.setattr(build, "miss_pegel_bei_marke", fake_miss)
+
+    result = build.run_shorts_build(**kwargs)
+
+    assert isinstance(result, build.BuildResult)
+    outcome = result.outcomes[0]
+    assert outcome.status == "gebaut"
+    # neighbor_true_end_ms faellt auf finde_wortrand_ende(prev_word_end_ms)
+    # zurueck - unter der Identitaets-Attrappe also 10000 selbst, gleichauf mit
+    # dem eigenen wahren Anfang -> Kollision, Mitte = 10000.
+    start_snap = outcome.pegelkorrektur.start
+    assert start_snap is not None
+    assert start_snap.verfahren == "wortrand_kollision"
+    assert start_snap.corrected_ms == 10000
+    assert outcome.build_start_ms == 10000
 
 
 # ---------------------------------------------------------------------------
