@@ -1,4 +1,4 @@
-# shorts-kriterien.yaml — Fassung 0.7 (20. August 2026)
+# shorts-kriterien.yaml — Fassung 0.8 (24. August 2026)
 #
 # Diese Datei ist der Text, den ein lesendes Modell in Stufe 2 als Vorgabe
 # bekommt. Jede Aussage traegt, woher sie kommt und wie gut sie belegt ist.
@@ -84,6 +84,16 @@ definition:
     oder zustimmungsfaehig. Es heisst NICHT, dass jeder Begriff darin erklaert
     wird. "Retail wurde wrong-footed, alle gucken nur auf den letzten Zyklus"
     steht fuer sich -- man kann widersprechen, ohne zu wissen, was davor kam.
+  staerke_bedeutet: |
+    `staerke` beschreibt, wie gut ein Kriterium BELEGT ist -- nicht, wie
+    verbindlich es ist. Die vorkommenden Werte sind mittel, stark,
+    schwach, schwach_bei_dieser_laenge, unbelegt und trennt_nicht.
+
+    Ein Kriterium kann stark belegt und trotzdem nur ein Rangmerkmal
+    sein. Umgekehrt kann ein Ausschluss zwingend gelten, auch wenn er nur
+    an wenigen Faellen belegt ist. Wo ein Kriterium einen ZWINGENDEN
+    AUSSCHLUSS beschreibt, sagt sein Regeltext das ausdruecklich -- die
+    Staerke sagt es nicht.
 
 # ---------------------------------------------------------------------------
 # Die Kriterien, nach Wirksamkeit sortiert
@@ -166,13 +176,39 @@ kriterien:
       dem Ton und spaeter der Mausbewegung. Zeigewoerter -- "hier", "dort",
       "diese Bereiche" -- sind deshalb ERLAUBT, solange der Zuschauer im Bild
       sieht, worauf gezeigt wird.
-    grenze_der_regel: >
-      Nicht erlaubt bleibt, was das Bild nicht traegt:
+    grenze_der_regel: |
+      Ausgeschlossen sind RECHNUNGEN, die der Zuschauer im Kopf
+      nachvollziehen muesste, um der Aussage zu folgen.
+
+      NICHT ausgeschlossen sind genannte Kursmarken, die eingetroffen sind.
+      Sie sind der Beleg, nicht die Rechnung -- der Zuschauer muss nichts
+      rechnen, er sieht die Zahl im Chart und hoert, dass sie vorher
+      genannt wurde. Mehrere solche Marken in einem Kandidaten schwaechen
+      ihn nicht, sie staerken ihn.
+
+      Beleg: Bei der Aufnahme 2026-08-21 hat ein Zerlegungslauf die
+      Numerologie-Zone 185-347 s wegen der alten Fassung dieser Regel
+      ausgelassen. Der Nutzer hat alle vier Kandidaten aus dieser Zone
+      angenommen (57.720, 125.720, 22 Prozent, Hyperliquid-Levels).
+
+      Ausgeschlossen bleibt der Rueckbezug auf FRUEHERE Videos oder auf
+      Gesagtes, das im Ausschnitt nicht sichtbar wird -- mit einer
+      Ausnahme: Ein Rueckbezug auf die eigene fruehere Ansage ist erlaubt,
+      wenn er im Kandidaten selbst EINGELOEST wird. "Wir hatten X gesagt,
+      und da steht X jetzt" ist vollstaendig, weil das X im Bild ist; der
+      Zuschauer braucht das fruehere Video nicht. Nicht eingeloest bleibt
+      verboten: "wie im letzten Video erklaert", ohne dass die Sache selbst
+      im Kandidaten vorkommt -- dann fehlt dem Zuschauer der Gegenstand,
+      nicht nur die Vorgeschichte.
+
+      Diese Ausnahme und die Ausnahme in
+      kuerzestes_was_noch_fuer_sich_steht gehoeren zusammen; ohne sie
+      wuerden sie einander widersprechen.
+
+      Unveraendert aus 0.7 uebernommen -- nicht erlaubt bleibt, was das
+      Bild nicht traegt:
         - lange Aufzaehlungen von Fachbegriffen ohne Zwischenpunkt
           (Wyckoff-Phasenketten ueber 40 s und mehr)
-        - Rueckbezug auf FRUEHERE Videos oder auf Gesagtes, das im Ausschnitt
-          nicht sichtbar wird
-        - Zahlen- und Levelketten, bei denen der Zuschauer mitrechnen muesste
     belegt_durch: >
       Im Lauf vom 18.8. wurden 14 von 34 Abschnitten mit "zeigt in den Chart"
       verworfen. Nach 0.6 kippten davon 8 -- genau die vorhergesagte Haelfte;
@@ -210,6 +246,24 @@ kriterien:
     folge: >
       Verschachtelte Kandidaten duerfen ausgegeben werden, die kurzen sind
       aber die Vorschlaege. Die lange Fassung kommt als laengere_fassung mit.
+    ausnahme_wenn_der_nachbar_traegt: |
+      Ausgenommen, die Darstellung verbessert sich durch etwas, was direkt
+      daneben steht. Dann kommt es mit, auch wenn das Kuerzeste fuer sich
+      stehen koennte. Das ist keine Zweifelsregel -- es braucht einen
+      benannten Grund, warum der Nachbar die Aussage staerker macht.
+
+      Der haeufigste Fall ist die eingeloeste eigene Ansage: "wir hatten
+      gesagt", "wir haben gedacht", "darueber haben wir neulich geredet".
+      Ohne diesen Teil ist es eine Chartbeobachtung, mit ihm eine
+      eingeloeste Ansage -- und daran reibt man sich. Genau diese Reibung
+      ist gewollt.
+
+      Beleg: Von den 13 Kandidaten der Aufnahme 2026-08-21 hat der Nutzer
+      drei abgelehnt, und alle drei Ablehnungen waren Schnittfehler dieser
+      Art, keine Inhaltsfehler ("der Teil der danach kommt gehoert
+      thematisch noch dazu", "davor hatten wir noch gesagt, dass wir das
+      gedacht hatten", "gehoert zu Kandidat X, gemeinsam als laengeres
+      Short nutzbar").
 
   - name: kein_anlauf_am_anfang
     staerke: mittel
@@ -326,6 +380,38 @@ kriterien:
       Zwoelfsekuender enthaelt im Mittel keine einzige. Nicht widerlegt,
       sondern fuer diese Laenge unbrauchbar. Ersetzt durch
       interpunktion_traegt_die_grenzen.
+
+  - name: grenze_braucht_eine_hoerbare_pause
+    staerke: stark
+    regel: |
+      Eine Kandidatengrenze darf nicht dort liegen, wo zwei Woerter einander
+      beruehren. Gemeint ist der Extremfall: die am Ton gemessene Luecke
+      zwischen dem letzten eigenen Wort und dem ersten fremden betraegt
+      NULL Millisekunden. Dann ist die Stelle als Grenze unbrauchbar,
+      unabhaengig davon, wie gut der Inhalt ist.
+
+      Das ist KEINE Forderung nach einer Sprechpause im Sinne von
+      grenze_liegt_auf_einer_sprechpause. Eine Fuge ist etwas Groesseres und
+      kommt in diesem Material selten vor; hier genuegt der messbare
+      Abstand zwischen zwei Lauten. Gemessene Faelle, die getragen haben:
+      100 ms, 140 ms, 90 ms. Der Ausschluss greift erst bei null.
+
+      Der Grund ist technisch und nicht verhandelbar: Beruehren sich die
+      Woerter, gibt es keinen richtigen Schnittpunkt. Jeder Schnitt kappt
+      dann entweder die letzte Silbe des eigenen Wortes oder nimmt das
+      erste Wort des naechsten Satzes mit. Ein Drittes gibt es nicht.
+
+      Beleg: An der Aufnahme 2026-08-21 wurde die Luecke zwischen "57.720,"
+      und "das" mit null Millisekunden gemessen. Fuenf aufeinanderfolgende
+      Auftraege an der Schnittpunktsuche haben daran nichts geaendert. Neun
+      von elf Kandidaten klangen einwandfrei; die zwei uebrigen waren beide
+      Faelle ohne Pause.
+
+      Praktisch: Interpunktion im Transkript ist kein Beweis fuer einen
+      Abstand -- whisper setzt Satzzeichen auch dort, wo der Sprecher
+      durchlaeuft, und meldet umgekehrt oft Nullpausen, wo hoerbar Abstand
+      ist (gemessen 120 bis 160 ms Abweichung). Verlass dich nicht auf die
+      Whisper-Marken; im Zweifel die Grenze eine Wortgrenze weiter legen.
 
   - name: themenwechselformel_am_anfang
     staerke: schwach
@@ -522,6 +608,16 @@ bekannte_grenzen:
     Die Wortzeitstempel sind grob: 80 % der Wortuebergaenge tragen eine Luecke
     von 0 ms. Wo eine echte Sprechpause liegt, entscheidet eine Pegelmessung
     im Ton, nicht das Transkript.
+
+
+    Nachtrag zur 0.8: Diese 80 Prozent sind eine Aussage ueber die
+    WHISPER-MARKEN, nicht ueber den Ton. Am Ton nachgemessen liegt an
+    denselben Stellen oft ein hoerbarer Abstand -- gemessen 120 ms bei
+    kandidat-04 und 160 ms bei kandidat-00 zwischen Marke und wahrem
+    Wortrand. Das Kriterium grenze_braucht_eine_hoerbare_pause greift
+    deshalb nicht an vier von fuenf Grenzen, sondern nur dort, wo auch
+    die Tonmessung null ergibt. Bei der Aufnahme 2026-08-21 waren das
+    zwei von elf Kandidaten.
   - >
     Was der Nutzer NICHT will, steht nur teilweise hier. Acht Kriterien sind
     erst durch Nachfragen beim Sichten entstanden. Weitere werden so entstehen.
@@ -529,3 +625,26 @@ bekannte_grenzen:
     schleifenfaehiger_uebergang ist eine Weisung, keine Messung. polarisierung
     war es auch -- und trennt heute nichts mehr. Beim naechsten
     Urteilsdurchgang gehoert beides geprueft.
+
+# ---------------------------------------------------------------------------
+# Verfahren
+# ---------------------------------------------------------------------------
+
+zerlegung_laeuft_zweimal: |
+  Diese Datei ist eine Vorgabe fuer ein lesendes Modell, kein Programm --
+  kein Feld darin wird von Code ausgewertet. Zwei Laeufe auf demselben
+  Transkript liefern deshalb verschiedene Ergebnisse.
+
+  Gemessen an der Aufnahme 2026-08-21: Zwei unabhaengige Zerlegungen
+  fanden je acht Kandidaten, davon nur drei dieselben. Der Nutzer nahm
+  aus Lauf A fuenf von fuenf eigenen an, aus Lauf B vier von fuenf, und
+  von den drei gemeinsamen nur einen von drei. Einigkeit beider Laeufe
+  sagt also nichts ueber Qualitaet.
+
+  Ein Lauf allein haette 6 bzw. 5 brauchbare Kandidaten ergeben, beide
+  zusammen 10. Die Zerlegung laeuft deshalb zweimal und wird
+  zusammengefuehrt; als dasselbe gilt, was sich um mehr als die Haelfte
+  der kuerzeren Dauer ueberlappt, und dann die laengere Fassung.
+
+  Der zweite Lauf darf den ersten nicht kennen. Er kostet nichts als einen
+  Modellaufruf auf einem Transkript, das ohnehin dasteht.
