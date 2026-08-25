@@ -1,0 +1,318 @@
+{
+  "artifact_type": "matrix_auto_cutter_shorts_urteile",
+  "kandidaten": {
+    "1": {
+      "end_ms": 43320,
+      "ist_kind": false,
+      "notiz": "\"Start der Akkumulation im Februar, so wie wir damals drüber geredet hatten.\" ist abgeschnitten",
+      "start_ms": 29980,
+      "titel": "2015 vs. heute: Der Vergleich",
+      "urteil": "nein"
+    },
+    "10": {
+      "end_ms": 160720,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 151600,
+      "titel": "Genau das brauchen wir für mehr Sicherheit über den Boden",
+      "urteil": "ja"
+    },
+    "11": {
+      "end_ms": 298260,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 288330,
+      "titel": "Fear-Greed-Index wieder auf Oktober-Liquidations-Niveau",
+      "urteil": "nein"
+    },
+    "12": {
+      "end_ms": 326880,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 311440,
+      "titel": "Der Shakeout: \"Ihr habt falsch gelegen\"",
+      "urteil": "nein"
+    },
+    "13": {
+      "end_ms": 339740,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 330610,
+      "titel": "\"Wer die Wahrheit nicht hören kann, wird nicht erleuchtet\"",
+      "urteil": "nein"
+    },
+    "14": {
+      "end_ms": 373230,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 356250,
+      "titel": "XRP reagiert wie vorhergesagt: Liquidität grabben, dann zurück zur Range-Oberseite",
+      "urteil": "ja"
+    },
+    "15": {
+      "end_ms": 411180,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 399360,
+      "titel": "XRP-Backtest-Ziel: 1,18 bis 1,30",
+      "urteil": "ja"
+    },
+    "16": {
+      "end_ms": 499700,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 488100,
+      "titel": "Bull-Run-Bestätigung als FOMO-Falle",
+      "urteil": "ja"
+    },
+    "17": {
+      "end_ms": 573740,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 559740,
+      "titel": "Steigende Medienberichterstattung als Distributionssignal",
+      "urteil": "ja"
+    },
+    "18": {
+      "end_ms": 617490,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 607930,
+      "titel": "Trump redet über ein Projekt — nie war es was Gutes",
+      "urteil": "ja"
+    },
+    "19": {
+      "end_ms": 697340,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 680180,
+      "titel": "Reakkumulation in den 60ern, dann Fortsetzung des Bullruns",
+      "urteil": "ja"
+    },
+    "2": {
+      "end_ms": 59960,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 43320,
+      "titel": "Bärenmarkt oder nur ungewisse Erholung?",
+      "urteil": "ja"
+    },
+    "20": {
+      "end_ms": 713920,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 698500,
+      "titel": "In beiden Szenarien: Erst die Narrativ-Preise nochmal antesten",
+      "urteil": "nein"
+    },
+    "21": {
+      "end_ms": 729360,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 718680,
+      "titel": "\"Von mir keine Guess\" — beide Szenarien bleiben offen",
+      "urteil": "ja"
+    },
+    "22": {
+      "end_ms": 743280,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 729360,
+      "titel": "Reakkumulationsziel für Hype: Golden Pocket bei 0,618 oder tiefer",
+      "urteil": "ja"
+    },
+    "23": {
+      "end_ms": 765000,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 752180,
+      "titel": "Distribution oder nur eine Korrektur mit Reversal?",
+      "urteil": "ja"
+    },
+    "24": {
+      "end_ms": 780470,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 766880,
+      "titel": "Wenn der Markt dumpt, rastet Hype aus — aber nicht immer",
+      "urteil": "ja"
+    },
+    "25": {
+      "end_ms": 796240,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 780470,
+      "titel": "Mein Maxi-Coin ist ausgerastet, während der Rest gecrasht ist",
+      "urteil": "ja"
+    },
+    "26": {
+      "end_ms": 819250,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 806520,
+      "titel": "Kein Trump-Pump-and-Dump bisher — aber jetzt kommt er",
+      "urteil": "ja"
+    },
+    "27": {
+      "end_ms": 834320,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 819600,
+      "titel": "\"Ich hoffe, ich habe niemanden hier reingefomot\"",
+      "urteil": "nein"
+    },
+    "28": {
+      "end_ms": 857080,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 843900,
+      "titel": "\"Das ist der Boden gewesen\" — die Masse hat's noch nicht kapiert",
+      "urteil": "ja"
+    },
+    "29": {
+      "end_ms": 872960,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 857080,
+      "titel": "\"Bärenmarkt, Bärenmarkt — wo sind die Bullen jetzt?\"",
+      "urteil": "ja"
+    },
+    "3": {
+      "end_ms": 71920,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 59960,
+      "titel": "Seitwärts bis August, dann Ausbruch wie 2015",
+      "urteil": "nein"
+    },
+    "30": {
+      "end_ms": 892400,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 874580,
+      "titel": "Gefühl vs. Zahl: Beide sagen dasselbe Level wie vor der Oktober-Liquidation",
+      "urteil": "nein"
+    },
+    "31": {
+      "end_ms": 901340,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 892400,
+      "titel": "\"Das habe ich mehrmals mit viel Lerngeld bezahlt\"",
+      "urteil": "nein"
+    },
+    "32": {
+      "end_ms": 916000,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 901340,
+      "titel": "Menschen liegen falsch, weil Emotion subjektiv ist — der Kollege hier nicht",
+      "urteil": "nein"
+    },
+    "33": {
+      "end_ms": 930920,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 922700,
+      "titel": "Keine neue Liquidation nötig — aber ein Backtest des Bodens ist möglich",
+      "urteil": "nein"
+    },
+    "34": {
+      "end_ms": 950280,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 940780,
+      "titel": "Das andere Fraktal: invertierte Top-Bildung vom Oktober-ATH",
+      "urteil": "ja"
+    },
+    "35": {
+      "end_ms": 965040,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 950280,
+      "titel": "ABC-Korrektion durch die Golden Pocket, dann erstmal langweilig",
+      "urteil": "nein"
+    },
+    "36": {
+      "end_ms": 981560,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 966380,
+      "titel": "Drei, vier Tage gefeiert oben — und trotzdem noch Rangebound",
+      "urteil": "ja"
+    },
+    "37": {
+      "end_ms": 994120,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 981560,
+      "titel": "Noch eine LPS-Phase möglich, dann wieder bullisch wie am Boden",
+      "urteil": "ja"
+    },
+    "38": {
+      "end_ms": 1009000,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 994120,
+      "titel": "\"Kein Hate, nur die Wahrheit\" — schaut euch die alten Thumbnails an",
+      "urteil": "ja"
+    },
+    "39": {
+      "end_ms": 1032820,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 1022920,
+      "titel": "Hyperliquid-Distribution korrekt erkannt — wer ist der nächste \"Kollege\"?",
+      "urteil": "nein"
+    },
+    "4": {
+      "end_ms": 87760,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 71920,
+      "titel": "3-Milliarden-Liquidation am Boden — und keiner hat's geglaubt",
+      "urteil": "ja"
+    },
+    "5": {
+      "end_ms": 99700,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 90100,
+      "titel": "Bullish Divergence auf dem Wochen-RSI seit Februar",
+      "urteil": "ja"
+    },
+    "6": {
+      "end_ms": 110560,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 99700,
+      "titel": "Numerologie traf den Boden bei 57.720",
+      "urteil": "ja"
+    },
+    "7": {
+      "end_ms": 127900,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 115840,
+      "titel": "\"Ich werde dafür ermordet, dass ich mein Zeug verkaufe\"",
+      "urteil": "ja"
+    },
+    "8": {
+      "end_ms": 136820,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 127900,
+      "titel": "Bullrun-Hoffnung ist Heroin, das dir das Rückgrat bricht",
+      "urteil": "nein"
+    },
+    "9": {
+      "end_ms": 149620,
+      "ist_kind": false,
+      "notiz": "",
+      "start_ms": 136820,
+      "titel": "Bärenmarkt bis in die 72-52k-Zone, dann seitwärts",
+      "urteil": "ja"
+    }
+  },
+  "schema_version": "1.0"
+}
