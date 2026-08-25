@@ -50,7 +50,12 @@ Zusammenfuehrung mehrerer Laeufe.
 
 Wurzelobjekt mit dem Feld `kandidaten` (eine Liste) und zusaetzlich:
 
-- `kriterien_fassung` -- die eben gelesene Fassung.
+- `kriterien_fassung` -- die Kopfzeile der Kriteriendatei WOERTLICH, also
+  z. B. `shorts-kriterien.yaml -- Fassung 0.8 (24. August 2026)`, nicht die
+  Nummer allein. Grund: die Trefferquote gruppiert nach dieser
+  Zeichenkette. Schreibt ein Lauf `"0.8"` und der naechste
+  `"Fassung 0.8 (24. August 2026)"`, stehen zwei Gruppen fuer dieselbe
+  Fassung nebeneinander, und der Vergleich zweier Laeufe wird wertlos.
 - `achse` -- immer `"gerendert"`.
 - `video_name` -- `<AUFNAHME>`.
 - `video_dauer_ms` -- `rendered_video.duration_ms` aus `shorts-job.json`.

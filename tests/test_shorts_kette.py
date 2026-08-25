@@ -31,10 +31,39 @@ def _job_dir(tmp_path: Path, name: str = AUFNAHME) -> Path:
     return tmp_path / kette.JOBS_ROOT / name
 
 
-def _lege_ausgaben_an(job_dir: Path, *stufennamen: str, dauer_ms: int = 584_900) -> None:
-    """Lege die Ausgaben der genannten Stufen an - Inhalt egal, ausser beim Auftrag."""
+def kandidatensatz(lauf: int = 1, *, start_ms: int = 0) -> dict[str, object]:
+    """Ein knapper, aber gueltiger Zerlegungslauf - Stufe 6 liest ihn wirklich."""
+    return {
+        "kandidaten": [
+            {
+                "index": 1,
+                "start_ms": start_ms,
+                "end_ms": start_ms + 10_000,
+                "titel": f"Titel aus Lauf {lauf}",
+                "begruendung": "Begruendung",
+                "sicherheit": "hoch",
+                "enthaelt": [],
+            }
+        ],
+        "achse": "gerendert",
+        "video_name": AUFNAHME,
+        "lauf": lauf,
+        "modell": "sonnet",
+    }
+
+
+def _lege_ausgaben_an(
+    job_dir: Path, *stufennamen: str, dauer_ms: int = 584_900, lauf: int = 1
+) -> None:
+    """Lege die Ausgaben der genannten Stufen an - Inhalt egal, ausser bei zwei.
+
+    Der Auftrag traegt seine Dauer, weil die Kopfzeile der Transkription sie
+    liest. Die Zerlegung traegt einen gueltigen Kandidatensatz, seit Stufe 6
+    nicht mehr kopiert, sondern zusammenfuehrt: eine leere ``{}`` waere
+    keine Laufdatei mehr, sondern ein Lesefehler.
+    """
     job_dir.mkdir(parents=True, exist_ok=True)
-    for stufe in kette.STUFEN:
+    for stufe in kette.stufen_fuer(lauf):
         if stufe.name not in stufennamen:
             continue
         ziel = job_dir / stufe.ausgabe
@@ -42,6 +71,8 @@ def _lege_ausgaben_an(job_dir: Path, *stufennamen: str, dauer_ms: int = 584_900)
             ziel.write_text(
                 json.dumps({"rendered_video": {"duration_ms": dauer_ms}}), encoding="utf-8"
             )
+        elif stufe.name == "zerlegung":
+            ziel.write_text(json.dumps(kandidatensatz(lauf)), encoding="utf-8")
         else:
             ziel.write_text("{}", encoding="utf-8")
 
@@ -281,35 +312,56 @@ def test_fehlendes_claude_ist_code_5_und_kein_absturz(
 # --------------------------------------------------------------------------
 
 
-def test_zwei_zerlegungslaeufe_geben_code_6(
+def test_zwei_zerlegungslaeufe_werden_vereinigt_statt_angehalten(
     tmp_path: Path,
     kein_bestand: None,
     prozesse: list[list[str]],
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Zwei ``kandidaten-laufN.json`` - hier wird nicht geraten, hier wird angehalten."""
+    """Bis zum 25.8. war das Code 6 - der Platzhalter fuer die fehlende Regel.
+
+    Er ist weg: zwei Laufdateien ergeben jetzt einen vereinigten
+    Kandidatensatz, und die Nummerierung des ersten Laufs bleibt stehen.
+    """
     job_dir = _job_dir(tmp_path)
     _lege_ausgaben_an(job_dir, "auftrag", "avatar_cut", "transcript", "wortliste", "zerlegung")
-    (job_dir / "kandidaten-lauf2.json").write_text("{}", encoding="utf-8")
+    (job_dir / "kandidaten-lauf2.json").write_text(
+        json.dumps(kandidatensatz(2, start_ms=60_000)), encoding="utf-8"
+    )
 
     code = kette.main(["--aufnahme", AUFNAHME, "--wurzel", str(tmp_path)])
     ausgabe = capsys.readouterr().out
 
-    assert code == 6
-    assert "ANGEHALTEN [zusammenfuehrung_fehlt]" in ausgabe
-    assert not (job_dir / "kandidaten.json").exists()
+    assert code == 0
+    assert "ANGEHALTEN" not in ausgabe
+    ergebnis = json.loads((job_dir / "kandidaten.json").read_text(encoding="utf-8"))
+    assert [k["index"] for k in ergebnis["kandidaten"]] == [1, 2]
+    assert ergebnis["laeufe"] == [1, 2]
 
 
-def test_zusammenfuehrung_kopiert_den_einzigen_lauf(tmp_path: Path) -> None:
-    """Bei einem Lauf ist die Zusammenfuehrung eine Kopie und sonst nichts."""
+def test_zusammenfuehrung_uebernimmt_den_einzigen_lauf(tmp_path: Path) -> None:
+    """Bei einem Lauf aendert sich am Kandidatensatz nichts - nur Wurzelfelder kommen dazu.
+
+    Frueher war das eine Dateikopie und die beiden Dateien waren bytegleich.
+    Das ist vorbei: das Ergebnis traegt jetzt ``laeufe``, ``modelle`` und
+    ``zusammengefuehrt_am``, damit einer spaeteren Trefferquote nicht die
+    Herkunft fehlt. Die Kandidaten selbst sind unveraendert - darauf kommt
+    es an.
+    """
     job_dir = _job_dir(tmp_path)
     job_dir.mkdir(parents=True)
-    (job_dir / "kandidaten-lauf1.json").write_text('{"kandidaten": []}', encoding="utf-8")
+    satz = kandidatensatz(1)
+    (job_dir / "kandidaten-lauf1.json").write_text(json.dumps(satz), encoding="utf-8")
 
     ziel = kette.fuehre_zusammen(job_dir)
+    ergebnis = json.loads(ziel.read_text(encoding="utf-8"))
 
     assert ziel == job_dir / "kandidaten.json"
-    assert ziel.read_text(encoding="utf-8") == '{"kandidaten": []}'
+    gewesen = satz["kandidaten"][0]
+    geworden = ergebnis["kandidaten"][0]
+    assert all(geworden[feld] == gewesen[feld] for feld in gewesen)
+    assert ergebnis["laeufe"] == [1]
+    assert ergebnis["modelle"] == {"1": "sonnet"}
 
 
 # --------------------------------------------------------------------------
@@ -547,3 +599,145 @@ def test_kopfzeile_der_zerlegung_nennt_ohne_fahne_die_vorgabe(tmp_path: Path) ->
     zeile = kette._kopfzeile(5, kette.STUFEN[4], tmp_path / "gibt-es-nicht.json")
 
     assert zeile == "Stufe 5 von 6: Zerlegung (Modell), Modell sonnet"
+
+
+# --------------------------------------------------------------------------
+# Laufnummer
+# --------------------------------------------------------------------------
+
+
+def test_lauf_2_schreibt_lauf2_und_laesst_lauf1_unberuehrt(
+    tmp_path: Path, kein_bestand: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Der Kern des Nachschlags: der zweite Lauf legt sich NEBEN den ersten."""
+    job_dir = _job_dir(tmp_path)
+    _lege_ausgaben_an(job_dir, "auftrag", "avatar_cut", "transcript", "wortliste", "zerlegung")
+    lauf1_vorher = (job_dir / "kandidaten-lauf1.json").read_text(encoding="utf-8")
+
+    aufgezeichnet: list[list[str]] = []
+
+    def _falscher_prozess(argv: Sequence[str], *, etikett: str) -> int:
+        aufgezeichnet.append(list(argv))
+        if etikett == "zerlegung":
+            (job_dir / "kandidaten-lauf2.json").write_text(
+                json.dumps(kandidatensatz(2, start_ms=60_000)), encoding="utf-8"
+            )
+        return 0
+
+    monkeypatch.setattr(kette, "fuehre_prozess", _falscher_prozess)
+
+    code = kette.main(
+        ["--aufnahme", AUFNAHME, "--wurzel", str(tmp_path), "--neu-ab", "zerlegung", "--lauf", "2"]
+    )
+
+    assert code == 0
+    assert (job_dir / "kandidaten-lauf2.json").is_file()
+    assert (job_dir / "kandidaten-lauf1.json").read_text(encoding="utf-8") == lauf1_vorher
+
+
+def test_laufnummer_erreicht_den_auftragstext_des_modellschritts() -> None:
+    """``<N>`` und der Auftragsname tragen die Nummer - sonst schriebe das Modell lauf1."""
+    text = kette.zerlegung_auftragstext(AUFNAHME, lauf=3)
+
+    assert "<N> ist 3" in text
+    assert "zerlegung-lauf3" in text
+
+
+def test_lauf_2_bestimmt_den_dateinamen_der_stufe() -> None:
+    stufen = kette.stufen_fuer(2)
+
+    assert stufen[4].name == "zerlegung"
+    assert stufen[4].ausgabe == "kandidaten-lauf2.json"
+    # Die uebrigen fuenf Stufen haengen nicht an der Laufnummer.
+    assert [stufe.ausgabe for stufe in stufen] != [stufe.ausgabe for stufe in kette.STUFEN]
+    assert stufen[:4] == kette.STUFEN[:4]
+    assert stufen[5] == kette.STUFEN[5]
+
+
+def test_trockenlauf_nennt_die_datei_des_zweiten_laufs(
+    tmp_path: Path, kein_bestand: None, prozesse: list[list[str]],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Vor dem Warten sehen, wohin geschrieben wuerde - nicht erst hinterher."""
+    kette.main(["--aufnahme", AUFNAHME, "--wurzel", str(tmp_path), "--trocken", "--lauf", "2"])
+    ausgabe = capsys.readouterr().out
+
+    assert "kandidaten-lauf2.json" in ausgabe
+    assert "kandidaten-lauf1.json" not in ausgabe
+
+
+def test_vorhandene_laufdatei_wird_gemeldet_und_uebersprungen(
+    tmp_path: Path, kein_bestand: None, prozesse: list[list[str]],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Liegt ``kandidaten-lauf2.json`` schon da, laeuft kein zweiter Modellaufruf."""
+    job_dir = _job_dir(tmp_path)
+    _lege_ausgaben_an(job_dir, "auftrag", "avatar_cut", "transcript", "wortliste")
+    (job_dir / "kandidaten-lauf2.json").write_text(
+        json.dumps(kandidatensatz(2, start_ms=60_000)), encoding="utf-8"
+    )
+
+    code = kette.main(["--aufnahme", AUFNAHME, "--wurzel", str(tmp_path), "--lauf", "2"])
+    ausgabe = capsys.readouterr().out
+
+    assert code == 0
+    assert [argv for argv in prozesse if argv[0] == kette.CLAUDE_BEFEHL] == []
+    assert "uebersprungen - " in ausgabe
+    assert "kandidaten-lauf2.json" in ausgabe
+
+
+def test_kette_json_traegt_nach_zwei_laeufen_beide_zerlegungseintraege(
+    tmp_path: Path, kein_bestand: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Der zweite Lauf ueberschreibt die Buchfuehrung des ersten NICHT.
+
+    Beide Eintraege stehen unter ``stufen.zerlegung.laeufe``, je Nummer
+    einer - dieselbe Form traegt auch einen dritten Lauf.
+    """
+    job_dir = _job_dir(tmp_path)
+    aufgezeichnet: list[list[str]] = []
+
+    def _falscher_prozess(argv: Sequence[str], *, etikett: str) -> int:
+        aufgezeichnet.append(list(argv))
+        if etikett == "zerlegung":
+            lauf = 2 if any(arg.endswith("zerlegung-lauf2.") for arg in argv) else 1
+            (job_dir / f"kandidaten-lauf{lauf}.json").write_text(
+                json.dumps(kandidatensatz(lauf, start_ms=60_000 * (lauf - 1))), encoding="utf-8"
+            )
+        else:
+            _lege_ausgaben_an(job_dir, etikett)
+        return 0
+
+    monkeypatch.setattr(kette, "fuehre_prozess", _falscher_prozess)
+
+    assert kette.main(["--aufnahme", AUFNAHME, "--wurzel", str(tmp_path)]) == 0
+    assert (
+        kette.main(
+            [
+                "--aufnahme",
+                AUFNAHME,
+                "--wurzel",
+                str(tmp_path),
+                "--neu-ab",
+                "zerlegung",
+                "--lauf",
+                "2",
+                "--modell",
+                "opus",
+            ]
+        )
+        == 0
+    )
+
+    stufen = _lies_zustand(job_dir)["stufen"]
+    assert isinstance(stufen, dict)
+    laeufe = stufen["zerlegung"]["laeufe"]
+    assert sorted(laeufe) == ["1", "2"]
+    assert laeufe["1"]["modell"] == "sonnet"
+    assert laeufe["2"]["modell"] == "opus"
+    assert laeufe["1"]["ausgabe"].endswith("kandidaten-lauf1.json")
+    assert laeufe["2"]["ausgabe"].endswith("kandidaten-lauf2.json")
+    assert laeufe["1"]["status"] == kette.STATUS_FERTIG
+    # Und die Zusammenfuehrung hat beide Laeufe gesehen.
+    ergebnis = json.loads((job_dir / "kandidaten.json").read_text(encoding="utf-8"))
+    assert ergebnis["laeufe"] == [1, 2]

@@ -24,11 +24,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 
 from matrix_auto_cutter.atomic import replace_atomically
 from matrix_auto_cutter.shorts.candidates import (
+    CANDIDATES_FILE_NAME,
     Candidate,
     CandidatesSchemaError,
     load_candidates,
@@ -36,6 +39,8 @@ from matrix_auto_cutter.shorts.candidates import (
 from matrix_auto_cutter.shorts.judge_server import Urteil, load_urteile
 
 BAULISTE_FILE_NAME = "bauliste.json"
+LAUFDATEI_GLOB = "kandidaten-lauf*.json"
+_LAUFDATEI_MUSTER = re.compile(r"^kandidaten-lauf(\d+)\.json$")
 TREFFERQUOTE_PFAD = Path("labels/repeat/trefferquote.json")
 TREFFERQUOTE_SCHEMA_VERSION = "1.0"
 
@@ -47,6 +52,186 @@ _CODE_KEINE_URTEILSDATEI = 2
 _CODE_URTEILE_KEIN_JSON = 3
 _CODE_KEINE_ANNAHMEN = 4
 _CODE_URTEILE_ABWEICHUNG = 5
+_CODE_KEINE_LAUFDATEI = 2
+_CODE_URTEILE_VORHANDEN = 9
+
+
+# --------------------------------------------------------------------------
+# Zusammenfuehrung mehrerer Zerlegungslaeufe
+# --------------------------------------------------------------------------
+
+
+def lade_laufdateien(job_dir: Path) -> list[tuple[int, dict[str, object]]]:
+    """Alle ``kandidaten-laufN.json`` des Auftragsordners, nach Laufnummer sortiert.
+
+    Sortiert wird nach der ZAHL, nicht nach dem Namen: bei zehn Laeufen
+    stuende ``kandidaten-lauf10.json`` alphabetisch vor
+    ``kandidaten-lauf2.json``, und die Nummerierungsregel (der kleinste
+    Lauf gibt vor) haenge dann an einer Zeichenkettensortierung.
+
+    Dateien, deren Name nicht auf ``kandidaten-lauf<Zahl>.json`` passt,
+    werden uebergangen - der Glob findet auch ``kandidaten-lauf1.bak.json``.
+    """
+    gefunden: list[tuple[int, dict[str, object]]] = []
+    for pfad in sorted(job_dir.glob(LAUFDATEI_GLOB)):
+        treffer = _LAUFDATEI_MUSTER.match(pfad.name)
+        if treffer is None or not pfad.is_file():
+            continue
+        roh = json.loads(pfad.read_text(encoding="utf-8"))
+        if not isinstance(roh, dict):
+            raise CandidatesSchemaError(f"{pfad.name}: erwartet ein Wurzelobjekt")
+        gefunden.append((int(treffer.group(1)), roh))
+    gefunden.sort(key=lambda paar: paar[0])
+    return gefunden
+
+
+def _zeitbereich(kandidat: dict[str, object]) -> tuple[int, int]:
+    start = kandidat.get("start_ms")
+    ende = kandidat.get("end_ms")
+    if isinstance(start, bool) or isinstance(ende, bool):
+        raise CandidatesSchemaError("start_ms/end_ms muessen Ganzzahlen sein, nicht Wahrheitswerte")
+    if not isinstance(start, int) or not isinstance(ende, int):
+        raise CandidatesSchemaError("Kandidat ohne ganzzahlige 'start_ms'/'end_ms'")
+    return start, ende
+
+
+def gleicher_kandidat(a: dict[str, object], b: dict[str, object]) -> bool:
+    r"""Sage, ob zwei Kandidaten aus verschiedenen Laeufen denselben Ausschnitt meinen.
+
+    Die Regel steht in ``labels\repeat\shorts-kriterien.yaml``, Abschnitt
+    ``zerlegung_laeuft_zweimal``: "als dasselbe gilt, was sich um mehr als
+    die Haelfte der kuerzeren Dauer ueberlappt". Also nicht die laengere
+    und nicht die Summe - die kuerzere Dauer ist der Massstab, sonst
+    verschluckte ein langer Ausschnitt jeden kurzen, der zufaellig in ihm
+    liegt.
+
+    "Mehr als die Haelfte" ist streng gemeint: genau die Haelfte reicht
+    nicht.
+    """
+    a_start, a_ende = _zeitbereich(a)
+    b_start, b_ende = _zeitbereich(b)
+    ueberlappung = min(a_ende, b_ende) - max(a_start, b_start)
+    if ueberlappung <= 0:
+        return False
+    kuerzere = min(a_ende - a_start, b_ende - b_start)
+    if kuerzere <= 0:
+        return False
+    return ueberlappung * 2 > kuerzere
+
+
+def _ist_laenger(neu: dict[str, object], alt: dict[str, object]) -> bool:
+    neu_start, neu_ende = _zeitbereich(neu)
+    alt_start, alt_ende = _zeitbereich(alt)
+    return (neu_ende - neu_start) > (alt_ende - alt_start)
+
+
+def _jetzt() -> str:
+    """Der Zeitpunkt in ISO-Form mit Zeitzone - so steht er in jeder Artefaktdatei."""
+    return datetime.now(UTC).isoformat()
+
+
+def fuehre_zusammen(saetze: list[tuple[int, dict[str, object]]]) -> dict[str, object]:
+    """Vereinige mehrere Zerlegungslaeufe zu einem Kandidatensatz.
+
+    Nummerierung - der Grund, warum sie nicht neu vergeben wird:
+    Urteile haengen am ``index`` und an sonst nichts
+    (``judge_server.Urteil``, ``auswahl.pruefe_uebereinstimmung``). Wer bei
+    der Zusammenfuehrung neu nummeriert, laesst jedes vorhandene Urteil auf
+    einen fremden Kandidaten zeigen - und zwar lautlos, denn eine Zahl
+    passt immer auf eine Zahl. Deshalb:
+
+    * Der Satz mit der KLEINSTEN Laufnummer gibt die Nummerierung vor;
+      seine Kandidaten behalten ihren ``index`` unveraendert.
+    * Ein Kandidat aus einem spaeteren Lauf, der einem vorhandenen gleicht
+      (:func:`gleicher_kandidat`), wird NICHT neu aufgenommen. Ist seine
+      Fassung laenger, ersetzt er ``start_ms``, ``end_ms``, ``titel`` und
+      ``begruendung`` des vorhandenen - der ``index`` bleibt.
+    * Ein Kandidat ohne Entsprechung wird hinten angehaengt und bekommt den
+      naechsten freien Index.
+
+    Bei EINEM Satz ist das Ergebnis eine Kopie mit Wurzelfeldern - kein
+    Sonderfall im Code, sondern derselbe Weg mit einer leeren zweiten
+    Runde.
+    """
+    if not saetze:
+        raise CandidatesSchemaError("kein einziger Zerlegungslauf zum Zusammenfuehren")
+    geordnet = sorted(saetze, key=lambda paar: paar[0])
+    erste_nummer, erster_satz = geordnet[0]
+
+    ergebnis: list[dict[str, object]] = []
+    hoechster_index = 0
+    for roh in _kandidatenliste(erster_satz):
+        kandidat = dict(roh)
+        kandidat["aus_lauf"] = erste_nummer
+        index = kandidat.get("index")
+        if isinstance(index, int) and not isinstance(index, bool):
+            hoechster_index = max(hoechster_index, index)
+        ergebnis.append(kandidat)
+
+    for nummer, satz in geordnet[1:]:
+        for roh in _kandidatenliste(satz):
+            vorhanden = next(
+                (eintrag for eintrag in ergebnis if gleicher_kandidat(eintrag, roh)), None
+            )
+            if vorhanden is None:
+                kandidat = dict(roh)
+                hoechster_index += 1
+                kandidat["index"] = hoechster_index
+                kandidat["aus_lauf"] = nummer
+                ergebnis.append(kandidat)
+                continue
+            if _ist_laenger(roh, vorhanden):
+                _ersetze_fassung(vorhanden, roh, nummer)
+
+    laeufe = [nummer for nummer, _ in geordnet]
+    payload: dict[str, object] = {
+        schluessel: wert
+        for schluessel, wert in erster_satz.items()
+        if schluessel not in ("kandidaten", "lauf", "modell")
+    }
+    payload["kandidaten"] = ergebnis
+    payload["lauf"] = erste_nummer
+    payload["laeufe"] = laeufe
+    payload["modelle"] = {
+        str(nummer): satz.get("modell", "unbekannt") for nummer, satz in geordnet
+    }
+    payload["zusammengefuehrt_am"] = _jetzt()
+    return payload
+
+
+def _kandidatenliste(satz: dict[str, object]) -> list[dict[str, object]]:
+    liste = satz.get("kandidaten")
+    if not isinstance(liste, list):
+        raise CandidatesSchemaError("Zerlegungslauf ohne Liste unter 'kandidaten'")
+    return [eintrag for eintrag in liste if isinstance(eintrag, dict)]
+
+
+def _ersetze_fassung(
+    vorhanden: dict[str, object], laenger: dict[str, object], nummer: int
+) -> None:
+    """Uebernimm die laengere Fassung - Zeiten, Titel, Begruendung; der Index bleibt.
+
+    ``dauer_ms`` wird mitgezogen, wo es dasteht: der Zerlegungslauf
+    schreibt es als abgeleitete Zahl neben ``start_ms``/``end_ms``, und ein
+    stehengebliebenes ``dauer_ms`` widerspraeche nach dem Ersetzen den
+    beiden Zeiten, aus denen es stammt.
+    """
+    start, ende = _zeitbereich(laenger)
+    vorhanden["start_ms"] = start
+    vorhanden["end_ms"] = ende
+    for feld in ("titel", "begruendung"):
+        if feld in laenger:
+            vorhanden[feld] = laenger[feld]
+    if "dauer_ms" in vorhanden or "dauer_ms" in laenger:
+        vorhanden["dauer_ms"] = ende - start
+    bisher = vorhanden.get("aus_laeufen")
+    laeufe = list(bisher) if isinstance(bisher, list) else []
+    erster = vorhanden.get("aus_lauf")
+    if not laeufe and isinstance(erster, int):
+        laeufe = [erster]
+    if nummer not in laeufe:
+        laeufe.append(nummer)
+    vorhanden["aus_laeufen"] = laeufe
 
 
 def juengste_urteilsdatei(job_dir: Path) -> Path | None:
@@ -183,6 +368,11 @@ def _write_json_atomically(path: Path, payload: dict[str, object]) -> None:
     finally:
         if temporary is not None and temporary.exists():
             temporary.unlink(missing_ok=True)
+
+
+def schreibe_kandidatensatz(pfad: Path, payload: dict[str, object]) -> None:
+    """Schreibe einen zusammengefuehrten Kandidatensatz atomar nach ``pfad``."""
+    _write_json_atomically(pfad, payload)
 
 
 def schreibe_bauliste(pfad: Path, payload: dict[str, object]) -> None:
@@ -351,6 +541,47 @@ def _hat_bestehenden_eintrag(pfad: Path, *, video_name: str, lauf: int | str | N
     )
 
 
+def _zusammenfuehren_cli(job_dir: Path, output: Path | None) -> int:
+    """``--zusammenfuehren``: aus allen Laufdateien eine ``kandidaten.json`` machen.
+
+    Liegen bereits Urteile UND eine ``kandidaten.json`` vor, wird nicht
+    geschrieben, sondern gemeldet (Code 9). Nicht aus Vorsicht: die
+    vorhandenen Urteile zeigen auf die Nummerierung der Datei, die
+    dalaege - eine neu geschriebene ``kandidaten.json`` kann dieselben
+    Indizes tragen und trotzdem andere Ausschnitte meinen, wenn zwischen
+    den beiden Zusammenfuehrungen eine Laufdatei dazukam.
+    """
+    ziel = output or (job_dir / CANDIDATES_FILE_NAME)
+    try:
+        saetze = lade_laufdateien(job_dir)
+    except (OSError, json.JSONDecodeError, CandidatesSchemaError) as exc:
+        print(f"ANGEHALTEN [laufdatei_unlesbar]: {exc}")
+        return _CODE_KANDIDATEN_UNLESBAR
+    if not saetze:
+        print(f"ANGEHALTEN [keine_laufdatei]: kein {LAUFDATEI_GLOB} in {job_dir}")
+        return _CODE_KEINE_LAUFDATEI
+
+    urteilsdatei = juengste_urteilsdatei(job_dir)
+    if ziel.is_file() and urteilsdatei is not None:
+        print(
+            f"ANGEHALTEN [urteile_vorhanden]: {ziel.name} liegt vor und {urteilsdatei.name} "
+            f"zeigt auf dessen Nummerierung - nichts geschrieben"
+        )
+        return _CODE_URTEILE_VORHANDEN
+
+    try:
+        payload = fuehre_zusammen(saetze)
+    except CandidatesSchemaError as exc:
+        print(f"ANGEHALTEN [laufdatei_unlesbar]: {exc}")
+        return _CODE_KANDIDATEN_UNLESBAR
+    schreibe_kandidatensatz(ziel, payload)
+    kandidaten = payload["kandidaten"]
+    assert isinstance(kandidaten, list)
+    laeufe = ", ".join(str(nummer) for nummer, _ in saetze)
+    print(f"Laeufe {laeufe} zusammengefuehrt: {len(kandidaten)} Kandidaten -> {ziel}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI: aus Kandidaten plus Urteilen eine Bauliste machen (und Trefferquote fortschreiben)."""
     import argparse
@@ -363,7 +594,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--urteile", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--keine-trefferquote", action="store_true")
+    parser.add_argument(
+        "--zusammenfuehren",
+        action="store_true",
+        help="alle kandidaten-lauf*.json zu kandidaten.json vereinigen und beenden",
+    )
     args = parser.parse_args(argv)
+
+    if args.zusammenfuehren:
+        return _zusammenfuehren_cli(args.job_path, args.output)
 
     job_dir: Path = args.job_path
     kandidaten_path = args.kandidaten or (job_dir / "kandidaten.json")

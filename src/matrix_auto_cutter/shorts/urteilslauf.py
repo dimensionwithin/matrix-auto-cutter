@@ -360,6 +360,11 @@ def quote_prozent(ja: int, gesamt: int) -> int:
 def nachschlagbefehl(video_name: str, modell: str = NACHSCHLAG_MODELL) -> str:
     """Die vollstaendige ``kette``-Zeile fuer einen zweiten Zerlegungslauf.
 
+    ``--lauf 2`` ist der Kern der Zeile: ohne die Fahne schriebe der
+    Nachschlag wieder ``kandidaten-lauf1.json`` und ueberschriebe damit den
+    ersten Lauf. Mit ihr entsteht ``kandidaten-lauf2.json`` daneben, und
+    Stufe 6 vereinigt beide.
+
     Wie :func:`baubefehl` nur zum Hinschreiben, nie zum Ausfuehren. Der
     Aufnahmename kommt aus dem Wurzelfeld ``video_name`` der
     Kandidatendatei, nicht aus dem Ordnernamen: die beiden duerfen
@@ -369,7 +374,7 @@ def nachschlagbefehl(video_name: str, modell: str = NACHSCHLAG_MODELL) -> str:
     """
     return (
         f'python -m matrix_auto_cutter.shorts.kette --aufnahme "{video_name}" '
-        f"--neu-ab zerlegung --modell {modell}"
+        f"--neu-ab zerlegung --lauf 2 --modell {modell}"
     )
 
 
@@ -574,9 +579,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     print("  Nachschlag mit einem anderen Modell, falls die Ausbeute zu mager war:")
     print(f"  {nachschlagbefehl(video_name)}")
     print(
-        "  Achtung: die Zusammenfuehrung ist NICHT gebaut - liegen mehrere "
-        "kandidaten-lauf*.json vor, haelt kette mit Code 6 an. Heute schreibt der "
-        "Nachschlag ohnehin wieder kandidaten-lauf1.json und ueberschreibt den ersten Lauf."
+        "  Danach muss kandidaten.json neu zusammengefuehrt werden (Stufe 6 der "
+        "Kette tut das selbst). Vorhandene Urteile bleiben gueltig: die "
+        "Zusammenfuehrung behaelt die Nummerierung des ersten Laufs bei."
     )
 
     # ---- Schritt 5: Bauliste ---------------------------------------------

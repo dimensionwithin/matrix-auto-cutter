@@ -44,7 +44,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -55,12 +54,16 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from matrix_auto_cutter.atomic import replace_atomically
+from matrix_auto_cutter.shorts import auswahl
 from matrix_auto_cutter.shorts.auftrag import (
     AuftragFehlschlag,
     sammle_aufnahmen,
     waehle_aufnahme,
 )
-from matrix_auto_cutter.shorts.candidates import CANDIDATES_FILE_NAME
+from matrix_auto_cutter.shorts.candidates import (
+    CANDIDATES_FILE_NAME,
+    CandidatesSchemaError,
+)
 
 JOBS_ROOT = Path("artefakte") / "repeat" / "shorts"
 ZUSTAND_FILE_NAME = "kette.json"
@@ -71,7 +74,6 @@ SCHEMA_VERSION = "1.0"
 CODE_ERFOLG = 0
 CODE_KEINE_AUFNAHME = 2
 CODE_STUFE_GESCHEITERT = 5
-CODE_ZUSAMMENFUEHRUNG_FEHLT = 6
 
 # Belegt in ORCHESTRATOR-UEBERGABE-2026-08-25.md: die Transkription mit vier
 # Threads braucht rund das 1,27-fache der Audiodauer. Der Wert ist eine
@@ -86,6 +88,7 @@ CLAUDE_BEFEHL = "claude"
 ZERLEGUNG_AUFTRAGSTEXT_PFAD = Path("docs") / "repeat" / "ZERLEGUNG-AUFTRAGSTEXT.md"
 ZERLEGUNG_MODELL = "sonnet"
 ZERLEGUNG_LAUF = 1
+ZERLEGUNG_STUFE = "zerlegung"
 
 STATUS_OFFEN = "offen"
 STATUS_LAEUFT = "laeuft"
@@ -107,11 +110,31 @@ STUFEN: tuple[Stufe, ...] = (
     Stufe("avatar_cut", "avatar-cut.mp4", "Avatar nachschneiden"),
     Stufe("transcript", "transkript-rendered.json", "Transkription"),
     Stufe("wortliste", "wortliste.json", "Wortliste"),
-    Stufe("zerlegung", f"kandidaten-lauf{ZERLEGUNG_LAUF}.json", "Zerlegung (Modell)"),
+    Stufe(ZERLEGUNG_STUFE, f"kandidaten-lauf{ZERLEGUNG_LAUF}.json", "Zerlegung (Modell)"),
     Stufe("zusammenfuehrung", CANDIDATES_FILE_NAME, "Zusammenfuehrung"),
 )
 
-_KANDIDATEN_LAUF_GLOB = "kandidaten-lauf*.json"
+_KANDIDATEN_LAUF_GLOB = auswahl.LAUFDATEI_GLOB
+
+
+def stufen_fuer(lauf: int) -> tuple[Stufe, ...]:
+    """Die sechs Stufen fuer eine bestimmte Laufnummer.
+
+    Nur die Zerlegung haengt an der Nummer, und sie haengt daran mit ihrem
+    Dateinamen: ``kandidaten-lauf2.json`` ist die Ausgabe des zweiten
+    Laufs. Waere der Name weiter fest, schriebe ein Nachschlag ueber den
+    ersten Lauf - genau der Fehler, den dieser Bau abstellt.
+
+    Der Stufen-NAME bleibt ``zerlegung``, damit ``--neu-ab zerlegung``
+    unabhaengig von der Laufnummer trifft. Die Laufnummer steckt allein im
+    Dateinamen und im Zustandsschluessel (:func:`zustand_schluessel`).
+    """
+    return tuple(
+        Stufe(stufe.name, f"kandidaten-lauf{lauf}.json", stufe.beschreibung)
+        if stufe.name == ZERLEGUNG_STUFE
+        else stufe
+        for stufe in STUFEN
+    )
 
 
 class KetteFehlschlag(Exception):
@@ -202,6 +225,38 @@ def schreibe_zustand(pfad: Path, zustand: dict[str, object]) -> None:
     finally:
         if temporaer is not None and temporaer.exists():
             temporaer.unlink(missing_ok=True)
+
+
+def zerlegung_lauf_eintrag(zustand: dict[str, object], lauf: int) -> dict[str, object]:
+    """Der Eintrag EINES Zerlegungslaufs, unter ``stufen.zerlegung.laeufe.<N>``.
+
+    Warum geschachtelt und nicht ``stufen["zerlegung-lauf2"]``: die
+    Stufenliste hat sechs Namen, und ``--neu-ab zerlegung`` sowie jede
+    Auswertung von ``kette.json`` gehen ueber diese Namen. Ein Schluessel,
+    der die Laufnummer traegt, machte aus sechs Stufen bei drei Laeufen
+    acht und truebe die Buchfuehrung fuer alle uebrigen Leser mit.
+
+    Unter ``laeufe`` steht dagegen je Nummer ein voller Stufeneintrag -
+    ``"1"``, ``"2"``, ``"3"`` -, und ein zweiter Lauf fasst den Eintrag des
+    ersten nicht an. Der Eintrag ``stufen["zerlegung"]`` selbst bleibt die
+    Zusammenfassung des zuletzt gefahrenen Laufs; wer wissen will, was
+    Lauf 1 gekostet hat, liest ``laeufe["1"]`` und nicht ihn.
+
+    Die Schluessel sind Zeichenketten, weil JSON keine Zahlen als
+    Objektschluessel kennt - ein ``json.dump`` machte daraus ohnehin
+    ``"1"``, und ein spaeterer Leser faende sie dann dort, wo er sie nicht
+    erwartet.
+    """
+    eintrag = _eintrag(zustand, ZERLEGUNG_STUFE)
+    laeufe = eintrag.get("laeufe")
+    if not isinstance(laeufe, dict):
+        laeufe = {}
+        eintrag["laeufe"] = laeufe
+    lauf_eintrag = laeufe.get(str(lauf))
+    if not isinstance(lauf_eintrag, dict):
+        lauf_eintrag = _leerer_eintrag()
+        laeufe[str(lauf)] = lauf_eintrag
+    return lauf_eintrag
 
 
 def _eintrag(zustand: dict[str, object], name: str) -> dict[str, object]:
@@ -376,6 +431,7 @@ def stufen_argv(
     video_name: str,
     erzwingen: bool,
     modell: str = ZERLEGUNG_MODELL,
+    lauf: int = ZERLEGUNG_LAUF,
 ) -> list[str] | None:
     """Die Befehlszeile einer Stufe; ``None`` heisst: kein Prozess, sondern Handarbeit.
 
@@ -405,8 +461,8 @@ def stufen_argv(
     if stufe.name in ("transcript", "wortliste"):
         argv = [py, "-m", f"matrix_auto_cutter.shorts.{stufe.name}", str(job_path)]
         return [*argv, "--force"] if erzwingen else argv
-    if stufe.name == "zerlegung":
-        return zerlegung_argv(video_name, modell=modell)
+    if stufe.name == ZERLEGUNG_STUFE:
+        return zerlegung_argv(video_name, lauf=lauf, modell=modell)
     return None
 
 
@@ -457,30 +513,41 @@ def laufdateien(job_dir: Path) -> list[Path]:
 
 
 def fuehre_zusammen(job_dir: Path) -> Path:
-    """Kopiere den einzigen Zerlegungslauf nach ``kandidaten.json``.
+    """Vereinige alle Zerlegungslaeufe zu ``kandidaten.json``.
 
-    Bei EINEM Lauf ist die Zusammenfuehrung eine Kopie und sonst nichts.
-    Liegen mehrere Laeufe vor, wird hier nicht geraten: die
-    Zusammenfuehrungslogik (welcher Vorschlag aus welchem Lauf gewinnt, was
-    ein Doppeltreffer ist) ist nicht gebaut, und eine willkuerlich gewaehlte
-    Datei waere schlimmer als ein Abbruch - sie sieht wie ein Ergebnis aus.
+    Die Regel liegt in ``auswahl.fuehre_zusammen`` und nicht hier: sie
+    gehoert zum Kandidatensatz, nicht zum Kettenlaeufer, und die
+    Befehlszeile ``auswahl --zusammenfuehren`` braucht sie ebenso. Bei
+    EINEM Lauf ist das Ergebnis eine Kopie - kein Sonderfall, sondern
+    derselbe Weg mit einer leeren zweiten Runde.
+
+    Bis zum 25.8. hielt diese Stelle bei mehreren Laufdateien mit Code 6
+    an, weil die Zusammenfuehrung nicht gebaut war. Sie ist es jetzt.
     """
-    dateien = laufdateien(job_dir)
-    if len(dateien) > 1:
-        namen = ", ".join(pfad.name for pfad in dateien)
+    try:
+        saetze = auswahl.lade_laufdateien(job_dir)
+    except (OSError, json.JSONDecodeError, CandidatesSchemaError) as fehler:
         raise KetteFehlschlag(
-            "zusammenfuehrung_fehlt",
-            f"{len(dateien)} Zerlegungslaeufe ({namen}) - die Zusammenfuehrung ist nicht gebaut",
-            CODE_ZUSAMMENFUEHRUNG_FEHLT,
-        )
-    if not dateien:
+            "stufe_gescheitert",
+            f"Zerlegungslauf in {job_dir} nicht lesbar - {fehler}",
+            CODE_STUFE_GESCHEITERT,
+        ) from fehler
+    if not saetze:
         raise KetteFehlschlag(
             "stufe_gescheitert",
             f"kein {_KANDIDATEN_LAUF_GLOB} in {job_dir} - die Zerlegung hat nichts hinterlassen",
             CODE_STUFE_GESCHEITERT,
         )
     ziel = job_dir / CANDIDATES_FILE_NAME
-    shutil.copy2(dateien[0], ziel)
+    try:
+        payload = auswahl.fuehre_zusammen(saetze)
+    except CandidatesSchemaError as fehler:
+        raise KetteFehlschlag(
+            "stufe_gescheitert",
+            f"Zusammenfuehrung in {job_dir} gescheitert - {fehler}",
+            CODE_STUFE_GESCHEITERT,
+        ) from fehler
+    auswahl.schreibe_kandidatensatz(ziel, payload)
     return ziel
 
 
@@ -531,7 +598,10 @@ def wird_uebersprungen(stufe: Stufe, job_dir: Path, zustand: dict[str, object]) 
 
 
 def _kopfzeile(
-    nummer: int, stufe: Stufe, job_path: Path, modell: str = ZERLEGUNG_MODELL
+    nummer: int,
+    stufe: Stufe,
+    job_path: Path,
+    modell: str = ZERLEGUNG_MODELL,
 ) -> str:
     """``Stufe 3 von 6: Transkription, erwartet rund 12 min 22 s``.
 
@@ -546,7 +616,7 @@ def _kopfzeile(
     angekommen ist - nicht erst danach in ``kette.json``.
     """
     zeile = f"Stufe {nummer} von {len(STUFEN)}: {stufe.beschreibung}"
-    if stufe.name == "zerlegung":
+    if stufe.name == ZERLEGUNG_STUFE:
         return f"{zeile}, Modell {modell}"
     if stufe.name != "transcript":
         return zeile
@@ -562,6 +632,7 @@ def _trockenlauf(
     zustand: dict[str, object],
     bis: int,
     modell: str = ZERLEGUNG_MODELL,
+    lauf: int = ZERLEGUNG_LAUF,
 ) -> int:
     """Nenne je Stufe, was geschehen wuerde - und fuehre nichts aus.
 
@@ -570,7 +641,7 @@ def _trockenlauf(
     """
     print("Trockenlauf (--trocken): es wird nichts ausgefuehrt und nichts geschrieben.")
     uebersprungen = 0
-    for nummer, stufe in enumerate(STUFEN[: bis + 1], start=1):
+    for nummer, stufe in enumerate(stufen_fuer(lauf)[: bis + 1], start=1):
         print(_kopfzeile(nummer, stufe, job_path, modell))
         ziel = job_dir / stufe.ausgabe
         if wird_uebersprungen(stufe, job_dir, zustand):
@@ -591,6 +662,7 @@ def _fuehre_stufe_aus(
     video_name: str,
     erzwingen: bool,
     modell: str = ZERLEGUNG_MODELL,
+    lauf: int = ZERLEGUNG_LAUF,
 ) -> None:
     """Fuehre eine einzelne Stufe aus; jeder Fehlschlag ist ein :class:`KetteFehlschlag`.
 
@@ -601,7 +673,8 @@ def _fuehre_stufe_aus(
     if stufe.name == "zusammenfuehrung":
         quelle = laufdateien(job_dir)
         ziel = fuehre_zusammen(job_dir)
-        print(f"  {ziel.name} aus {quelle[0].name} kopiert")
+        namen = ", ".join(pfad.name for pfad in quelle)
+        print(f"  {ziel.name} aus {namen} zusammengefuehrt")
         return
     argv = stufen_argv(
         stufe,
@@ -610,6 +683,7 @@ def _fuehre_stufe_aus(
         video_name=video_name,
         erzwingen=erzwingen,
         modell=modell,
+        lauf=lauf,
     )
     assert argv is not None
     code = fuehre_prozess(argv, etikett=stufe.name)
@@ -650,6 +724,16 @@ def _parser() -> argparse.ArgumentParser:
         metavar="NAME",
         help=f"Modell der Zerlegung, an claude --model durchgereicht (Vorgabe: {ZERLEGUNG_MODELL})",
     )
+    parser.add_argument(
+        "--lauf",
+        type=int,
+        default=ZERLEGUNG_LAUF,
+        metavar="N",
+        help=(
+            f"Nummer des Zerlegungslaufs; bestimmt kandidaten-laufN.json "
+            f"(Vorgabe: {ZERLEGUNG_LAUF})"
+        ),
+    )
     parser.add_argument("--wurzel", type=Path, default=None, help="abweichende Repo-Wurzel")
     return parser
 
@@ -676,38 +760,47 @@ def main(argv: Sequence[str] | None = None) -> int:
         zustand["video_name"] = video_name
 
         if args.trocken:
-            return _trockenlauf(job_dir, job_path, zustand, bis, args.modell)
+            return _trockenlauf(job_dir, job_path, zustand, bis, args.modell, args.lauf)
 
         zustand_pfad = job_dir / ZUSTAND_FILE_NAME
-        for nummer, stufe in enumerate(STUFEN[: bis + 1], start=1):
+        for nummer, stufe in enumerate(stufen_fuer(args.lauf)[: bis + 1], start=1):
             print(_kopfzeile(nummer, stufe, job_path, args.modell))
-            eintrag = _eintrag(zustand, stufe.name)
+            # Die Zerlegung fuehrt zweimal Buch: einmal als Stufe (die
+            # Zusammenfassung des zuletzt gefahrenen Laufs) und einmal je
+            # Laufnummer. Beide Eintraege bekommen denselben Stand - nur
+            # der Lauf-Eintrag bleibt dem naechsten Lauf erhalten.
+            eintraege = [_eintrag(zustand, stufe.name)]
+            if stufe.name == ZERLEGUNG_STUFE:
+                eintraege.append(zerlegung_lauf_eintrag(zustand, args.lauf))
             erzwingen = nummer - 1 >= ab
             if not erzwingen and wird_uebersprungen(stufe, job_dir, zustand):
                 print(f"  uebersprungen - {job_dir / stufe.ausgabe} liegt bereits vor")
-                eintrag.update(
-                    status=STATUS_FERTIG,
-                    ausgabe=str(job_dir / stufe.ausgabe),
-                    meldung="uebersprungen, Ausgabe lag bereits vor",
-                )
+                for eintrag in eintraege:
+                    eintrag.update(
+                        status=STATUS_FERTIG,
+                        ausgabe=str(job_dir / stufe.ausgabe),
+                        meldung="uebersprungen, Ausgabe lag bereits vor",
+                    )
                 schreibe_zustand(zustand_pfad, zustand)
                 continue
             begonnen = time.monotonic()
-            eintrag.update(
-                status=STATUS_LAEUFT,
-                begonnen_am=_jetzt(),
-                beendet_am=None,
-                dauer_s=None,
-                ausgabe=None,
-                meldung=None,
-            )
-            if stufe.name == "zerlegung":
-                # Nur hier und nur, wenn die Stufe wirklich anlaeuft: eine
-                # uebersprungene Zerlegung hat mit diesem Modell nichts
-                # gefahren, und der Eintrag des vorigen Laufs bleibt der
-                # wahre. Ihn mit der Fahne von heute zu ueberschreiben
-                # machte aus der Buchfuehrung eine Behauptung.
-                eintrag["modell"] = args.modell
+            for eintrag in eintraege:
+                eintrag.update(
+                    status=STATUS_LAEUFT,
+                    begonnen_am=_jetzt(),
+                    beendet_am=None,
+                    dauer_s=None,
+                    ausgabe=None,
+                    meldung=None,
+                )
+                if stufe.name == ZERLEGUNG_STUFE:
+                    # Nur hier und nur, wenn die Stufe wirklich anlaeuft: eine
+                    # uebersprungene Zerlegung hat mit diesem Modell nichts
+                    # gefahren, und der Eintrag des vorigen Laufs bleibt der
+                    # wahre. Ihn mit der Fahne von heute zu ueberschreiben
+                    # machte aus der Buchfuehrung eine Behauptung.
+                    eintrag["modell"] = args.modell
+                    eintrag["lauf"] = args.lauf
             schreibe_zustand(zustand_pfad, zustand)
             try:
                 _fuehre_stufe_aus(
@@ -718,24 +811,27 @@ def main(argv: Sequence[str] | None = None) -> int:
                     video_name=video_name,
                     erzwingen=erzwingen,
                     modell=args.modell,
+                    lauf=args.lauf,
                 )
             except KetteFehlschlag as fehler:
-                eintrag.update(
-                    status=STATUS_GESCHEITERT,
-                    beendet_am=_jetzt(),
-                    dauer_s=round(time.monotonic() - begonnen, 1),
-                    meldung=fehler.text,
-                )
+                for eintrag in eintraege:
+                    eintrag.update(
+                        status=STATUS_GESCHEITERT,
+                        beendet_am=_jetzt(),
+                        dauer_s=round(time.monotonic() - begonnen, 1),
+                        meldung=fehler.text,
+                    )
                 schreibe_zustand(zustand_pfad, zustand)
                 raise
             dauer = time.monotonic() - begonnen
-            eintrag.update(
-                status=STATUS_FERTIG,
-                beendet_am=_jetzt(),
-                dauer_s=round(dauer, 1),
-                ausgabe=str(job_dir / stufe.ausgabe),
-                meldung=None,
-            )
+            for eintrag in eintraege:
+                eintrag.update(
+                    status=STATUS_FERTIG,
+                    beendet_am=_jetzt(),
+                    dauer_s=round(dauer, 1),
+                    ausgabe=str(job_dir / stufe.ausgabe),
+                    meldung=None,
+                )
             schreibe_zustand(zustand_pfad, zustand)
             print(f"  fertig in {dauer_text(dauer)} -> {job_dir / stufe.ausgabe}")
     except KetteFehlschlag as fehler:

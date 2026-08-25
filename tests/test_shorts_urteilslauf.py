@@ -561,7 +561,7 @@ def test_nachschlagbefehl_nennt_aufnahme_stufe_und_modell() -> None:
 
     assert befehl == (
         'python -m matrix_auto_cutter.shorts.kette --aufnahme "2026-08-21 10-46-08" '
-        "--neu-ab zerlegung --modell opus"
+        "--neu-ab zerlegung --lauf 2 --modell opus"
     )
 
 
@@ -591,8 +591,10 @@ def test_nachschlagzeile_steht_unter_der_quote(
         "  Nachschlag mit einem anderen Modell, falls die Ausbeute zu mager war:"
     )
     assert zeilen[quote + 2] == f"  {urteilslauf.nachschlagbefehl('2026-08-21 10-46-08')}"
-    assert "die Zusammenfuehrung ist NICHT gebaut" in zeilen[quote + 3]
-    assert "Code 6" in zeilen[quote + 3]
+    # Seit dem 26.8. steht dort kein Warnhinweis mehr, sondern der Anschluss:
+    # die Zusammenfuehrung ist gebaut, und sie erhaelt die Nummerierung.
+    assert "neu zusammengefuehrt" in zeilen[quote + 3]
+    assert "Urteile bleiben gueltig" in zeilen[quote + 3]
 
 
 def test_nachschlagzeile_nimmt_den_video_name_nicht_den_ordnernamen(
