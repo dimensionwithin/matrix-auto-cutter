@@ -995,6 +995,100 @@ def test_arbeitskopie_kopiert_nur_dateien_von_anderem_laufwerk(
     assert neuer_avatar == avatar, "unveraendert, weil schon auf dem Zielaufwerk"
 
 
+# ---------------------------------------------------------------------------
+# Auftrag arbeitskopie-seitendateien: mit jeder kopierten Videodatei zieht
+# ihre Seitendatei (gleicher Stamm, ``.json``) aus dem Quellordner mit.
+# ---------------------------------------------------------------------------
+
+
+def test_arbeitskopie_kopiert_seitendatei_mit(tmp_path: Path, monkeypatch) -> None:
+    """avatar-cut.mp4 UND avatar-cut.json liegen in der Quelle - beide landen
+    in der Arbeitskopie."""
+    quelle_dir = tmp_path / "quelle"
+    quelle_dir.mkdir()
+    rendered = quelle_dir / "rendered.mp4"
+    avatar = quelle_dir / "avatar-cut.mp4"
+    avatar_sidecar = quelle_dir / "avatar-cut.json"
+    rendered.write_bytes(b"rendered-inhalt")
+    avatar.write_bytes(b"avatar-inhalt")
+    avatar_sidecar.write_text('{"coverage": {}}', encoding="utf-8")
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+
+    monkeypatch.setattr(
+        build, "_laufwerksbuchstabe", lambda path: "F:" if "quelle" in path.parts else "P:"
+    )
+
+    neuer_rendered, neuer_avatar, info = build._bereite_arbeitskopie_vor(
+        output_dir=output_dir,
+        rendered_video_path=rendered,
+        avatar_cut_path=avatar,
+        aktiviert=True,
+    )
+    assert info.aktiv is True
+    kopierte_seitendatei = info.arbeitsverzeichnis / "avatar-cut.json"
+    assert kopierte_seitendatei.is_file()
+    assert kopierte_seitendatei.read_text(encoding="utf-8") == '{"coverage": {}}'
+    assert neuer_avatar == info.arbeitsverzeichnis / "avatar-cut.mp4"
+
+
+def test_arbeitskopie_ohne_seitendatei_kein_fehlschlag(tmp_path: Path, monkeypatch) -> None:
+    """avatar-cut.json fehlt in der Quelle - die .mp4 wird trotzdem kopiert,
+    kein Fehlschlag."""
+    quelle_dir = tmp_path / "quelle"
+    quelle_dir.mkdir()
+    rendered = quelle_dir / "rendered.mp4"
+    avatar = quelle_dir / "avatar-cut.mp4"
+    rendered.write_bytes(b"rendered-inhalt")
+    avatar.write_bytes(b"avatar-inhalt")
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+
+    monkeypatch.setattr(
+        build, "_laufwerksbuchstabe", lambda path: "F:" if "quelle" in path.parts else "P:"
+    )
+
+    neuer_rendered, neuer_avatar, info = build._bereite_arbeitskopie_vor(
+        output_dir=output_dir,
+        rendered_video_path=rendered,
+        avatar_cut_path=avatar,
+        aktiviert=True,
+    )
+    assert info.aktiv is True
+    assert info.fehlgeschlagen is False
+    assert neuer_avatar == info.arbeitsverzeichnis / "avatar-cut.mp4"
+    assert neuer_avatar.read_bytes() == b"avatar-inhalt"
+    assert not (info.arbeitsverzeichnis / "avatar-cut.json").exists()
+
+
+def test_arbeitskopie_framecount_seitendatei_zieht_nicht_mit(tmp_path: Path, monkeypatch) -> None:
+    """avatar-cut.mp4.framecount.json bleibt in der Quelle - dafuer gilt die
+    bestehende Umleitung, nicht die Arbeitskopie."""
+    quelle_dir = tmp_path / "quelle"
+    quelle_dir.mkdir()
+    rendered = quelle_dir / "rendered.mp4"
+    avatar = quelle_dir / "avatar-cut.mp4"
+    framecount_sidecar = quelle_dir / "avatar-cut.mp4.framecount.json"
+    rendered.write_bytes(b"rendered-inhalt")
+    avatar.write_bytes(b"avatar-inhalt")
+    framecount_sidecar.write_text("{}", encoding="utf-8")
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+
+    monkeypatch.setattr(
+        build, "_laufwerksbuchstabe", lambda path: "F:" if "quelle" in path.parts else "P:"
+    )
+
+    _, _, info = build._bereite_arbeitskopie_vor(
+        output_dir=output_dir,
+        rendered_video_path=rendered,
+        avatar_cut_path=avatar,
+        aktiviert=True,
+    )
+    assert info.aktiv is True
+    assert not (info.arbeitsverzeichnis / "avatar-cut.mp4.framecount.json").exists()
+
+
 def test_arbeitskopie_faellt_bei_kopierfehler_auf_originalpfade_zurueck(
     tmp_path: Path, monkeypatch
 ) -> None:

@@ -169,6 +169,11 @@ BUILD_REPORT_FILE_NAME = "shorts-bau-bericht.json"
 AVATAR_CUT_FILE_NAME = "avatar-cut.mp4"
 AUSSCHNITT_FILE_NAME = "ausschnitt.json"
 ARBEITSKOPIE_DIR_NAME = "arbeitskopie"
+ARBEITSKOPIE_BEGLEITER_SUFFIXE = (".json",)
+"""Endungen der Seitendateien, die mit jeder kopierten Videodatei mitziehen -
+Auftrag arbeitskopie-seitendateien. Gleicher Stamm im Quellordner, sonst
+uebersprungen (kein Fehlschlag). Nicht ``.mp4.framecount.json`` - dafuer gilt
+die bestehende Umleitung in :func:`_framecount_sidecar_path`."""
 
 PARALLEL_DEFAULT = 4
 """Voreingestellte Zahl gleichzeitig gebauter Kandidaten - Auftrag shorts-bau-parallel.
@@ -1047,6 +1052,10 @@ def _bereite_arbeitskopie_vor(
             ziel = arbeitsverzeichnis / quellen[name].name
             shutil.copy2(quellen[name], ziel)
             neue_pfade[name] = ziel
+            for suffix in ARBEITSKOPIE_BEGLEITER_SUFFIXE:
+                begleiter_quelle = quellen[name].parent / f"{quellen[name].stem}{suffix}"
+                if begleiter_quelle.is_file():
+                    shutil.copy2(begleiter_quelle, arbeitsverzeichnis / begleiter_quelle.name)
     except OSError as exc:
         kopierdauer_sekunden = time.perf_counter() - start
         shutil.rmtree(arbeitsverzeichnis, ignore_errors=True)
