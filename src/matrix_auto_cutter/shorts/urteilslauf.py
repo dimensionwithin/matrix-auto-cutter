@@ -172,14 +172,19 @@ def warte_auf_kind(
         time.sleep(_TAKT_SEKUNDEN)
 
 
-def _server_argv(job_path: Path, *, platzhalter: bool) -> list[str]:
-    """Die Befehlszeile des Kindprozesses - echter Urteilsserver oder Platzhalter."""
-    if platzhalter:
-        return [sys.executable, "-c", f"import time; time.sleep({_PLATZHALTER_SEKUNDEN})"]
+def _server_argv(job_path: Path, *, platzhalter: bool | float) -> list[str]:
+    """Die Befehlszeile des Kindprozesses - echter Urteilsserver oder Platzhalter.
+
+    ``platzhalter`` ist ``False`` (echter Server), ``True`` (Platzhalter mit
+    der Vorgabedauer) oder eine Sekundenzahl.
+    """
+    if platzhalter is not False:
+        sekunden = _PLATZHALTER_SEKUNDEN if platzhalter is True else float(platzhalter)
+        return [sys.executable, "-c", f"import time; time.sleep({sekunden})"]
     return [sys.executable, "-m", "matrix_auto_cutter.shorts.judge_server", str(job_path)]
 
 
-def starte_urteilsseite(job_path: Path, *, platzhalter: bool = False) -> int:
+def starte_urteilsseite(job_path: Path, *, platzhalter: bool | float = False) -> int:
     """Fuehre den Urteilsserver aus und warte auf ihn, ohne an Strg+C mitzusterben.
 
     Der Nutzer beendet die Urteilsseite mit Strg+C. Unter Windows geht
@@ -206,7 +211,9 @@ def starte_urteilsseite(job_path: Path, *, platzhalter: bool = False) -> int:
 
     ``platzhalter`` startet statt des Servers einen schlafenden
     Einzeiler - dieselbe Prozessgruppe, dieselbe Schleife, dieselbe
-    Abbruchbehandlung, nur ohne Zugriff auf Urteilsdateien.
+    Abbruchbehandlung, nur ohne Zugriff auf Urteilsdateien. Eine Zahl
+    statt ``True`` legt dessen Schlafdauer fest; laenger schlafend laesst
+    sich Strg+C in Ruhe erproben.
     """
     creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
     process = subprocess.Popen(
@@ -359,11 +366,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--wurzel", type=Path, default=None)
     parser.add_argument(
         "--platzhalter-server",
-        action="store_true",
+        nargs="?",
+        type=float,
+        const=_PLATZHALTER_SEKUNDEN,
+        default=False,
+        metavar="SEKUNDEN",
         help=(
             "Erprobungshilfe: statt der Urteilsseite laeuft ein schlafender Einzeiler. "
             "Damit laesst sich Strg+C ueben, ohne den Urteilsserver auf einen echten "
-            "Auftragsordner loszulassen."
+            f"Auftragsordner loszulassen. Ohne Zahl {_PLATZHALTER_SEKUNDEN} Sekunden."
         ),
     )
     args = parser.parse_args(argv)
@@ -427,7 +438,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"ANGEHALTEN [auftrag_unlesbar]: {job_path} fehlt - Urteilsseite nicht startbar")
             return _CODE_AUFTRAG_UNLESBAR
         print("Schritt 3: Urteilsseite starten (Strg+C beendet sie, der Lauf geht danach weiter)")
-        if args.platzhalter_server:
+        if args.platzhalter_server is not False:
             print("  Erprobung: Platzhalterprozess statt Urteilsseite (--platzhalter-server)")
         server_code = starte_urteilsseite(job_path, platzhalter=args.platzhalter_server)
         print(f"  Urteilsseite beendet (Rueckgabecode {server_code}) - weiter geht es.")

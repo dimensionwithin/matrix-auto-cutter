@@ -336,3 +336,43 @@ def test_der_platzhalter_lebt_nach_dem_abfangen_nicht_mehr(
     assert code == 0
     assert len(aufgezeichnete_kinder) == 1
     assert aufgezeichnete_kinder[0].poll() is not None
+
+
+def test_platzhalter_nimmt_eine_eigene_schlafdauer_an() -> None:
+    """--platzhalter-server 12.5 schlaeft 12.5 s, ohne Zahl die Vorgabe 4.0."""
+    vorgabe = urteilslauf._server_argv(Path("egal.json"), platzhalter=True)
+    eigene = urteilslauf._server_argv(Path("egal.json"), platzhalter=12.5)
+    echter = urteilslauf._server_argv(Path("egal.json"), platzhalter=False)
+
+    assert f"time.sleep({urteilslauf._PLATZHALTER_SEKUNDEN})" in vorgabe[-1]
+    assert "time.sleep(12.5)" in eigene[-1]
+    assert echter[-1] == "egal.json"
+
+
+
+def test_platzhalter_mit_zahl_laeuft_ueber_die_befehlszeile(
+    tmp_path: Path,
+    trefferquote_umgebogen: Path,
+    capsys: pytest.CaptureFixture[str],
+    aufgezeichnete_kinder: list[Any],
+) -> None:
+    """Die Zahl hinter --platzhalter-server erreicht den Kindprozess wirklich."""
+    job_dir = tmp_path / "auftrag"
+    job_path = _baue_aufnahme(job_dir)
+
+    code = urteilslauf.main(
+        [
+            str(job_path),
+            "--platzhalter-server",
+            "0.2",
+            "--keine-sicherung",
+            "--wurzel",
+            str(tmp_path),
+        ]
+    )
+    zeilen = capsys.readouterr().out.splitlines()
+
+    assert code == 0
+    assert len(aufgezeichnete_kinder) == 1
+    assert aufgezeichnete_kinder[0].poll() == 0
+    assert "  Urteilsseite beendet (Rueckgabecode 0) - weiter geht es." in zeilen
