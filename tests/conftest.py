@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import builtins
 import json
+import os
+import subprocess
+from collections.abc import Callable
 from typing import Any
 
 import pytest
@@ -152,3 +156,128 @@ def expected_source() -> SourceIdentity:
 @pytest.fixture
 def parsed_sidecar(raw_sidecar: dict[str, Any]) -> ObsEventSidecar:
     return ObsEventSidecar.model_validate_json(json.dumps(raw_sidecar))
+
+
+# --------------------------------------------------------------------------
+# Der Riegel: kein Test greift nach draussen
+# --------------------------------------------------------------------------
+# Zwei Vorkehrungen, die fuer jeden Test der ``test_shorts_*``-Dateien von
+# selbst greifen. Sie sind hier gebuendelt, weil ``tests/conftest.py``
+# ohnehin fuer alle Testdateien gilt - eine eigene Datei nur fuer diese
+# beiden Fixtures haette dieselbe Reichweite und einen Ort mehr.
+#
+# Warum nicht schaerfer? Ein Test, der ``subprocess`` durchlaufen laesst,
+# startet irgendwann ``ffmpeg`` auf einer echten Aufnahme; ein Test, der
+# einen ``F:``-Pfad anfasst, legt irgendwann einen Ordner neben 27 fertigen
+# Shorts an. Beides ist schon geschehen. Der Riegel macht daraus einen
+# Fehlschlag mit Namen statt einer Spur im Dateisystem.
+
+MARKE_UNTERPROZESS = "echter_unterprozess"
+_SHORTS_PRAEFIX = "test_shorts_"
+_FREMDE_WURZEL = "f:"
+
+
+class RiegelVerletzt(Exception):
+    """Ein Test hat nach draussen gegriffen.
+
+    Kein ``OSError`` und kein ``ValueError``: ``Path.exists`` verschluckt
+    beide still und meldete dann schlicht "gibt es nicht", statt den Test
+    scheitern zu lassen.
+    """
+
+
+def _ist_shorts_test(request: pytest.FixtureRequest) -> bool:
+    return request.path.name.startswith(_SHORTS_PRAEFIX)
+
+
+def _zeigt_nach_f(wert: object) -> bool:
+    r"""Faengt ``F:\...``, ``F:/...`` und ``F:`` in jeder Schreibweise."""
+    if isinstance(wert, int):  # schon offene Dateideskriptoren
+        return False
+    try:
+        text = os.fspath(wert)
+    except TypeError:
+        return False
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", "replace")
+    return text[:2].lower() == _FREMDE_WURZEL
+
+
+@pytest.fixture(autouse=True)
+def kein_echter_unterprozess(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``subprocess.run`` und ``subprocess.Popen`` starten nichts mehr.
+
+    Wer wirklich ein Kind braucht - die Platzhalter-Tests des
+    Urteilslaufs -, setzt ``@pytest.mark.echter_unterprozess`` an genau
+    diesen Test. Die Markierung ist die Ausnahme, nie die Regel.
+    """
+    if not _ist_shorts_test(request):
+        return
+    if request.node.get_closest_marker(MARKE_UNTERPROZESS) is not None:
+        return
+
+    def _versperrt(name: str) -> Callable[..., Any]:
+        def _wehr(*args: Any, **kwargs: Any) -> Any:
+            befehl = args[0] if args else kwargs.get("args")
+            raise RiegelVerletzt(
+                f"subprocess.{name} ist in Shorts-Tests versperrt: {befehl!r}. "
+                f"Mocke den Unterprozess - oder setze "
+                f"@pytest.mark.{MARKE_UNTERPROZESS}, wenn dieser Test wirklich "
+                f"ein Kind braucht."
+            )
+
+        return _wehr
+
+    monkeypatch.setattr(subprocess, "run", _versperrt("run"))
+    monkeypatch.setattr(subprocess, "Popen", _versperrt("Popen"))
+
+
+_OS_TUEREN = (
+    "stat",
+    "lstat",
+    "mkdir",
+    "rmdir",
+    "remove",
+    "unlink",
+    "rename",
+    "replace",
+    "listdir",
+    "scandir",
+    "open",
+)
+
+
+@pytest.fixture(autouse=True)
+def kein_zugriff_auf_f(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Jeder Pfad, der mit ``F:`` beginnt, laesst den Test scheitern.
+
+    Verriegelt wird die ``os``-Ebene und ``open``, nicht ``pathlib``:
+    ``Path.exists``, ``Path.mkdir``, ``shutil.copy`` und ``open`` laufen
+    alle dort zusammen. Ein Dutzend ``pathlib``-Methoden einzeln zu
+    umwickeln haette dieselbe Wirkung und mehr Luecken. Der blosse Bau
+    eines ``Path("F:/...")`` bleibt erlaubt - erst das Anfassen zaehlt,
+    und genau das faengt diese Ebene.
+    """
+    if not _ist_shorts_test(request):
+        return
+
+    def _umwickle(modul: Any, name: str) -> None:
+        echt = getattr(modul, name)
+
+        def _wehr(*args: Any, **kwargs: Any) -> Any:
+            for wert in (*args[:2], kwargs.get("path"), kwargs.get("file")):
+                if _zeigt_nach_f(wert):
+                    raise RiegelVerletzt(
+                        f"Test greift ueber {modul.__name__}.{name} auf {wert!r} zu. "
+                        f"Tests schreiben und lesen nur unter tmp_path; "
+                        f"biege die Wurzel um (siehe Fixture bauziel_umgebogen)."
+                    )
+            return echt(*args, **kwargs)
+
+        monkeypatch.setattr(modul, name, _wehr)
+
+    for tuer in _OS_TUEREN:
+        _umwickle(os, tuer)
+    _umwickle(builtins, "open")

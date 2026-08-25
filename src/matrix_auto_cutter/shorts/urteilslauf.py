@@ -5,8 +5,8 @@ juengste Aufnahme heraussuchen, pruefen dass alte Urteile nicht auf neue
 Kandidaten zeigen, den Urteilsserver starten, und danach Quote melden,
 Bauliste erzeugen und die Urteile sichern. Dieses Modul reiht sie
 aneinander - es rechnet nichts selbst aus, sondern ruft ``judge_server``
-und ``auswahl`` in der richtigen Reihenfolge auf und schreibt zum
-Schluss die naechste Handlung hin.
+und ``auswahl`` in der richtigen Reihenfolge auf und laesst zum Schluss
+``build`` die Shorts bauen.
 
 Die Pruefung (``auswahl.pruefe_uebereinstimmung``) laeuft VOR dem
 Serverstart, nicht danach: ``judge_server`` uebernimmt beim Start den
@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -48,19 +49,23 @@ from matrix_auto_cutter.shorts.judge_server import load_urteile
 SICHERUNG_DIR = Path("labels/repeat")
 AUFNAHMEN_UNTERPFAD = Path("artefakte/repeat/shorts")
 JOB_FILE_NAME = "shorts-job.json"
-RENDER_WURZEL = r"F:\MatrixMarketAutoEdit\Shorts-Rendered"
+RENDER_WURZEL = r"F:\MatrixMarketAutoEdit\Shorts Rendered"
 
 _CODE_ERFOLG = 0
 _CODE_KEINE_AUFNAHME = 2
 _CODE_AUFTRAG_UNLESBAR = 2
 _CODE_URTEILE_ABWEICHUNG = 5
 _CODE_SICHERUNG_FEHLGESCHLAGEN = 6
+_CODE_ZIEL_BELEGT = 7
+_CODE_BAU_UNVOLLSTAENDIG = 8
 
 _BEENDE_FRIST_SEKUNDEN = 5.0
 _TAKT_SEKUNDEN = 0.25
 _ABBRUCH_MELDUNG = "Strg+C empfangen - Urteilsseite wird beendet."
 _PLATZHALTER_SEKUNDEN = 4.0
 _ABBRUCH_SIGNALE = ("SIGINT", "SIGBREAK")
+_KANDIDATENORDNER = re.compile(r"kandidat-\d+")
+_SHORT_NAME = "short.mp4"
 
 
 def finde_aufnahme(wurzel: Path) -> Path | None:
@@ -352,6 +357,78 @@ def baubefehl(job_path: Path, bauliste_pfad: Path, video_name: str) -> str:
     )
 
 
+def bauziel(video_name: str) -> Path:
+    """Der Zielordner des Baus: ein eigener Unterordner je Aufnahme.
+
+    Ein gemeinsamer Ordner fuer alle Aufnahmen ginge nicht: ``build``
+    benennt seine Ausgaben nach dem Kandidatenindex (``kandidat-00``), und
+    der beginnt bei jeder Aufnahme wieder bei null.
+    """
+    return Path(RENDER_WURZEL) / video_name
+
+
+def vorhandene_kandidatenordner(ziel_dir: Path) -> list[str]:
+    """Die Namen der bereits vorhandenen ``kandidat-NN``-Ordner im Ziel."""
+    if not ziel_dir.is_dir():
+        return []
+    return sorted(
+        eintrag.name
+        for eintrag in ziel_dir.iterdir()
+        if eintrag.is_dir() and _KANDIDATENORDNER.fullmatch(eintrag.name)
+    )
+
+
+def zaehle_baulisteneintraege(bauliste_pfad: Path) -> int:
+    """Wie viele Kandidaten die Bauliste nennt - die Sollzahl des Baus."""
+    try:
+        roh = json.loads(bauliste_pfad.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return 0
+    if not isinstance(roh, dict):
+        return 0
+    eintraege = roh.get("kandidaten")
+    return len(eintraege) if isinstance(eintraege, list) else 0
+
+
+def zaehle_shorts(ziel_dir: Path) -> int:
+    """Wie viele ``short.mp4`` unter den Kandidatenordnern liegen.
+
+    Das ist der Erfolgsnachweis des Baus, nicht der Rueckgabecode von
+    ``build``: der ist 0 auch dann, wenn kein einziger Kandidat gebaut
+    wurde (Uebergabe vom 25.8.).
+    """
+    return sum(
+        1
+        for name in vorhandene_kandidatenordner(ziel_dir)
+        if (ziel_dir / name / _SHORT_NAME).is_file()
+    )
+
+
+def _bau_argv(job_path: Path, bauliste_pfad: Path, ziel_dir: Path) -> list[str]:
+    """Die Befehlszeile des Baus - dieselbe, die :func:`baubefehl` hinschreibt."""
+    return [
+        sys.executable,
+        "-m",
+        "matrix_auto_cutter.shorts.build",
+        str(job_path),
+        str(bauliste_pfad),
+        "--output-dir",
+        str(ziel_dir),
+    ]
+
+
+def fuehre_bau_aus(job_path: Path, bauliste_pfad: Path, ziel_dir: Path) -> int:
+    """Fuehre ``build`` aus; sein Rueckgabecode ist blosse Auskunft, kein Nachweis."""
+    process = subprocess.Popen(
+        _bau_argv(job_path, bauliste_pfad, ziel_dir),
+        stdin=subprocess.DEVNULL,
+        close_fds=True,
+        shell=False,
+    )
+    code = warte_auf_kind(process)
+    return code if code is not None else 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI: einmal aufrufen, urteilen, Fenster schliessen - der Rest laeuft von selbst."""
     import argparse
@@ -363,6 +440,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--kein-server", action="store_true")
     parser.add_argument("--keine-sicherung", action="store_true")
     parser.add_argument("--keine-auswahl", action="store_true")
+    parser.add_argument(
+        "--kein-bau",
+        action="store_true",
+        help=(
+            "Schritt 7 gibt die Bauzeile nur aus, statt sie auszufuehren - fuer Aufnahmen, "
+            "deren Shorts bereits gebaut sind."
+        ),
+    )
     parser.add_argument("--wurzel", type=Path, default=None)
     parser.add_argument(
         "--platzhalter-server",
@@ -474,9 +559,46 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _CODE_SICHERUNG_FEHLGESCHLAGEN
         print(f"  {len(kopiert)} Datei(en) kopiert")
 
-    # ---- Schritt 7: naechste Handlung ------------------------------------
-    print("Schritt 7: naechste Handlung - diese Zeile ausfuehren, wenn die Bauliste stimmt:")
-    print(baubefehl(job_path, bauliste_pfad, _namensteil(kandidaten_wurzel, "video_name")))
+    # ---- Schritt 7: bauen ------------------------------------------------
+    video_name = _namensteil(kandidaten_wurzel, "video_name")
+    ziel_dir = bauziel(video_name)
+    if args.kein_bau:
+        print("Schritt 7: Bau uebersprungen (--kein-bau) - diese Zeile baut die Shorts:")
+        print(baubefehl(job_path, bauliste_pfad, video_name))
+        return _CODE_ERFOLG
+
+    print(f"Schritt 7: Shorts bauen nach {ziel_dir}")
+    if not bauliste_pfad.is_file():
+        print(f"ANGEHALTEN [bau_unvollstaendig]: {bauliste_pfad} fehlt - nichts zu bauen")
+        return _CODE_BAU_UNVOLLSTAENDIG
+    belegt = vorhandene_kandidatenordner(ziel_dir)
+    if belegt:
+        print(
+            f"ANGEHALTEN [ziel_belegt]: {ziel_dir} enthaelt bereits "
+            f"{len(belegt)} Kandidatenordner ({belegt[0]} ...)"
+        )
+        print("  build ueberspringt vorhandene Ausgaben nicht und baute Fertiges neu.")
+        print("  Nichts angefasst. Zielordner leeren oder umbenennen, dann erneut starten.")
+        return _CODE_ZIEL_BELEGT
+    erwartet = zaehle_baulisteneintraege(bauliste_pfad)
+    print(f"  {erwartet} Eintrag/Eintraege in der Bauliste")
+    try:
+        ziel_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(f"ANGEHALTEN [bau_unvollstaendig]: {ziel_dir} nicht anlegbar: {exc}")
+        return _CODE_BAU_UNVOLLSTAENDIG
+    begonnen = time.monotonic()
+    bau_code = fuehre_bau_aus(job_path, bauliste_pfad, ziel_dir)
+    dauer = time.monotonic() - begonnen
+    gebaut = zaehle_shorts(ziel_dir)
+    print(f"  build endete mit Rueckgabecode {bau_code}")
+    print(f"Fertig: {ziel_dir} - {gebaut} von {erwartet} Shorts in {dauer:.1f} s")
+    if gebaut != erwartet:
+        print(
+            f"ANGEHALTEN [bau_unvollstaendig]: {gebaut} {_SHORT_NAME} statt {erwartet} - "
+            "der Rueckgabecode von build zaehlt dafuer nicht"
+        )
+        return _CODE_BAU_UNVOLLSTAENDIG
     return _CODE_ERFOLG
 
 

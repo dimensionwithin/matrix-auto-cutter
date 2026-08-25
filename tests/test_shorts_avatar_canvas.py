@@ -1049,6 +1049,11 @@ def test_run_stage5b_shifts_the_candidate_span_by_missing_frames_front(
     monkeypatch.setattr(
         avatar_canvas, "read_avatar_coverage_missing_frames_back", lambda *a, **k: 0
     )
+    # Die Ausgabepruefung nach dem (gefaelschten) ffmpeg-Aufruf sondierte
+    # bisher mit echtem ``ffprobe`` an der nie entstandenen out.mp4 - ein
+    # Unterprozess, den dieser Test nicht braucht und nicht prueft.
+    monkeypatch.setattr(avatar_canvas, "discover_ffprobe", lambda *a, **k: None)
+    monkeypatch.setattr(avatar_canvas, "probe_audio_track_count", lambda *a, **k: 1)
     args = dict(
         _STAGE5B_DEFAULTS,
         expected_avatar_frame_count=52919,

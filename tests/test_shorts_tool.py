@@ -607,7 +607,15 @@ def test_find_proposal_sorts_by_actual_instant_across_utc_offsets(
 # --- Dauer über ffprobe -------------------------------------------------------------
 
 
-def test_probe_duration_ms_no_ffprobe_available(tmp_path: Path) -> None:
+def test_probe_duration_ms_no_ffprobe_available(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ohne ``ffprobe_path`` sucht die Funktion selbst - und fand auf dieser
+    Maschine das echte ``ffprobe`` samt Unterprozess. Der Test hiess "nicht
+    verfuegbar" und pruefte in Wahrheit den Rueckfall auf eine unlesbare
+    Ausgabe. Erst die abgeschaltete Suche stellt den gemeinten Fall her."""
+    monkeypatch.setattr(inv, "discover_ffprobe", lambda *a, **k: None)
+
     assert probe_duration_ms(tmp_path / "video.mp4", ffprobe_path=None) is None
 
 

@@ -359,6 +359,7 @@ def _fake_chart_crop_checks(plan: chart_crop.ChartCropPlan) -> chart_crop.Verify
 
 
 def test_run_shorts_build_end_to_end_with_faked_stages(tmp_path: Path, monkeypatch) -> None:
+    _pegelmessung_ohne_ffmpeg(monkeypatch)
     job_dir = tmp_path / "job"
     job_dir.mkdir()
     job_path = job_dir / "shorts-job.json"
@@ -525,6 +526,37 @@ def test_run_shorts_build_end_to_end_with_faked_stages(tmp_path: Path, monkeypat
 # ---------------------------------------------------------------------------
 
 
+
+def _pegelmessung_ohne_ffmpeg(monkeypatch) -> None:
+    """Lege die Pegel- und Wortrandsuche still - sie ruft sonst echtes ``ffmpeg``.
+
+    Diese acht Funktionen aus ``level_cut`` messen am Tonspur-Inhalt und
+    starten dafuer je einen ``ffmpeg``-Prozess. Kein Test dieser Datei
+    prueft ihre Messung; sie prueft, was ``run_shorts_build`` mit dem
+    Ergebnis macht. Ohne diese Stummschaltung lief hier bei jedem Lauf
+    echtes ``ffmpeg`` - der Riegel in ``tests/conftest.py`` hat es
+    sichtbar gemacht.
+
+    Die Rueckgaben sind bewusst die Eingangsmarken: die Korrektur wird
+    damit zur Nullkorrektur, und die Erwartungen der Tests bleiben die,
+    die sie vor dem Riegel waren.
+    """
+    monkeypatch.setattr(build, "finde_wortrand_ende", lambda media, ms, **k: ms)
+    monkeypatch.setattr(build, "finde_wortrand_anfang", lambda media, ms, **k: ms)
+    monkeypatch.setattr(build, "finde_wortende_ton", lambda *a, **k: a[1])
+    monkeypatch.setattr(build, "finde_worteinsatz_ton", lambda *a, **k: a[1])
+    monkeypatch.setattr(build, "finde_nachbarrand_ausklang", lambda *a, **k: None)
+    monkeypatch.setattr(build, "finde_nachbarrand_einsatz", lambda *a, **k: None)
+    monkeypatch.setattr(build, "miss_pegel_bei_marke", lambda *a, **k: (-30.0, -30.0))
+    monkeypatch.setattr(
+        build,
+        "finde_stillevorlauf",
+        lambda media_path, mark_ms, candidate_end_ms, **k: StilleVorlauf(
+            mark_ms, mark_ms, 0, False, -30.0, 0
+        ),
+    )
+
+
 def _prepare_single_candidate_build(
     tmp_path: Path, monkeypatch, *, word_tokens: list[dict[str, object]] | None = None
 ) -> dict[str, object]:
@@ -601,6 +633,7 @@ def _prepare_single_candidate_build(
             mark_ms, mark_ms, 0, False, -30.0, 0
         ),
     )
+    _pegelmessung_ohne_ffmpeg(monkeypatch)
     return {
         "job_path": job_path,
         "kandidaten_path": kandidaten_path,
@@ -623,6 +656,7 @@ def test_run_shorts_build_measures_constant_values_once_across_candidates(
     """Zwei Kandidaten, aber ``chart_crop.probe_dimensions``/``probe_frame_count``
     laufen je genau ZWEIMAL insgesamt (einmal fuer rendered_video, einmal fuer
     avatar-cut) - nicht ZWEIMAL JE KANDIDAT wie vor diesem Auftrag."""
+    _pegelmessung_ohne_ffmpeg(monkeypatch)
     job_dir = tmp_path / "job"
     job_dir.mkdir()
     job_path = job_dir / "shorts-job.json"
@@ -1718,6 +1752,7 @@ def _prepare_multi_candidate_build(
             mark_ms, mark_ms, 0, False, -30.0, 0
         ),
     )
+    _pegelmessung_ohne_ffmpeg(monkeypatch)
     return {
         "job_path": job_path,
         "kandidaten_path": kandidaten_path,
@@ -1853,6 +1888,8 @@ def test_bericht_nennt_die_parallelstufe(tmp_path: Path, monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
+# Die Prozesswache selbst ist der Gegenstand - ohne echtes Kind gibt es nichts zu pruefen.
+@pytest.mark.echter_unterprozess
 def test_prozesswache_liefert_denselben_ausgang_wie_der_standardweg() -> None:
     wache = build._ProzessWache()
     runner = wache.runner(canvas.ProcessResult)
@@ -1864,6 +1901,8 @@ def test_prozesswache_liefert_denselben_ausgang_wie_der_standardweg() -> None:
     assert b"hallo" in ergebnis.stderr
 
 
+# Die Prozesswache selbst ist der Gegenstand - ohne echtes Kind gibt es nichts zu pruefen.
+@pytest.mark.echter_unterprozess
 def test_prozesswache_meldet_fehlstart_statt_zu_werfen() -> None:
     wache = build._ProzessWache()
     runner = wache.runner(chart_crop.ProcessResult)
@@ -1874,6 +1913,8 @@ def test_prozesswache_meldet_fehlstart_statt_zu_werfen() -> None:
     assert ergebnis.stderr
 
 
+# Die Prozesswache selbst ist der Gegenstand - ohne echtes Kind gibt es nichts zu pruefen.
+@pytest.mark.echter_unterprozess
 def test_prozesswache_beendet_laufende_prozesse_und_startet_keine_neuen() -> None:
     """brich_ab toetet den laufenden Prozess - und jeder spaetere startet gar nicht."""
     wache = build._ProzessWache()

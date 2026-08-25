@@ -122,7 +122,7 @@ def test_finde_aufnahme_nimmt_juengste_kandidatendatei(tmp_path: Path) -> None:
 def test_kein_ordner_mit_kandidaten_gibt_code_2(tmp_path: Path) -> None:
     (tmp_path / urteilslauf.AUFNAHMEN_UNTERPFAD / "leer").mkdir(parents=True)
 
-    code = urteilslauf.main(["--wurzel", str(tmp_path), "--kein-server"])
+    code = urteilslauf.main(["--wurzel", str(tmp_path), "--kein-server", "--kein-bau"])
 
     assert code == 2
 
@@ -139,7 +139,9 @@ def test_abweichendes_end_ms_haelt_an_ohne_bauliste_und_sicherung(
         },
     )
 
-    code = urteilslauf.main([str(job_path), "--kein-server", "--wurzel", str(tmp_path)])
+    code = urteilslauf.main(
+        [str(job_path), "--kein-server", "--kein-bau", "--wurzel", str(tmp_path)]
+    )
 
     assert code == 5
     assert not (job_dir / auswahl.BAULISTE_FILE_NAME).exists()
@@ -152,7 +154,9 @@ def test_erfolgsfall_erzeugt_bauliste_und_beide_sicherungen(
     job_dir = tmp_path / "auftrag"
     job_path = _baue_aufnahme(job_dir)
 
-    code = urteilslauf.main([str(job_path), "--kein-server", "--wurzel", str(tmp_path)])
+    code = urteilslauf.main(
+        [str(job_path), "--kein-server", "--kein-bau", "--wurzel", str(tmp_path)]
+    )
 
     assert code == 0
     assert (job_dir / auswahl.BAULISTE_FILE_NAME).is_file()
@@ -171,7 +175,9 @@ def test_vorhandene_sicherung_bleibt_unberuehrt(
     bestand = ziel_dir / "urteile-2026-08-21 10-46-08-lauf1-sonnet.json"
     bestand.write_text("aelterer Bestand", encoding="utf-8")
 
-    code = urteilslauf.main([str(job_path), "--kein-server", "--wurzel", str(tmp_path)])
+    code = urteilslauf.main(
+        [str(job_path), "--kein-server", "--kein-bau", "--wurzel", str(tmp_path)]
+    )
 
     assert code == 0
     assert bestand.read_text(encoding="utf-8") == "aelterer Bestand"
@@ -185,7 +191,9 @@ def test_fehlende_wurzelfelder_geben_unbekannt_im_namen(
     job_dir = tmp_path / "auftrag"
     job_path = _baue_aufnahme(job_dir, wurzelfelder=None)
 
-    code = urteilslauf.main([str(job_path), "--kein-server", "--wurzel", str(tmp_path)])
+    code = urteilslauf.main(
+        [str(job_path), "--kein-server", "--kein-bau", "--wurzel", str(tmp_path)]
+    )
 
     assert code == 0
     ziel_dir = tmp_path / urteilslauf.SICHERUNG_DIR
@@ -200,7 +208,14 @@ def test_keine_sicherung_laesst_labels_unberuehrt(
     job_path = _baue_aufnahme(job_dir)
 
     code = urteilslauf.main(
-        [str(job_path), "--kein-server", "--keine-sicherung", "--wurzel", str(tmp_path)]
+        [
+            str(job_path),
+            "--kein-server",
+            "--kein-bau",
+            "--keine-sicherung",
+            "--wurzel",
+            str(tmp_path),
+        ]
     )
 
     assert code == 0
@@ -215,7 +230,7 @@ def test_keine_auswahl_laesst_die_bauliste_aus(
     job_path = _baue_aufnahme(job_dir)
 
     code = urteilslauf.main(
-        [str(job_path), "--kein-server", "--keine-auswahl", "--wurzel", str(tmp_path)]
+        [str(job_path), "--kein-server", "--kein-bau", "--keine-auswahl", "--wurzel", str(tmp_path)]
     )
 
     assert code == 0
@@ -230,15 +245,20 @@ def test_quotenzeile_und_baubefehl_stehen_am_ende(
     job_path = _baue_aufnahme(job_dir)
 
     code = urteilslauf.main(
-        [str(job_path), "--kein-server", "--keine-sicherung", "--wurzel", str(tmp_path)]
+        [
+            str(job_path),
+            "--kein-server",
+            "--kein-bau",
+            "--keine-sicherung",
+            "--wurzel",
+            str(tmp_path),
+        ]
     )
     ausgabe = capsys.readouterr().out
 
     assert code == 0
     assert "  2 von 2 beurteilt - 1 ja, 1 nein, 0 offen" in ausgabe.splitlines()
-    assert (
-        r'--output-dir "F:\MatrixMarketAutoEdit\Shorts-Rendered\2026-08-21 10-46-08"' in ausgabe
-    )
+    assert r'--output-dir "F:\MatrixMarketAutoEdit\Shorts Rendered\2026-08-21 10-46-08"' in ausgabe
 
 
 def _kurzer_platzhalter(sekunden: float) -> subprocess.Popen[bytes]:
@@ -280,6 +300,7 @@ def _lauf_mit_abgefangenem_strg_c(
     return urteilslauf.main(
         [
             str(job_path),
+            "--kein-bau",
             "--platzhalter-server",
             "--keine-sicherung",
             "--wurzel",
@@ -288,6 +309,8 @@ def _lauf_mit_abgefangenem_strg_c(
     )
 
 
+# Platzhalterprozess: das Warten auf ein echtes Kind ist der Gegenstand.
+@pytest.mark.echter_unterprozess
 def test_warteschleife_kehrt_zurueck_wenn_das_kind_von_selbst_endet() -> None:
     process = _kurzer_platzhalter(0.3)
     try:
@@ -300,6 +323,8 @@ def test_warteschleife_kehrt_zurueck_wenn_das_kind_von_selbst_endet() -> None:
     assert code == 0
 
 
+# Platzhalterprozess: das Warten auf ein echtes Kind ist der Gegenstand.
+@pytest.mark.echter_unterprozess
 def test_strg_c_im_warten_bricht_main_nicht_ab(
     tmp_path: Path,
     trefferquote_umgebogen: Path,
@@ -320,6 +345,8 @@ def test_strg_c_im_warten_bricht_main_nicht_ab(
     assert any(zeile.startswith("Schritt 7:") for zeile in zeilen)
 
 
+# Platzhalterprozess: das Warten auf ein echtes Kind ist der Gegenstand.
+@pytest.mark.echter_unterprozess
 def test_der_platzhalter_lebt_nach_dem_abfangen_nicht_mehr(
     tmp_path: Path,
     trefferquote_umgebogen: Path,
@@ -349,7 +376,8 @@ def test_platzhalter_nimmt_eine_eigene_schlafdauer_an() -> None:
     assert echter[-1] == "egal.json"
 
 
-
+# Platzhalterprozess: das Warten auf ein echtes Kind ist der Gegenstand.
+@pytest.mark.echter_unterprozess
 def test_platzhalter_mit_zahl_laeuft_ueber_die_befehlszeile(
     tmp_path: Path,
     trefferquote_umgebogen: Path,
@@ -363,6 +391,7 @@ def test_platzhalter_mit_zahl_laeuft_ueber_die_befehlszeile(
     code = urteilslauf.main(
         [
             str(job_path),
+            "--kein-bau",
             "--platzhalter-server",
             "0.2",
             "--keine-sicherung",
@@ -376,3 +405,134 @@ def test_platzhalter_mit_zahl_laeuft_ueber_die_befehlszeile(
     assert len(aufgezeichnete_kinder) == 1
     assert aufgezeichnete_kinder[0].poll() == 0
     assert "  Urteilsseite beendet (Rueckgabecode 0) - weiter geht es." in zeilen
+
+
+# --------------------------------------------------------------------------
+# Schritt 7: bauen (TEIL 2 des Auftrags kettenlaeufer)
+# --------------------------------------------------------------------------
+
+
+def _beide_ja() -> dict[int, Urteil]:
+    """Beide Kandidaten angenommen - so hat die Bauliste zwei Eintraege statt einem."""
+    return {0: _urteil(0, "ja", titel="Erster"), 1: _urteil(1, "ja", titel="Zweiter")}
+
+
+@pytest.fixture
+def bauziel_umgebogen(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Biege ``RENDER_WURZEL`` auf ``tmp_path`` um - nie auf das echte ``F:``."""
+    wurzel = tmp_path / "Shorts Rendered"
+    monkeypatch.setattr(urteilslauf, "RENDER_WURZEL", str(wurzel))
+    return wurzel / "2026-08-21 10-46-08"
+
+
+def test_kein_bau_gibt_die_bauzeile_nur_aus(
+    tmp_path: Path,
+    trefferquote_umgebogen: Path,
+    bauziel_umgebogen: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--kein-bau ist der Weg fuer Aufnahmen, deren Shorts schon gebaut sind."""
+
+    def _kein_prozess(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("mit --kein-bau darf kein Prozess starten")
+
+    monkeypatch.setattr(urteilslauf.subprocess, "Popen", _kein_prozess)
+    job_dir = tmp_path / "auftrag"
+    job_path = _baue_aufnahme(job_dir)
+
+    code = urteilslauf.main(
+        [str(job_path), "--kein-server", "--kein-bau", "--wurzel", str(tmp_path)]
+    )
+    zeilen = capsys.readouterr().out.splitlines()
+
+    assert code == 0
+    assert "Schritt 7: Bau uebersprungen (--kein-bau) - diese Zeile baut die Shorts:" in zeilen
+    assert zeilen[-1].startswith("python -m matrix_auto_cutter.shorts.build ")
+    assert not bauziel_umgebogen.exists()
+
+
+def test_vorhandener_kandidatenordner_haelt_mit_code_7_an(
+    tmp_path: Path,
+    trefferquote_umgebogen: Path,
+    bauziel_umgebogen: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``build`` ueberspringt nichts - liegt schon etwas im Ziel, wird nicht gebaut."""
+
+    def _kein_prozess(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("bei belegtem Ziel darf kein Bau starten")
+
+    monkeypatch.setattr(urteilslauf.subprocess, "Popen", _kein_prozess)
+    job_dir = tmp_path / "auftrag"
+    job_path = _baue_aufnahme(job_dir)
+    fertig = bauziel_umgebogen / "kandidat-00"
+    fertig.mkdir(parents=True)
+    (fertig / "short.mp4").write_text("fertiger Short", encoding="utf-8")
+
+    code = urteilslauf.main([str(job_path), "--kein-server", "--wurzel", str(tmp_path)])
+    ausgabe = capsys.readouterr().out
+
+    assert code == 7
+    assert "ANGEHALTEN [ziel_belegt]" in ausgabe
+    assert (fertig / "short.mp4").read_text(encoding="utf-8") == "fertiger Short"
+
+
+def test_weniger_shorts_als_baulisteneintraege_ist_code_8(
+    tmp_path: Path,
+    trefferquote_umgebogen: Path,
+    bauziel_umgebogen: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Erfolgsnachweis ist die Zahl der ``short.mp4``, nicht der Code von ``build``.
+
+    Der falsche ``build`` hier endet mit 0 und baut nur einen von zwei
+    Shorts - genau der Fall, den ein Blick auf den Rueckgabecode uebersieht.
+    """
+    job_dir = tmp_path / "auftrag"
+    job_path = _baue_aufnahme(job_dir, urteile=_beide_ja())
+
+    def _halber_bau(job_path_: Path, bauliste_pfad: Path, ziel_dir: Path) -> int:
+        ordner = ziel_dir / "kandidat-00"
+        ordner.mkdir(parents=True, exist_ok=True)
+        (ordner / "short.mp4").write_text("ein Short", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(urteilslauf, "fuehre_bau_aus", _halber_bau)
+
+    code = urteilslauf.main([str(job_path), "--kein-server", "--wurzel", str(tmp_path)])
+    zeilen = capsys.readouterr().out.splitlines()
+
+    assert code == 8
+    assert any(zeile.startswith("Fertig: ") and " 1 von 2 Shorts in " in zeile for zeile in zeilen)
+    assert "ANGEHALTEN [bau_unvollstaendig]: 1 short.mp4 statt 2 - " in zeilen[-1]
+
+
+def test_vollstaendiger_bau_endet_mit_code_0(
+    tmp_path: Path,
+    trefferquote_umgebogen: Path,
+    bauziel_umgebogen: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Zwei Baulisteneintraege, zwei ``short.mp4`` - die Schlusszeile nennt beides."""
+    job_dir = tmp_path / "auftrag"
+    job_path = _baue_aufnahme(job_dir, urteile=_beide_ja())
+
+    def _ganzer_bau(job_path_: Path, bauliste_pfad: Path, ziel_dir: Path) -> int:
+        for nummer in range(urteilslauf.zaehle_baulisteneintraege(bauliste_pfad)):
+            ordner = ziel_dir / f"kandidat-{nummer:02d}"
+            ordner.mkdir(parents=True, exist_ok=True)
+            (ordner / "short.mp4").write_text("Short", encoding="utf-8")
+        return 3  # Auskunft, kein Fehlschlag - gezaehlt wird die Zahl der Shorts.
+
+    monkeypatch.setattr(urteilslauf, "fuehre_bau_aus", _ganzer_bau)
+
+    code = urteilslauf.main([str(job_path), "--kein-server", "--wurzel", str(tmp_path)])
+    zeilen = capsys.readouterr().out.splitlines()
+
+    assert code == 0
+    assert zeilen[-1].startswith(f"Fertig: {bauziel_umgebogen} - 2 von 2 Shorts in ")
+    assert zeilen[-1].endswith(" s")
