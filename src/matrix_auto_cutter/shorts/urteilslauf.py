@@ -50,6 +50,7 @@ SICHERUNG_DIR = Path("labels/repeat")
 AUFNAHMEN_UNTERPFAD = Path("artefakte/repeat/shorts")
 JOB_FILE_NAME = "shorts-job.json"
 RENDER_WURZEL = r"F:\MatrixMarketAutoEdit\Shorts Rendered"
+NACHSCHLAG_MODELL = "opus"
 
 _CODE_ERFOLG = 0
 _CODE_KEINE_AUFNAHME = 2
@@ -343,6 +344,35 @@ def zaehle_urteile(job_dir: Path) -> tuple[int, int, int, int]:
     return gesamt, ja, nein, gesamt - ja - nein
 
 
+def quote_prozent(ja: int, gesamt: int) -> int:
+    """Die Trefferquote in ganzen Prozent - ``0`` bei leerem Kandidatensatz.
+
+    Ganze Prozent, weil die Zahl eine Entscheidung traegt und keine
+    Messung ist: sie beantwortet "lohnt ein zweiter Lauf?". Eine
+    Nachkommastelle taeuschte eine Genauigkeit vor, die 31 Kandidaten
+    nicht hergeben.
+    """
+    if gesamt <= 0:
+        return 0
+    return round(ja * 100 / gesamt)
+
+
+def nachschlagbefehl(video_name: str, modell: str = NACHSCHLAG_MODELL) -> str:
+    """Die vollstaendige ``kette``-Zeile fuer einen zweiten Zerlegungslauf.
+
+    Wie :func:`baubefehl` nur zum Hinschreiben, nie zum Ausfuehren. Der
+    Aufnahmename kommt aus dem Wurzelfeld ``video_name`` der
+    Kandidatendatei, nicht aus dem Ordnernamen: die beiden duerfen
+    auseinanderfallen (ein Auftragsordner darf heissen, wie er will), und
+    ``kette --aufnahme`` sucht nach dem Aufnahmenamen, nicht nach dem
+    Ordner.
+    """
+    return (
+        f'python -m matrix_auto_cutter.shorts.kette --aufnahme "{video_name}" '
+        f"--neu-ab zerlegung --modell {modell}"
+    )
+
+
 def baubefehl(job_path: Path, bauliste_pfad: Path, video_name: str) -> str:
     """Die vollstaendige ``build.py``-Kommandozeile - nur zum Hinschreiben.
 
@@ -529,9 +559,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"  Urteilsseite beendet (Rueckgabecode {server_code}) - weiter geht es.")
 
     # ---- Schritt 4: Quote -------------------------------------------------
+    # Der Wurzelsatz wird hier gelesen, nicht erst bei der Sicherung: die
+    # Nachschlagzeile braucht ``video_name`` schon jetzt.
+    kandidaten_wurzel = lies_kandidaten_wurzel(kandidaten_pfad)
+    video_name = _namensteil(kandidaten_wurzel, "video_name")
     print("Schritt 4: Urteile zaehlen")
     gesamt, ja, nein, offen = zaehle_urteile(job_dir)
-    print(f"  {ja + nein} von {gesamt} beurteilt - {ja} ja, {nein} nein, {offen} offen")
+    print(
+        f"  {ja + nein} von {gesamt} beurteilt - {ja} ja, {nein} nein, {offen} offen"
+        f" - Quote {quote_prozent(ja, gesamt)} %"
+    )
+    # Immer, nicht nur bei magerer Quote. Ob 87 % gut sind, weiss der
+    # Nutzer und nicht dieses Werkzeug - eine Schwelle hier waere geraten.
+    print("  Nachschlag mit einem anderen Modell, falls die Ausbeute zu mager war:")
+    print(f"  {nachschlagbefehl(video_name)}")
+    print(
+        "  Achtung: die Zusammenfuehrung ist NICHT gebaut - liegen mehrere "
+        "kandidaten-lauf*.json vor, haelt kette mit Code 6 an. Heute schreibt der "
+        "Nachschlag ohnehin wieder kandidaten-lauf1.json und ueberschreibt den ersten Lauf."
+    )
 
     # ---- Schritt 5: Bauliste ---------------------------------------------
     bauliste_pfad = job_dir / auswahl.BAULISTE_FILE_NAME
@@ -546,7 +592,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _CODE_URTEILE_ABWEICHUNG
 
     # ---- Schritt 6: Sicherung --------------------------------------------
-    kandidaten_wurzel = lies_kandidaten_wurzel(kandidaten_pfad)
     if args.keine_sicherung:
         print("Schritt 6: Sicherung uebersprungen (--keine-sicherung)")
     else:
@@ -560,7 +605,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"  {len(kopiert)} Datei(en) kopiert")
 
     # ---- Schritt 7: bauen ------------------------------------------------
-    video_name = _namensteil(kandidaten_wurzel, "video_name")
     ziel_dir = bauziel(video_name)
     if args.kein_bau:
         print("Schritt 7: Bau uebersprungen (--kein-bau) - diese Zeile baut die Shorts:")

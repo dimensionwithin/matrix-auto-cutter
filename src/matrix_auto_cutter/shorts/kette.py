@@ -322,21 +322,32 @@ def erwartete_transkriptionsdauer_s(job_path: Path) -> float | None:
 # --------------------------------------------------------------------------
 
 
-def zerlegung_auftragstext(video_name: str, lauf: int = ZERLEGUNG_LAUF) -> str:
+def zerlegung_auftragstext(
+    video_name: str, lauf: int = ZERLEGUNG_LAUF, modell: str = ZERLEGUNG_MODELL
+) -> str:
     """Der Verweis auf den Auftragstext - nicht der Auftragstext selbst.
 
     Wiederholte man ihn hier, gaebe es ihn zweimal, und beim naechsten
     Kriterienwechsel bliebe eine der beiden Fassungen stehen.
+
+    ``modell`` steht zweimal im Aufruf: hier als Wurzelfeld der
+    Kandidatendatei und in :func:`zerlegung_argv` als ``--model``. Das ist
+    kein Versehen. Die Fahne bestimmt, WOMIT gefahren wird; das Wurzelfeld
+    haelt fest, WOMIT gefahren WURDE - daraus liest die Trefferquote
+    spaeter, welches Modell welche Ausbeute gebracht hat. Ein
+    Kandidatensatz ohne dieses Feld waere fuer den Vergleich wertlos.
     """
     return (
         f"Lies {ZERLEGUNG_AUFTRAGSTEXT_PFAD} vollstaendig und fuehre den darin "
         f'beschriebenen Auftrag aus. <AUFNAHME> ist "{video_name}", <N> ist {lauf}. '
-        f'Trage als Wurzelfeld modell den Wert "{ZERLEGUNG_MODELL}" ein. '
+        f'Trage als Wurzelfeld modell den Wert "{modell}" ein. '
         f"Auftragsname: zerlegung-lauf{lauf}."
     )
 
 
-def zerlegung_argv(video_name: str, lauf: int = ZERLEGUNG_LAUF) -> list[str]:
+def zerlegung_argv(
+    video_name: str, lauf: int = ZERLEGUNG_LAUF, modell: str = ZERLEGUNG_MODELL
+) -> list[str]:
     """Die Befehlszeile des Modellschritts - an einer Stelle gefasst.
 
     An einer Stelle, damit die geplante Aufgabe spaeter dieselbe benutzt
@@ -349,9 +360,9 @@ def zerlegung_argv(video_name: str, lauf: int = ZERLEGUNG_LAUF) -> list[str]:
     return [
         CLAUDE_BEFEHL,
         "-p",
-        zerlegung_auftragstext(video_name, lauf),
+        zerlegung_auftragstext(video_name, lauf, modell),
         "--model",
-        ZERLEGUNG_MODELL,
+        modell,
         "--permission-mode",
         "acceptEdits",
     ]
@@ -364,6 +375,7 @@ def stufen_argv(
     jobs_root: Path,
     video_name: str,
     erzwingen: bool,
+    modell: str = ZERLEGUNG_MODELL,
 ) -> list[str] | None:
     """Die Befehlszeile einer Stufe; ``None`` heisst: kein Prozess, sondern Handarbeit.
 
@@ -394,7 +406,7 @@ def stufen_argv(
         argv = [py, "-m", f"matrix_auto_cutter.shorts.{stufe.name}", str(job_path)]
         return [*argv, "--force"] if erzwingen else argv
     if stufe.name == "zerlegung":
-        return zerlegung_argv(video_name)
+        return zerlegung_argv(video_name, modell=modell)
     return None
 
 
@@ -518,15 +530,24 @@ def wird_uebersprungen(stufe: Stufe, job_dir: Path, zustand: dict[str, object]) 
     return eintrag.get("status") not in (STATUS_LAEUFT, STATUS_GESCHEITERT)
 
 
-def _kopfzeile(nummer: int, stufe: Stufe, job_path: Path) -> str:
+def _kopfzeile(
+    nummer: int, stufe: Stufe, job_path: Path, modell: str = ZERLEGUNG_MODELL
+) -> str:
     """``Stufe 3 von 6: Transkription, erwartet rund 12 min 22 s``.
 
     Die Erwartung steht nur bei der Transkription: sie ist die einzige
     Stufe, deren Dauer sich vorher aus einer bekannten Zahl abschaetzen
     laesst, und die einzige, bei der die Frage "warten oder weggehen?"
     ueberhaupt aufkommt.
+
+    Bei der Zerlegung steht statt einer Dauer das Modell. Es ist die
+    einzige Stufe, deren Ergebnis von einer Fahne abhaengt, und wer einen
+    Nachschlag faehrt, will vor dem Warten sehen, dass die Fahne
+    angekommen ist - nicht erst danach in ``kette.json``.
     """
     zeile = f"Stufe {nummer} von {len(STUFEN)}: {stufe.beschreibung}"
+    if stufe.name == "zerlegung":
+        return f"{zeile}, Modell {modell}"
     if stufe.name != "transcript":
         return zeile
     erwartet = erwartete_transkriptionsdauer_s(job_path)
@@ -535,7 +556,13 @@ def _kopfzeile(nummer: int, stufe: Stufe, job_path: Path) -> str:
     return f"{zeile}, erwartet rund {dauer_text(erwartet)}"
 
 
-def _trockenlauf(job_dir: Path, job_path: Path, zustand: dict[str, object], bis: int) -> int:
+def _trockenlauf(
+    job_dir: Path,
+    job_path: Path,
+    zustand: dict[str, object],
+    bis: int,
+    modell: str = ZERLEGUNG_MODELL,
+) -> int:
     """Nenne je Stufe, was geschehen wuerde - und fuehre nichts aus.
 
     Auch die Zustandsdatei bleibt ungeschrieben: ein Probelauf, der eine
@@ -544,7 +571,7 @@ def _trockenlauf(job_dir: Path, job_path: Path, zustand: dict[str, object], bis:
     print("Trockenlauf (--trocken): es wird nichts ausgefuehrt und nichts geschrieben.")
     uebersprungen = 0
     for nummer, stufe in enumerate(STUFEN[: bis + 1], start=1):
-        print(_kopfzeile(nummer, stufe, job_path))
+        print(_kopfzeile(nummer, stufe, job_path, modell))
         ziel = job_dir / stufe.ausgabe
         if wird_uebersprungen(stufe, job_dir, zustand):
             uebersprungen += 1
@@ -563,6 +590,7 @@ def _fuehre_stufe_aus(
     jobs_root: Path,
     video_name: str,
     erzwingen: bool,
+    modell: str = ZERLEGUNG_MODELL,
 ) -> None:
     """Fuehre eine einzelne Stufe aus; jeder Fehlschlag ist ein :class:`KetteFehlschlag`.
 
@@ -581,6 +609,7 @@ def _fuehre_stufe_aus(
         jobs_root=jobs_root,
         video_name=video_name,
         erzwingen=erzwingen,
+        modell=modell,
     )
     assert argv is not None
     code = fuehre_prozess(argv, etikett=stufe.name)
@@ -615,6 +644,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--trocken", action="store_true", help="nur nennen, was geschaehe; nichts ausfuehren"
     )
+    parser.add_argument(
+        "--modell",
+        default=ZERLEGUNG_MODELL,
+        metavar="NAME",
+        help=f"Modell der Zerlegung, an claude --model durchgereicht (Vorgabe: {ZERLEGUNG_MODELL})",
+    )
     parser.add_argument("--wurzel", type=Path, default=None, help="abweichende Repo-Wurzel")
     return parser
 
@@ -641,11 +676,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         zustand["video_name"] = video_name
 
         if args.trocken:
-            return _trockenlauf(job_dir, job_path, zustand, bis)
+            return _trockenlauf(job_dir, job_path, zustand, bis, args.modell)
 
         zustand_pfad = job_dir / ZUSTAND_FILE_NAME
         for nummer, stufe in enumerate(STUFEN[: bis + 1], start=1):
-            print(_kopfzeile(nummer, stufe, job_path))
+            print(_kopfzeile(nummer, stufe, job_path, args.modell))
             eintrag = _eintrag(zustand, stufe.name)
             erzwingen = nummer - 1 >= ab
             if not erzwingen and wird_uebersprungen(stufe, job_dir, zustand):
@@ -666,6 +701,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ausgabe=None,
                 meldung=None,
             )
+            if stufe.name == "zerlegung":
+                # Nur hier und nur, wenn die Stufe wirklich anlaeuft: eine
+                # uebersprungene Zerlegung hat mit diesem Modell nichts
+                # gefahren, und der Eintrag des vorigen Laufs bleibt der
+                # wahre. Ihn mit der Fahne von heute zu ueberschreiben
+                # machte aus der Buchfuehrung eine Behauptung.
+                eintrag["modell"] = args.modell
             schreibe_zustand(zustand_pfad, zustand)
             try:
                 _fuehre_stufe_aus(
@@ -675,6 +717,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     jobs_root=jobs_root,
                     video_name=video_name,
                     erzwingen=erzwingen,
+                    modell=args.modell,
                 )
             except KetteFehlschlag as fehler:
                 eintrag.update(

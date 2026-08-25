@@ -257,7 +257,7 @@ def test_quotenzeile_und_baubefehl_stehen_am_ende(
     ausgabe = capsys.readouterr().out
 
     assert code == 0
-    assert "  2 von 2 beurteilt - 1 ja, 1 nein, 0 offen" in ausgabe.splitlines()
+    assert "  2 von 2 beurteilt - 1 ja, 1 nein, 0 offen - Quote 50 %" in ausgabe.splitlines()
     assert r'--output-dir "F:\MatrixMarketAutoEdit\Shorts Rendered\2026-08-21 10-46-08"' in ausgabe
 
 
@@ -341,7 +341,7 @@ def test_strg_c_im_warten_bricht_main_nicht_ab(
     assert code == 0
     assert "Strg+C empfangen - Urteilsseite wird beendet." in zeilen
     assert "Schritt 4: Urteile zaehlen" in zeilen
-    assert "  2 von 2 beurteilt - 1 ja, 1 nein, 0 offen" in zeilen
+    assert "  2 von 2 beurteilt - 1 ja, 1 nein, 0 offen - Quote 50 %" in zeilen
     assert any(zeile.startswith("Schritt 7:") for zeile in zeilen)
 
 
@@ -536,3 +536,111 @@ def test_vollstaendiger_bau_endet_mit_code_0(
     assert code == 0
     assert zeilen[-1].startswith(f"Fertig: {bauziel_umgebogen} - 2 von 2 Shorts in ")
     assert zeilen[-1].endswith(" s")
+
+
+# --------------------------------------------------------------------------
+# Quote in Prozent und Nachschlagbefehl
+# --------------------------------------------------------------------------
+
+
+def test_quote_in_prozent_rundet_auf_ganze_zahlen() -> None:
+    """27 von 31 sind 87,09 % - die Zeile traegt 87, nicht 87,1."""
+    assert urteilslauf.quote_prozent(27, 31) == 87
+    assert urteilslauf.quote_prozent(1, 2) == 50
+    assert urteilslauf.quote_prozent(31, 31) == 100
+    assert urteilslauf.quote_prozent(0, 31) == 0
+
+
+def test_quote_ohne_kandidaten_ist_null_statt_ein_absturz() -> None:
+    """Ein leerer Kandidatensatz ist kein Fehlerpfad dieses Werkzeugs."""
+    assert urteilslauf.quote_prozent(0, 0) == 0
+
+
+def test_nachschlagbefehl_nennt_aufnahme_stufe_und_modell() -> None:
+    befehl = urteilslauf.nachschlagbefehl("2026-08-21 10-46-08")
+
+    assert befehl == (
+        'python -m matrix_auto_cutter.shorts.kette --aufnahme "2026-08-21 10-46-08" '
+        "--neu-ab zerlegung --modell opus"
+    )
+
+
+def test_nachschlagzeile_steht_unter_der_quote(
+    tmp_path: Path, trefferquote_umgebogen: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Erklaerung, Befehl und Warnung - alle drei, in dieser Reihenfolge."""
+    job_dir = tmp_path / "auftrag"
+    job_path = _baue_aufnahme(job_dir)
+
+    code = urteilslauf.main(
+        [
+            str(job_path),
+            "--kein-server",
+            "--kein-bau",
+            "--keine-sicherung",
+            "--wurzel",
+            str(tmp_path),
+        ]
+    )
+    zeilen = capsys.readouterr().out.splitlines()
+
+    assert code == 0
+    quote = next(i for i, zeile in enumerate(zeilen) if " beurteilt - " in zeile)
+    assert zeilen[quote].endswith(" - Quote 50 %")
+    assert zeilen[quote + 1] == (
+        "  Nachschlag mit einem anderen Modell, falls die Ausbeute zu mager war:"
+    )
+    assert zeilen[quote + 2] == f"  {urteilslauf.nachschlagbefehl('2026-08-21 10-46-08')}"
+    assert "die Zusammenfuehrung ist NICHT gebaut" in zeilen[quote + 3]
+    assert "Code 6" in zeilen[quote + 3]
+
+
+def test_nachschlagzeile_nimmt_den_video_name_nicht_den_ordnernamen(
+    tmp_path: Path, trefferquote_umgebogen: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Ordner und Aufnahme duerfen auseinanderfallen - ``kette`` sucht die Aufnahme.
+
+    Ein Auftragsordner darf heissen, wie er will; ``kette --aufnahme``
+    sucht nach dem Aufnahmenamen. Naehme die Zeile den Ordnernamen, faende
+    der Nachschlag die Aufnahme nicht und begaenne mit Code 2.
+    """
+    job_dir = tmp_path / "ein-ganz-anderer-ordnername"
+    job_path = _baue_aufnahme(job_dir)
+
+    urteilslauf.main(
+        [
+            str(job_path),
+            "--kein-server",
+            "--kein-bau",
+            "--keine-sicherung",
+            "--wurzel",
+            str(tmp_path),
+        ]
+    )
+    ausgabe = capsys.readouterr().out
+
+    assert '--aufnahme "2026-08-21 10-46-08"' in ausgabe
+    assert "ein-ganz-anderer-ordnername" not in ausgabe.split("Schritt 5")[0].split("Schritt 4")[1]
+
+
+def test_nachschlagzeile_erscheint_auch_bei_voller_ausbeute(
+    tmp_path: Path, trefferquote_umgebogen: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Keine Schwelle: ob 100 % genuegen, entscheidet der Nutzer, nicht das Werkzeug."""
+    job_dir = tmp_path / "auftrag"
+    job_path = _baue_aufnahme(job_dir, urteile=_beide_ja())
+
+    urteilslauf.main(
+        [
+            str(job_path),
+            "--kein-server",
+            "--kein-bau",
+            "--keine-sicherung",
+            "--wurzel",
+            str(tmp_path),
+        ]
+    )
+    ausgabe = capsys.readouterr().out
+
+    assert " - Quote 100 %" in ausgabe
+    assert "Nachschlag mit einem anderen Modell" in ausgabe

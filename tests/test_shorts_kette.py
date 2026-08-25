@@ -427,3 +427,123 @@ def test_unbekannte_stufe_wird_benannt(
 
     assert code == 5
     assert "ANGEHALTEN [stufe_unbekannt]" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# --modell: die Fahne der Zerlegung
+# --------------------------------------------------------------------------
+
+
+def test_modell_erreicht_die_claude_kommandozeile_und_den_auftragstext() -> None:
+    """``--model`` und das Wurzelfeld ``modell`` tragen beide denselben Wert.
+
+    Beide, nicht eines: die Fahne bestimmt, womit gefahren wird, das
+    Wurzelfeld haelt fest, womit gefahren wurde. Fiele eines von beiden
+    weg, koennte die Trefferquote spaeter nicht mehr zuordnen.
+    """
+    argv = kette.zerlegung_argv(AUFNAHME, modell="opus")
+
+    assert argv[3:] == ["--model", "opus", "--permission-mode", "acceptEdits"]
+    assert 'Trage als Wurzelfeld modell den Wert "opus" ein.' in argv[2]
+
+
+def test_ohne_modell_bleibt_es_bei_sonnet() -> None:
+    """Die bisherige Konstante ist die Vorgabe - ein Lauf ohne Fahne faehrt wie bisher."""
+    argv = kette.zerlegung_argv(AUFNAHME)
+
+    assert kette.ZERLEGUNG_MODELL == "sonnet"
+    assert argv[3:] == ["--model", "sonnet", "--permission-mode", "acceptEdits"]
+    assert 'Trage als Wurzelfeld modell den Wert "sonnet" ein.' in argv[2]
+
+
+def test_modell_aus_der_befehlszeile_landet_im_claude_aufruf(
+    tmp_path: Path, kein_bestand: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Von ``main`` bis zum Prozessstart - der Weg dazwischen ist der Punkt."""
+    job_dir = _job_dir(tmp_path)
+    aufgezeichnet: list[list[str]] = []
+    _prozess_legt_ausgabe_an(job_dir, aufgezeichnet, monkeypatch)
+    _lege_ausgaben_an(job_dir, "auftrag", "avatar_cut", "transcript", "wortliste")
+
+    code = kette.main(
+        ["--aufnahme", AUFNAHME, "--wurzel", str(tmp_path), "--modell", "opus"]
+    )
+
+    assert code == 0
+    zerlegung = [argv for argv in aufgezeichnet if argv[0] == kette.CLAUDE_BEFEHL]
+    assert len(zerlegung) == 1
+    assert "--model" in zerlegung[0]
+    assert zerlegung[0][zerlegung[0].index("--model") + 1] == "opus"
+
+
+def test_modell_steht_bei_der_zerlegung_in_kette_json(
+    tmp_path: Path, kein_bestand: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spaeter soll nachvollziehbar sein, womit gefahren wurde - nicht nur, dass."""
+    job_dir = _job_dir(tmp_path)
+    aufgezeichnet: list[list[str]] = []
+    _prozess_legt_ausgabe_an(job_dir, aufgezeichnet, monkeypatch)
+    _lege_ausgaben_an(job_dir, "auftrag", "avatar_cut", "transcript", "wortliste")
+
+    kette.main(["--aufnahme", AUFNAHME, "--wurzel", str(tmp_path), "--modell", "opus"])
+    stufen = _lies_zustand(job_dir)["stufen"]
+
+    assert isinstance(stufen, dict)
+    assert stufen["zerlegung"]["modell"] == "opus"
+
+
+def test_ohne_modell_steht_sonnet_in_kette_json(
+    tmp_path: Path, kein_bestand: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_dir = _job_dir(tmp_path)
+    aufgezeichnet: list[list[str]] = []
+    _prozess_legt_ausgabe_an(job_dir, aufgezeichnet, monkeypatch)
+    _lege_ausgaben_an(job_dir, "auftrag", "avatar_cut", "transcript", "wortliste")
+
+    kette.main(["--aufnahme", AUFNAHME, "--wurzel", str(tmp_path)])
+    stufen = _lies_zustand(job_dir)["stufen"]
+
+    assert isinstance(stufen, dict)
+    assert stufen["zerlegung"]["modell"] == "sonnet"
+
+
+def test_uebersprungene_zerlegung_traegt_das_modell_von_heute_nicht_nach(
+    tmp_path: Path, kein_bestand: None, prozesse: list[list[str]]
+) -> None:
+    """Wer nichts gefahren hat, darf nichts behaupten.
+
+    Sonst schriebe ein Lauf mit ``--modell opus``, der die vorhandene
+    Zerlegung ueberspringt, ``opus`` in die Buchfuehrung - und die
+    Trefferquote schriebe die Ausbeute des Sonnet-Laufs dem falschen
+    Modell zu.
+    """
+    job_dir = _job_dir(tmp_path)
+    _lege_ausgaben_an(job_dir, *ALLE_STUFEN)
+
+    kette.main(["--aufnahme", AUFNAHME, "--wurzel", str(tmp_path), "--modell", "opus"])
+    stufen = _lies_zustand(job_dir)["stufen"]
+
+    assert isinstance(stufen, dict)
+    assert prozesse == []
+    assert "modell" not in stufen["zerlegung"]
+
+
+def test_trockenlauf_nennt_das_modell_bei_der_zerlegung(
+    tmp_path: Path,
+    kein_bestand: None,
+    prozesse: list[list[str]],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Vor dem Warten sehen, dass die Fahne angekommen ist - nicht erst danach."""
+    kette.main(
+        ["--aufnahme", AUFNAHME, "--wurzel", str(tmp_path), "--trocken", "--modell", "opus"]
+    )
+    ausgabe = capsys.readouterr().out
+
+    assert "Stufe 5 von 6: Zerlegung (Modell), Modell opus" in ausgabe
+
+
+def test_kopfzeile_der_zerlegung_nennt_ohne_fahne_die_vorgabe(tmp_path: Path) -> None:
+    zeile = kette._kopfzeile(5, kette.STUFEN[4], tmp_path / "gibt-es-nicht.json")
+
+    assert zeile == "Stufe 5 von 6: Zerlegung (Modell), Modell sonnet"
