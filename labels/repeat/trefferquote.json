@@ -1,0 +1,36 @@
+{
+  "eintraege": [
+    {
+      "abgelehnt": 4,
+      "angenommen": 27,
+      "im_zielbereich_ja": 20,
+      "im_zielbereich_nein": 7,
+      "kandidaten_gesamt": 31,
+      "kriterien_fassung": "Fassung 0.8 (24. August 2026)",
+      "lauf": 1,
+      "modell": "sonnet",
+      "ohne_urteil": 0,
+      "polarisierend": {
+        "falsch": 15,
+        "wahr": 12
+      },
+      "quote": 0.871,
+      "sicherheit": {
+        "hoch": {
+          "ja": 14,
+          "nein": 1
+        },
+        "mittel": {
+          "ja": 12,
+          "nein": 2
+        },
+        "niedrig": {
+          "ja": 1,
+          "nein": 1
+        }
+      },
+      "video_name": "2026-08-21 10-46-08"
+    }
+  ],
+  "schema_version": "1.0"
+}
