@@ -39,6 +39,9 @@ from matrix_auto_cutter.shorts.candidates import (
 from matrix_auto_cutter.shorts.judge_server import Urteil, load_urteile
 
 BAULISTE_FILE_NAME = "bauliste.json"
+BUENDEL_FILE_NAME = "buendel.json"
+BUENDEL_ARTIFACT_TYPE = "matrix_auto_cutter_shorts_buendel"
+BUENDEL_SCHEMA_VERSION = "1.0"
 LAUFDATEI_GLOB = "kandidaten-lauf*.json"
 _LAUFDATEI_MUSTER = re.compile(r"^kandidaten-lauf(\d+)\.json$")
 TREFFERQUOTE_PFAD = Path("labels/repeat/trefferquote.json")
@@ -363,6 +366,128 @@ def pruefe_uebereinstimmung(
                 f"Kandidat {index}: 'titel' weicht ab - Urteil {urteil.titel!r}, "
                 f"Kandidat {candidate.titel!r}"
             )
+    return meldungen
+
+
+def lies_buendel(pfad: Path) -> list[dict[str, object]]:
+    """Lies ``buendel.json`` roh und gib die Liste unter ``buendel`` zurueck.
+
+    Roh und nicht ueber ein Schema-Objekt: die Buendelung wird von einem
+    Modell geschrieben, und was daran nicht stimmt, soll
+    :func:`pruefe_buendel` als LISTE von Meldungen sagen und nicht als
+    erster Ausnahmefehler. Nur was gar keine Liste ist, gilt hier schon als
+    nichts - dann meldet die Pruefung jeden Kandidaten als fehlend, und das
+    ist die richtige Auskunft.
+    """
+    roh = json.loads(pfad.read_text(encoding="utf-8"))
+    liste = roh.get("buendel") if isinstance(roh, dict) else roh
+    if not isinstance(liste, list):
+        return []
+    return [eintrag for eintrag in liste if isinstance(eintrag, dict)]
+
+
+def _ganzzahl(wert: object) -> int | None:
+    """Der Wert als Ganzzahl - oder ``None``, wenn er keine ist (``True`` ist keine)."""
+    return wert if isinstance(wert, int) and not isinstance(wert, bool) else None
+
+
+def pruefe_buendel(
+    kandidaten: list[dict[str, object]], buendel: list[dict[str, object]]
+) -> list[str]:
+    """Melde jede Abweichung zwischen ``kandidaten.json`` und ``buendel.json``.
+
+    Dasselbe Muster wie :func:`pruefe_uebereinstimmung`: eine Liste
+    deutscher Meldungen, leer heisst in Ordnung. Geprueft wird gegen die
+    Kandidatendatei als Leitliste - sie wird von der Buendelung nicht
+    angefasst, an ihren Indizes haengen die Urteile des Nutzers, und eine
+    Buendelung, die einen Index erfindet oder auslaesst, waere fuer die
+    Auswahl unbrauchbar.
+
+    Fuenf Befunde, in dieser Reihenfolge: fehlende Indizes, ueberzaehlige
+    Indizes, Gruppen ohne genau eine Empfehlung, Raenge die doppelt
+    vorkommen oder fehlen, und Paare mit ``laengere_fassung_von``, die
+    auseinandergerissen wurden. Der letzte Befund ist der wichtigste - genau
+    solche Paare zeigen dasselbe Material, und sie zu trennen hiesse den
+    Nutzer zweimal ueber dieselbe Sache entscheiden zu lassen.
+
+    Beide Eingaben sind ROHE Wortlisten und keine :class:`Candidate`-Objekte:
+    ``laengere_fassung_von`` ist ein Buchfuehrungsfeld und wird von
+    ``parse_candidates`` weggeschnitten (siehe :data:`_BUCHFUEHRUNGSFELDER`),
+    stuende hier also gar nicht mehr zur Verfuegung.
+    """
+    meldungen: list[str] = []
+
+    kandidaten_index = _nach_index(kandidaten)
+
+    buendel_index: dict[int, dict[str, object]] = {}
+    for position, eintrag in enumerate(buendel):
+        index = _ganzzahl(eintrag.get("index"))
+        if index is None:
+            meldungen.append(f"Buendeleintrag {position}: 'index' fehlt oder ist keine Ganzzahl")
+            continue
+        if index in buendel_index:
+            meldungen.append(f"Buendeleintrag {index}: Index doppelt vergeben")
+            continue
+        buendel_index[index] = eintrag
+
+    for index in sorted(set(kandidaten_index) - set(buendel_index)):
+        meldungen.append(f"Kandidat {index}: fehlt in {BUENDEL_FILE_NAME}")
+    for index in sorted(set(buendel_index) - set(kandidaten_index)):
+        meldungen.append(f"Buendeleintrag {index}: kein Kandidat mit diesem Index vorhanden")
+
+    gruppen: dict[int, list[tuple[int, dict[str, object]]]] = {}
+    for index in sorted(buendel_index):
+        eintrag = buendel_index[index]
+        gruppe = _ganzzahl(eintrag.get("gruppe"))
+        if gruppe is None:
+            meldungen.append(f"Buendeleintrag {index}: 'gruppe' fehlt oder ist keine Ganzzahl")
+            continue
+        gruppen.setdefault(gruppe, []).append((index, eintrag))
+
+    for gruppe in sorted(gruppen):
+        eintraege = gruppen[gruppe]
+        empfohlen = [index for index, eintrag in eintraege if eintrag.get("empfohlen") is True]
+        if len(empfohlen) != 1:
+            wer = ", ".join(str(index) for index in empfohlen) if empfohlen else "keiner"
+            meldungen.append(
+                f"Gruppe {gruppe}: {len(empfohlen)} Empfehlungen statt genau einer - {wer}"
+            )
+        raenge = [_ganzzahl(eintrag.get("rang")) for _, eintrag in eintraege]
+        gueltig = [rang for rang in raenge if rang is not None]
+        if len(gueltig) != len(raenge):
+            ohne = [
+                index
+                for (index, _), rang in zip(eintraege, raenge, strict=True)
+                if rang is None
+            ]
+            namen = ", ".join(str(index) for index in ohne)
+            meldungen.append(f"Gruppe {gruppe}: kein ganzzahliger 'rang' bei {namen}")
+        erwartet = set(range(1, len(eintraege) + 1))
+        doppelt = sorted({rang for rang in gueltig if gueltig.count(rang) > 1})
+        if doppelt:
+            namen = ", ".join(str(rang) for rang in doppelt)
+            meldungen.append(f"Gruppe {gruppe}: Rang {namen} doppelt vergeben")
+        fehlend = sorted(erwartet - set(gueltig))
+        if fehlend:
+            namen = ", ".join(str(rang) for rang in fehlend)
+            meldungen.append(
+                f"Gruppe {gruppe}: Rang {namen} fehlt - erwartet 1 bis {len(eintraege)}"
+            )
+
+    for index in sorted(kandidaten_index):
+        ziel = _ganzzahl(kandidaten_index[index].get("laengere_fassung_von"))
+        if ziel is None:
+            continue
+        hier = buendel_index.get(index)
+        dort = buendel_index.get(ziel)
+        if hier is None or dort is None:
+            continue
+        if hier.get("gruppe") != dort.get("gruppe"):
+            meldungen.append(
+                f"Kandidat {index} ist die laengere Fassung von {ziel}, steht aber in Gruppe "
+                f"{hier.get('gruppe')} statt in Gruppe {dort.get('gruppe')}"
+            )
+
     return meldungen
 
 

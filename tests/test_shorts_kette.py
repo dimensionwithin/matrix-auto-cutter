@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from matrix_auto_cutter.shorts import kette
+from matrix_auto_cutter.shorts import auswahl, kette
 
 # --------------------------------------------------------------------------
 # Hilfen
@@ -73,8 +73,52 @@ def _lege_ausgaben_an(
             )
         elif stufe.name == "zerlegung":
             ziel.write_text(json.dumps(kandidatensatz(lauf)), encoding="utf-8")
+        elif stufe.name == kette.BUENDELUNG_STUFE:
+            ziel.write_text(json.dumps(buendel_zu(job_dir)), encoding="utf-8")
         else:
             ziel.write_text("{}", encoding="utf-8")
+
+
+def buendel_zu(job_dir: Path) -> dict[str, object]:
+    """Eine Buendelung, die zur vorliegenden ``kandidaten.json`` passt.
+
+    Je Kandidat eine eigene Gruppe: das ist die einfachste Form, die
+    ``auswahl.pruefe_buendel`` durchgehen laesst, und mehr braucht ein
+    Kettentest nicht. Liegt (noch) keine lesbare ``kandidaten.json`` da,
+    wird ein einzelner Index angenommen - dieselbe Groesse wie
+    :func:`kandidatensatz`.
+    """
+    pfad = job_dir / "kandidaten.json"
+    indizes: list[int] = [1]
+    if pfad.is_file():
+        try:
+            roh = json.loads(pfad.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            roh = {}
+        liste = roh.get("kandidaten") if isinstance(roh, dict) else None
+        if isinstance(liste, list) and liste:
+            indizes = sorted(eintrag["index"] for eintrag in liste)
+    return {
+        "artifact_type": auswahl.BUENDEL_ARTIFACT_TYPE,
+        "schema_version": auswahl.BUENDEL_SCHEMA_VERSION,
+        "video_name": AUFNAHME,
+        "kandidaten_gesamt": len(indizes),
+        "gruppen_gesamt": len(indizes),
+        "modell": "opus",
+        "gebuendelt_am": "2026-08-26T12:00:00+00:00",
+        "buendel": [
+            {
+                "index": index,
+                "projekt": "Bitcoin",
+                "thema": f"Thema {index}",
+                "gruppe": nummer,
+                "rang": 1,
+                "empfohlen": True,
+                "begruendung": "einziger seiner Gruppe",
+            }
+            for nummer, index in enumerate(indizes, start=1)
+        ],
+    }
 
 
 ALLE_STUFEN = tuple(stufe.name for stufe in kette.STUFEN)
@@ -183,9 +227,10 @@ def test_zustandsdatei_traegt_nach_jeder_stufe_den_stand(
         kette.STATUS_OFFEN,
         kette.STATUS_OFFEN,
         kette.STATUS_OFFEN,
+        kette.STATUS_OFFEN,
     ]
     zustand = _lies_zustand(job_dir)
-    assert [_status(zustand, name) for name in ALLE_STUFEN] == [kette.STATUS_FERTIG] * 6
+    assert [_status(zustand, name) for name in ALLE_STUFEN] == [kette.STATUS_FERTIG] * 7
     assert (job_dir / "kandidaten.json").is_file()
 
 
@@ -209,7 +254,7 @@ def test_fertige_stufe_mit_ausgabe_wird_uebersprungen(
 
     assert code == 0
     assert prozesse == []
-    assert ausgabe.count("uebersprungen -") == 6
+    assert ausgabe.count("uebersprungen -") == 7
 
 
 def test_neu_erzwingt_jede_stufe(
@@ -224,8 +269,8 @@ def test_neu_erzwingt_jede_stufe(
     code = kette.main(["--aufnahme", AUFNAHME, "--wurzel", str(tmp_path), "--neu"])
 
     assert code == 0
-    # Fuenf Prozesse: die Zusammenfuehrung ist eine Kopie, kein Prozess.
-    assert len(aufgezeichnet) == 5
+    # Sechs Prozesse: die Zusammenfuehrung ist eine Kopie, kein Prozess.
+    assert len(aufgezeichnet) == 6
     assert "--force" in aufgezeichnet[0]
 
 
@@ -242,9 +287,11 @@ def test_neu_ab_4_laesst_1_bis_3_stehen(
 
     assert code == 0
     gestartet = [argv[-1] if argv[0] != kette.CLAUDE_BEFEHL else "claude" for argv in aufgezeichnet]
-    # Nur Stufe 4 (wortliste) und Stufe 5 (zerlegung) liefen wieder.
-    assert len(aufgezeichnet) == 2
+    # Stufe 4 (wortliste), 5 (zerlegung) und 7 (buendelung) liefen wieder;
+    # Stufe 6 ist eine Kopie und startet keinen Prozess.
+    assert len(aufgezeichnet) == 3
     assert gestartet[1] == "claude"
+    assert gestartet[2] == "claude"
     zustand = _lies_zustand(job_dir)
     assert _status(zustand, "transcript") == kette.STATUS_FERTIG
 
@@ -329,7 +376,9 @@ def test_zwei_zerlegungslaeufe_werden_vereinigt_statt_angehalten(
         json.dumps(kandidatensatz(2, start_ms=60_000)), encoding="utf-8"
     )
 
-    code = kette.main(["--aufnahme", AUFNAHME, "--wurzel", str(tmp_path)])
+    code = kette.main(
+        ["--aufnahme", AUFNAHME, "--wurzel", str(tmp_path), "--bis", "zusammenfuehrung"]
+    )
     ausgabe = capsys.readouterr().out
 
     assert code == 0
@@ -398,7 +447,16 @@ def test_stufe_sechs_laeuft_durch_wenn_kein_index_umgedeutet_wird(
     # ``--neu-ab``, weil ``kandidaten.json`` schon daliegt - sonst gaelte
     # Stufe 6 als erledigt und die Sperre kaeme gar nicht erst zum Zug.
     code = kette.main(
-        ["--aufnahme", AUFNAHME, "--wurzel", str(tmp_path), "--neu-ab", "zusammenfuehrung"]
+        [
+            "--aufnahme",
+            AUFNAHME,
+            "--wurzel",
+            str(tmp_path),
+            "--neu-ab",
+            "zusammenfuehrung",
+            "--bis",
+            "zusammenfuehrung",
+        ]
     )
     ausgabe = capsys.readouterr().out
 
@@ -518,8 +576,8 @@ def test_trocken_fuehrt_nichts_aus_und_schreibt_nichts(
     assert prozesse == []
     assert not (job_dir / kette.ZUSTAND_FILE_NAME).exists()
     assert ausgabe.count("wird uebersprungen") == 2
-    assert ausgabe.count("wuerde laufen") == 4
-    assert "2 von 6 Stufen wuerden uebersprungen." in ausgabe
+    assert ausgabe.count("wuerde laufen") == 5
+    assert "2 von 7 Stufen wuerden uebersprungen." in ausgabe
 
 
 def test_erwartete_transkriptionsdauer_steht_in_der_kopfzeile(
@@ -535,14 +593,14 @@ def test_erwartete_transkriptionsdauer_steht_in_der_kopfzeile(
     kette.main(["--aufnahme", AUFNAHME, "--wurzel", str(tmp_path), "--trocken"])
     ausgabe = capsys.readouterr().out
 
-    assert "Stufe 3 von 6: Transkription, erwartet rund 12 min 22 s" in ausgabe
+    assert "Stufe 3 von 7: Transkription, erwartet rund 12 min 22 s" in ausgabe
 
 
 def test_ohne_auftragsdatei_bleibt_die_kopfzeile_ohne_erwartung(tmp_path: Path) -> None:
     """Fehlt ``shorts-job.json``, wird nichts geraten - die Zeile nennt dann keine Dauer."""
     zeile = kette._kopfzeile(3, kette.STUFEN[2], tmp_path / "gibt-es-nicht.json")
 
-    assert zeile == "Stufe 3 von 6: Transkription"
+    assert zeile == "Stufe 3 von 7: Transkription"
 
 
 def test_dauer_text_schneidet_ab_statt_zu_runden() -> None:
@@ -560,7 +618,7 @@ def test_zerlegung_verweist_auf_den_auftragstext_statt_ihn_zu_wiederholen() -> N
     assert str(kette.ZERLEGUNG_AUFTRAGSTEXT_PFAD) in argv[2]
     assert AUFNAHME in argv[2]
     assert "<N> ist 1" in argv[2]
-    assert argv[3:] == ["--model", "sonnet", "--permission-mode", "acceptEdits"]
+    assert argv[3:] == ["--model", "opus", "--permission-mode", "acceptEdits"]
 
 
 def test_unbekannte_stufe_wird_benannt(
@@ -590,13 +648,17 @@ def test_modell_erreicht_die_claude_kommandozeile_und_den_auftragstext() -> None
     assert 'Trage als Wurzelfeld modell den Wert "opus" ein.' in argv[2]
 
 
-def test_ohne_modell_bleibt_es_bei_sonnet() -> None:
-    """Die bisherige Konstante ist die Vorgabe - ein Lauf ohne Fahne faehrt wie bisher."""
+def test_ohne_modell_bleibt_es_bei_opus() -> None:
+    """Seit dem 26.8. ist ``opus`` die Vorgabe der Zerlegung, nicht mehr ``sonnet``.
+
+    Entscheidung des Auftraggebers: der Nachschlaglauf mit opus hat das
+    Material gebracht, um das es in der Buendelung geht.
+    """
     argv = kette.zerlegung_argv(AUFNAHME)
 
-    assert kette.ZERLEGUNG_MODELL == "sonnet"
-    assert argv[3:] == ["--model", "sonnet", "--permission-mode", "acceptEdits"]
-    assert 'Trage als Wurzelfeld modell den Wert "sonnet" ein.' in argv[2]
+    assert kette.ZERLEGUNG_MODELL == "opus"
+    assert argv[3:] == ["--model", "opus", "--permission-mode", "acceptEdits"]
+    assert 'Trage als Wurzelfeld modell den Wert "opus" ein.' in argv[2]
 
 
 def test_modell_aus_der_befehlszeile_landet_im_claude_aufruf(
@@ -609,7 +671,16 @@ def test_modell_aus_der_befehlszeile_landet_im_claude_aufruf(
     _lege_ausgaben_an(job_dir, "auftrag", "avatar_cut", "transcript", "wortliste")
 
     code = kette.main(
-        ["--aufnahme", AUFNAHME, "--wurzel", str(tmp_path), "--modell", "opus"]
+        [
+            "--aufnahme",
+            AUFNAHME,
+            "--wurzel",
+            str(tmp_path),
+            "--modell",
+            "opus",
+            "--bis",
+            "zerlegung",
+        ]
     )
 
     assert code == 0
@@ -635,7 +706,7 @@ def test_modell_steht_bei_der_zerlegung_in_kette_json(
     assert stufen["zerlegung"]["modell"] == "opus"
 
 
-def test_ohne_modell_steht_sonnet_in_kette_json(
+def test_ohne_modell_steht_opus_in_kette_json(
     tmp_path: Path, kein_bestand: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     job_dir = _job_dir(tmp_path)
@@ -647,7 +718,7 @@ def test_ohne_modell_steht_sonnet_in_kette_json(
     stufen = _lies_zustand(job_dir)["stufen"]
 
     assert isinstance(stufen, dict)
-    assert stufen["zerlegung"]["modell"] == "sonnet"
+    assert stufen["zerlegung"]["modell"] == "opus"
 
 
 def test_uebersprungene_zerlegung_traegt_das_modell_von_heute_nicht_nach(
@@ -683,13 +754,13 @@ def test_trockenlauf_nennt_das_modell_bei_der_zerlegung(
     )
     ausgabe = capsys.readouterr().out
 
-    assert "Stufe 5 von 6: Zerlegung (Modell), Modell opus" in ausgabe
+    assert "Stufe 5 von 7: Zerlegung (Modell), Modell opus" in ausgabe
 
 
 def test_kopfzeile_der_zerlegung_nennt_ohne_fahne_die_vorgabe(tmp_path: Path) -> None:
     zeile = kette._kopfzeile(5, kette.STUFEN[4], tmp_path / "gibt-es-nicht.json")
 
-    assert zeile == "Stufe 5 von 6: Zerlegung (Modell), Modell sonnet"
+    assert zeile == "Stufe 5 von 7: Zerlegung (Modell), Modell opus"
 
 
 # --------------------------------------------------------------------------
@@ -718,7 +789,18 @@ def test_lauf_2_schreibt_lauf2_und_laesst_lauf1_unberuehrt(
     monkeypatch.setattr(kette, "fuehre_prozess", _falscher_prozess)
 
     code = kette.main(
-        ["--aufnahme", AUFNAHME, "--wurzel", str(tmp_path), "--neu-ab", "zerlegung", "--lauf", "2"]
+        [
+            "--aufnahme",
+            AUFNAHME,
+            "--wurzel",
+            str(tmp_path),
+            "--neu-ab",
+            "zerlegung",
+            "--lauf",
+            "2",
+            "--bis",
+            "zusammenfuehrung",
+        ]
     )
 
     assert code == 0
@@ -739,10 +821,10 @@ def test_lauf_2_bestimmt_den_dateinamen_der_stufe() -> None:
 
     assert stufen[4].name == "zerlegung"
     assert stufen[4].ausgabe == "kandidaten-lauf2.json"
-    # Die uebrigen fuenf Stufen haengen nicht an der Laufnummer.
+    # Die uebrigen sechs Stufen haengen nicht an der Laufnummer.
     assert [stufe.ausgabe for stufe in stufen] != [stufe.ausgabe for stufe in kette.STUFEN]
     assert stufen[:4] == kette.STUFEN[:4]
-    assert stufen[5] == kette.STUFEN[5]
+    assert stufen[5:] == kette.STUFEN[5:]
 
 
 def test_trockenlauf_nennt_die_datei_des_zweiten_laufs(
@@ -768,7 +850,18 @@ def test_vorhandene_laufdatei_wird_gemeldet_und_uebersprungen(
         json.dumps(kandidatensatz(2, start_ms=60_000)), encoding="utf-8"
     )
 
-    code = kette.main(["--aufnahme", AUFNAHME, "--wurzel", str(tmp_path), "--lauf", "2"])
+    code = kette.main(
+        [
+            "--aufnahme",
+            AUFNAHME,
+            "--wurzel",
+            str(tmp_path),
+            "--lauf",
+            "2",
+            "--bis",
+            "zusammenfuehrung",
+        ]
+    )
     ausgabe = capsys.readouterr().out
 
     assert code == 0
@@ -801,7 +894,12 @@ def test_kette_json_traegt_nach_zwei_laeufen_beide_zerlegungseintraege(
 
     monkeypatch.setattr(kette, "fuehre_prozess", _falscher_prozess)
 
-    assert kette.main(["--aufnahme", AUFNAHME, "--wurzel", str(tmp_path)]) == 0
+    assert (
+        kette.main(
+            ["--aufnahme", AUFNAHME, "--wurzel", str(tmp_path), "--modell", "sonnet"]
+        )
+        == 0
+    )
     assert (
         kette.main(
             [

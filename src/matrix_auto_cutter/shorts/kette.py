@@ -1,9 +1,9 @@
 r"""Der Kettenlaeufer: eine frische Aufnahme bis zu den Kandidaten.
 
-Sechs Stufen liegen zwischen einer gerenderten Aufnahme und der
+Sieben Stufen liegen zwischen einer gerenderten Aufnahme und der
 Urteilsseite - Auftragsdatei, Avatarschnitt, Transkript, Wortliste,
-Zerlegung, Zusammenfuehrung. Jede davon ist ein erprobtes Werkzeug, und
-jede wurde bisher von Hand angestossen. Dieses Modul reiht sie
+Zerlegung, Zusammenfuehrung, Buendelung. Jede davon ist ein erprobtes
+Werkzeug, und jede wurde bisher von Hand angestossen. Dieses Modul reiht sie
 aneinander und gibt ihnen ein Gedaechtnis: ``kette.json`` im
 Aufnahmeordner haelt nach JEDER Stufe fest, was gelaufen ist. Ein
 abgebrochener Lauf laesst sich damit fortsetzen, statt von vorn zu
@@ -33,10 +33,19 @@ gelesen. Der Bestand waechst taeglich - "die juengste Aufnahme" ist
 morgen eine andere, und eine Kette, die ihren Namen zwischendurch neu
 erfragt, wechselt mitten im Lauf das Werkstueck.
 
-Die Zerlegung (Stufe 5) hat kein Modul: sie ist der Modellschritt und
-laeuft als ``claude -p``. Der Auftragstext steht nicht hier, sondern in
-``docs\repeat\ZERLEGUNG-AUFTRAGSTEXT.md`` - stuende er an beiden
+Zwei Stufen haben kein Modul: die Zerlegung (5) und die Buendelung (7).
+Beide sind Modellschritte und laufen als ``claude -p`` ueber denselben Weg
+(:func:`modell_argv`). Ihre Auftragstexte stehen nicht hier, sondern in
+``docs\repeat\ZERLEGUNG-AUFTRAGSTEXT.md`` und
+``docs
+epeat\BUENDELUNG-AUFTRAGSTEXT.md`` - stuenden sie an beiden
 Stellen, veralteten zwei Fassungen nebeneinander.
+
+Die Buendelung schreibt ``buendel.json`` NEBEN ``kandidaten.json`` und
+fasst diese nicht an: an deren Indizes haengen die Urteile des Nutzers.
+Danach prueft :func:`auswahl.pruefe_buendel`, ob die Buendelung jeden Index
+genau einmal trifft; meldet sie etwas, endet die Kette mit
+:data:`CODE_BUENDEL_ABWEICHUNG` und die Datei bleibt zur Ansicht liegen.
 """
 
 from __future__ import annotations
@@ -78,6 +87,10 @@ CODE_STUFE_GESCHEITERT = 5
 # dieselbe Meldung - egal ob ueber Stufe 6 oder ueber
 # ``auswahl --zusammenfuehren`` zusammengefuehrt wird.
 CODE_URTEILE_VORHANDEN = 9
+# Eigener Code, damit sich eine gescheiterte Buendelung von einem
+# abgestuerzten Modellaufruf unterscheiden laesst: hier ist die Datei da und
+# lesbar, nur ihr Inhalt trifft die Kandidaten nicht.
+CODE_BUENDEL_ABWEICHUNG = 10
 
 # Belegt in ORCHESTRATOR-UEBERGABE-2026-08-25.md: die Transkription mit vier
 # Threads braucht rund das 1,27-fache der Audiodauer. Der Wert ist eine
@@ -90,9 +103,16 @@ _POLL_TAKT_SEKUNDEN = 0.25
 
 CLAUDE_BEFEHL = "claude"
 ZERLEGUNG_AUFTRAGSTEXT_PFAD = Path("docs") / "repeat" / "ZERLEGUNG-AUFTRAGSTEXT.md"
-ZERLEGUNG_MODELL = "sonnet"
+# Bis zum 26.8. ``sonnet``. Der Auftraggeber hat an diesem Tag auf ``opus``
+# umgestellt: der Nachschlaglauf mit opus (Lauf 2 der Aufnahme vom 25.8.)
+# brachte das Material, um das es geht.
+ZERLEGUNG_MODELL = "opus"
 ZERLEGUNG_LAUF = 1
 ZERLEGUNG_STUFE = "zerlegung"
+
+BUENDELUNG_AUFTRAGSTEXT_PFAD = Path("docs") / "repeat" / "BUENDELUNG-AUFTRAGSTEXT.md"
+BUENDELUNG_MODELL = "opus"
+BUENDELUNG_STUFE = "buendelung"
 
 STATUS_OFFEN = "offen"
 STATUS_LAEUFT = "laeuft"
@@ -116,13 +136,14 @@ STUFEN: tuple[Stufe, ...] = (
     Stufe("wortliste", "wortliste.json", "Wortliste"),
     Stufe(ZERLEGUNG_STUFE, f"kandidaten-lauf{ZERLEGUNG_LAUF}.json", "Zerlegung (Modell)"),
     Stufe("zusammenfuehrung", CANDIDATES_FILE_NAME, "Zusammenfuehrung"),
+    Stufe(BUENDELUNG_STUFE, auswahl.BUENDEL_FILE_NAME, "Buendelung (Modell)"),
 )
 
 _KANDIDATEN_LAUF_GLOB = auswahl.LAUFDATEI_GLOB
 
 
 def stufen_fuer(lauf: int) -> tuple[Stufe, ...]:
-    """Die sechs Stufen fuer eine bestimmte Laufnummer.
+    """Die Stufen fuer eine bestimmte Laufnummer.
 
     Nur die Zerlegung haengt an der Nummer, und sie haengt daran mit ihrem
     Dateinamen: ``kandidaten-lauf2.json`` ist die Ausgabe des zweiten
@@ -175,7 +196,7 @@ def _leerer_eintrag() -> dict[str, object]:
 
 
 def leerer_zustand(video_name: str) -> dict[str, object]:
-    """Ein frischer Zustand: alle sechs Stufen offen, nichts begonnen."""
+    """Ein frischer Zustand: alle Stufen offen, nichts begonnen."""
     jetzt = _jetzt()
     return {
         "artifact_type": ARTIFACT_TYPE,
@@ -235,10 +256,10 @@ def zerlegung_lauf_eintrag(zustand: dict[str, object], lauf: int) -> dict[str, o
     """Der Eintrag EINES Zerlegungslaufs, unter ``stufen.zerlegung.laeufe.<N>``.
 
     Warum geschachtelt und nicht ``stufen["zerlegung-lauf2"]``: die
-    Stufenliste hat sechs Namen, und ``--neu-ab zerlegung`` sowie jede
+    Stufenliste hat sieben Namen, und ``--neu-ab zerlegung`` sowie jede
     Auswertung von ``kette.json`` gehen ueber diese Namen. Ein Schluessel,
-    der die Laufnummer traegt, machte aus sechs Stufen bei drei Laeufen
-    acht und truebe die Buchfuehrung fuer alle uebrigen Leser mit.
+    der die Laufnummer traegt, machte aus sieben Stufen bei drei Laeufen
+    neun und truebe die Buchfuehrung fuer alle uebrigen Leser mit.
 
     Unter ``laeufe`` steht dagegen je Nummer ein voller Stufeneintrag -
     ``"1"``, ``"2"``, ``"3"`` -, und ein zweiter Lauf fasst den Eintrag des
@@ -404,13 +425,15 @@ def zerlegung_auftragstext(
     )
 
 
-def zerlegung_argv(
-    video_name: str, lauf: int = ZERLEGUNG_LAUF, modell: str = ZERLEGUNG_MODELL
-) -> list[str]:
-    """Die Befehlszeile des Modellschritts - an einer Stelle gefasst.
+def modell_argv(auftragstext: str, modell: str) -> list[str]:
+    """Die Befehlszeile EINES Modellschritts - an einer Stelle gefasst.
 
-    An einer Stelle, damit die geplante Aufgabe spaeter dieselbe benutzt
-    und nicht eine zweite, leicht abweichende.
+    An einer Stelle, damit jede weitere Modellstufe denselben Weg nimmt und
+    nicht einen zweiten, leicht abweichenden. Bis zum 26.8. gab es nur die
+    Zerlegung, und diese Zeilen standen in ``zerlegung_argv``; die
+    Buendelung braucht dasselbe Geruest mit einem anderen Auftragstext, also
+    steht das Geruest jetzt hier und die beiden Stufen liefern nur noch den
+    Text und das Modell.
 
     ``--permission-mode acceptEdits`` ist nicht Bequemlichkeit: ohne die
     Angabe scheitert ein unbeaufsichtigter Lauf am Freigabedialog, und zwar
@@ -419,12 +442,43 @@ def zerlegung_argv(
     return [
         CLAUDE_BEFEHL,
         "-p",
-        zerlegung_auftragstext(video_name, lauf, modell),
+        auftragstext,
         "--model",
         modell,
         "--permission-mode",
         "acceptEdits",
     ]
+
+
+def zerlegung_argv(
+    video_name: str, lauf: int = ZERLEGUNG_LAUF, modell: str = ZERLEGUNG_MODELL
+) -> list[str]:
+    """Die Befehlszeile der Zerlegung."""
+    return modell_argv(zerlegung_auftragstext(video_name, lauf, modell), modell)
+
+
+def buendelung_auftragstext(video_name: str, modell: str = BUENDELUNG_MODELL) -> str:
+    r"""Der Verweis auf den Buendelungs-Auftragstext - nicht der Text selbst.
+
+    Aus demselben Grund wie bei der Zerlegung: der Inhalt steht in
+    ``docs\repeat\BUENDELUNG-AUFTRAGSTEXT.md``, und stuende er auch hier,
+    veralteten zwei Fassungen nebeneinander.
+
+    ``modell`` steht wieder zweimal im Aufruf - als Wurzelfeld der
+    Buendeldatei und als ``--model``. Die Fahne bestimmt, WOMIT gebuendelt
+    wird; das Wurzelfeld haelt fest, WOMIT gebuendelt WURDE.
+    """
+    return (
+        f"Lies {BUENDELUNG_AUFTRAGSTEXT_PFAD} vollstaendig und fuehre den darin "
+        f'beschriebenen Auftrag aus. <AUFNAHME> ist "{video_name}". '
+        f'Trage als Wurzelfeld modell den Wert "{modell}" ein. '
+        f"Auftragsname: buendelung."
+    )
+
+
+def buendelung_argv(video_name: str, modell: str = BUENDELUNG_MODELL) -> list[str]:
+    """Die Befehlszeile der Buendelung."""
+    return modell_argv(buendelung_auftragstext(video_name, modell), modell)
 
 
 def stufen_argv(
@@ -435,6 +489,7 @@ def stufen_argv(
     video_name: str,
     erzwingen: bool,
     modell: str = ZERLEGUNG_MODELL,
+    modell_buendelung: str = BUENDELUNG_MODELL,
     lauf: int = ZERLEGUNG_LAUF,
 ) -> list[str] | None:
     """Die Befehlszeile einer Stufe; ``None`` heisst: kein Prozess, sondern Handarbeit.
@@ -467,6 +522,8 @@ def stufen_argv(
         return [*argv, "--force"] if erzwingen else argv
     if stufe.name == ZERLEGUNG_STUFE:
         return zerlegung_argv(video_name, lauf=lauf, modell=modell)
+    if stufe.name == BUENDELUNG_STUFE:
+        return buendelung_argv(video_name, modell=modell_buendelung)
     return None
 
 
@@ -610,6 +667,49 @@ def _pruefe_urteile_bleiben_gueltig(
 
 
 # --------------------------------------------------------------------------
+# Buendelung
+# --------------------------------------------------------------------------
+
+
+def pruefe_buendelung(job_dir: Path) -> None:
+    """Halte die Kette an, wenn ``buendel.json`` die Kandidaten nicht trifft.
+
+    Die Datei bleibt dabei ausdruecklich liegen. Sie ist die Arbeit eines
+    Modellaufs, der Minuten gekostet hat, und ihr Fehler ist meist an einer
+    Stelle zu sehen - wer sie aufraeumen liesse, naehme dem Nutzer die
+    Moeglichkeit nachzusehen, was schiefging. Angehalten wird trotzdem: eine
+    Buendelung, die einen Index auslaesst, verschweigt genau den Kandidaten,
+    ueber den nie entschieden wird.
+
+    Der eigene Rueckgabecode :data:`CODE_BUENDEL_ABWEICHUNG` unterscheidet
+    diesen Fall von :data:`CODE_STUFE_GESCHEITERT`: dort ist der Modellaufruf
+    selbst gescheitert, hier hat er geliefert und getroffen hat er nicht.
+    """
+    kandidaten_pfad = job_dir / CANDIDATES_FILE_NAME
+    buendel_pfad = job_dir / auswahl.BUENDEL_FILE_NAME
+    try:
+        kandidaten, _ = auswahl.lies_kandidaten_rohdaten(kandidaten_pfad)
+        buendel = auswahl.lies_buendel(buendel_pfad)
+    except (OSError, json.JSONDecodeError) as fehler:
+        raise KetteFehlschlag(
+            "buendel_abweichung",
+            f"{buendel_pfad.name} ist nicht lesbar - {fehler}",
+            CODE_BUENDEL_ABWEICHUNG,
+        ) from fehler
+    meldungen = auswahl.pruefe_buendel(kandidaten, buendel)
+    if not meldungen:
+        print(f"  {buendel_pfad.name} geprueft: keine Abweichung zu {kandidaten_pfad.name}")
+        return
+    zeilen = "\n".join(f"    - {meldung}" for meldung in meldungen)
+    raise KetteFehlschlag(
+        "buendel_abweichung",
+        f"{buendel_pfad.name} weicht von {kandidaten_pfad.name} ab "
+        f"({len(meldungen)} Meldungen) - die Datei bleibt liegen:\n{zeilen}",
+        CODE_BUENDEL_ABWEICHUNG,
+    )
+
+
+# --------------------------------------------------------------------------
 # Ablauf
 # --------------------------------------------------------------------------
 
@@ -660,22 +760,25 @@ def _kopfzeile(
     stufe: Stufe,
     job_path: Path,
     modell: str = ZERLEGUNG_MODELL,
+    modell_buendelung: str = BUENDELUNG_MODELL,
 ) -> str:
-    """``Stufe 3 von 6: Transkription, erwartet rund 12 min 22 s``.
+    """``Stufe 3 von 7: Transkription, erwartet rund 12 min 22 s``.
 
     Die Erwartung steht nur bei der Transkription: sie ist die einzige
     Stufe, deren Dauer sich vorher aus einer bekannten Zahl abschaetzen
     laesst, und die einzige, bei der die Frage "warten oder weggehen?"
     ueberhaupt aufkommt.
 
-    Bei der Zerlegung steht statt einer Dauer das Modell. Es ist die
-    einzige Stufe, deren Ergebnis von einer Fahne abhaengt, und wer einen
-    Nachschlag faehrt, will vor dem Warten sehen, dass die Fahne
-    angekommen ist - nicht erst danach in ``kette.json``.
+    Bei den beiden Modellstufen steht statt einer Dauer das Modell. Ihr
+    Ergebnis haengt an einer Fahne, und wer einen Nachschlag faehrt, will
+    vor dem Warten sehen, dass die Fahne angekommen ist - nicht erst danach
+    in ``kette.json``.
     """
     zeile = f"Stufe {nummer} von {len(STUFEN)}: {stufe.beschreibung}"
     if stufe.name == ZERLEGUNG_STUFE:
         return f"{zeile}, Modell {modell}"
+    if stufe.name == BUENDELUNG_STUFE:
+        return f"{zeile}, Modell {modell_buendelung}"
     if stufe.name != "transcript":
         return zeile
     erwartet = erwartete_transkriptionsdauer_s(job_path)
@@ -691,6 +794,7 @@ def _trockenlauf(
     bis: int,
     modell: str = ZERLEGUNG_MODELL,
     lauf: int = ZERLEGUNG_LAUF,
+    modell_buendelung: str = BUENDELUNG_MODELL,
 ) -> int:
     """Nenne je Stufe, was geschehen wuerde - und fuehre nichts aus.
 
@@ -700,7 +804,7 @@ def _trockenlauf(
     print("Trockenlauf (--trocken): es wird nichts ausgefuehrt und nichts geschrieben.")
     uebersprungen = 0
     for nummer, stufe in enumerate(stufen_fuer(lauf)[: bis + 1], start=1):
-        print(_kopfzeile(nummer, stufe, job_path, modell))
+        print(_kopfzeile(nummer, stufe, job_path, modell, modell_buendelung))
         ziel = job_dir / stufe.ausgabe
         if wird_uebersprungen(stufe, job_dir, zustand):
             uebersprungen += 1
@@ -720,6 +824,7 @@ def _fuehre_stufe_aus(
     video_name: str,
     erzwingen: bool,
     modell: str = ZERLEGUNG_MODELL,
+    modell_buendelung: str = BUENDELUNG_MODELL,
     lauf: int = ZERLEGUNG_LAUF,
 ) -> None:
     """Fuehre eine einzelne Stufe aus; jeder Fehlschlag ist ein :class:`KetteFehlschlag`.
@@ -727,6 +832,9 @@ def _fuehre_stufe_aus(
     Ein Rueckgabecode 0 allein genuegt nicht - die erwartete Ausgabe muss
     danach dasein. Sonst gilt eine Stufe als fertig, die nichts
     hinterlassen hat, und die naechste faellt ueber eine fehlende Datei.
+
+    Bei der Buendelung genuegt auch die vorhandene Datei nicht: sie wird
+    danach gegen ``kandidaten.json`` geprueft (:func:`pruefe_buendelung`).
     """
     if stufe.name == "zusammenfuehrung":
         quelle = laufdateien(job_dir)
@@ -741,6 +849,7 @@ def _fuehre_stufe_aus(
         video_name=video_name,
         erzwingen=erzwingen,
         modell=modell,
+        modell_buendelung=modell_buendelung,
         lauf=lauf,
     )
     assert argv is not None
@@ -758,6 +867,8 @@ def _fuehre_stufe_aus(
             f"Stufe {stufe.name} endete mit Rueckgabecode 0, aber {ziel} fehlt",
             CODE_STUFE_GESCHEITERT,
         )
+    if stufe.name == BUENDELUNG_STUFE:
+        pruefe_buendelung(job_dir)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -768,10 +879,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--aufnahme", default=None, help="Name der Aufnahme; ohne: die juengste")
     parser.add_argument("--neu", action="store_true", help="alle Stufen erzwingen")
     parser.add_argument(
-        "--neu-ab", default=None, metavar="STUFE", help="ab dieser Stufe erzwingen (Name oder 1-6)"
+        "--neu-ab", default=None, metavar="STUFE", help="ab dieser Stufe erzwingen (Name oder 1-7)"
     )
     parser.add_argument(
-        "--bis", default=None, metavar="STUFE", help="nach dieser Stufe anhalten (Name oder 1-6)"
+        "--bis", default=None, metavar="STUFE", help="nach dieser Stufe anhalten (Name oder 1-7)"
     )
     parser.add_argument(
         "--trocken", action="store_true", help="nur nennen, was geschaehe; nichts ausfuehren"
@@ -781,6 +892,15 @@ def _parser() -> argparse.ArgumentParser:
         default=ZERLEGUNG_MODELL,
         metavar="NAME",
         help=f"Modell der Zerlegung, an claude --model durchgereicht (Vorgabe: {ZERLEGUNG_MODELL})",
+    )
+    parser.add_argument(
+        "--modell-buendelung",
+        default=BUENDELUNG_MODELL,
+        metavar="NAME",
+        help=(
+            f"Modell der Buendelung, an claude --model durchgereicht "
+            f"(Vorgabe: {BUENDELUNG_MODELL})"
+        ),
     )
     parser.add_argument(
         "--lauf",
@@ -797,7 +917,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Sechs Stufen, ein Gedaechtnis - und nach jeder Stufe ein Stand auf der Platte."""
+    """Sieben Stufen, ein Gedaechtnis - und nach jeder Stufe ein Stand auf der Platte."""
     args = _parser().parse_args(argv)
     wurzel: Path = args.wurzel if args.wurzel is not None else Path.cwd()
     jobs_root = wurzel / JOBS_ROOT
@@ -818,11 +938,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         zustand["video_name"] = video_name
 
         if args.trocken:
-            return _trockenlauf(job_dir, job_path, zustand, bis, args.modell, args.lauf)
+            return _trockenlauf(
+                job_dir,
+                job_path,
+                zustand,
+                bis,
+                args.modell,
+                args.lauf,
+                args.modell_buendelung,
+            )
 
         zustand_pfad = job_dir / ZUSTAND_FILE_NAME
         for nummer, stufe in enumerate(stufen_fuer(args.lauf)[: bis + 1], start=1):
-            print(_kopfzeile(nummer, stufe, job_path, args.modell))
+            print(_kopfzeile(nummer, stufe, job_path, args.modell, args.modell_buendelung))
             # Die Zerlegung fuehrt zweimal Buch: einmal als Stufe (die
             # Zusammenfassung des zuletzt gefahrenen Laufs) und einmal je
             # Laufnummer. Beide Eintraege bekommen denselben Stand - nur
@@ -859,6 +987,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     # machte aus der Buchfuehrung eine Behauptung.
                     eintrag["modell"] = args.modell
                     eintrag["lauf"] = args.lauf
+                elif stufe.name == BUENDELUNG_STUFE:
+                    # Aus demselben Grund und mit derselben Zurueckhaltung:
+                    # der Eintrag nennt das Modell nur, wenn wirklich damit
+                    # gebuendelt wurde.
+                    eintrag["modell"] = args.modell_buendelung
             schreibe_zustand(zustand_pfad, zustand)
             try:
                 _fuehre_stufe_aus(
@@ -869,6 +1002,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     video_name=video_name,
                     erzwingen=erzwingen,
                     modell=args.modell,
+                    modell_buendelung=args.modell_buendelung,
                     lauf=args.lauf,
                 )
             except KetteFehlschlag as fehler:
@@ -897,6 +1031,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return fehler.rueckgabecode
 
     print(f"Kette fertig: {job_dir / CANDIDATES_FILE_NAME}")
+    print(f"Buendelung:   {job_dir / auswahl.BUENDEL_FILE_NAME}")
     print("Weiter mit: python -m matrix_auto_cutter.shorts.urteilslauf")
     return CODE_ERFOLG
 
