@@ -364,6 +364,97 @@ def test_zusammenfuehrung_uebernimmt_den_einzigen_lauf(tmp_path: Path) -> None:
     assert ergebnis["modelle"] == {"1": "sonnet"}
 
 
+def _urteilsdatei(job_dir: Path) -> None:
+    """Eine Urteilsdatei, wie ``judge_server`` sie hinterlaesst - Inhalt egal.
+
+    Die Sperre fragt ueber ``auswahl.juengste_urteilsdatei`` nur, OB eine
+    ``urteile*.json`` daliegt; welche Urteile darin stehen, entscheidet sie
+    nicht - das entscheidet der Vergleich der Kandidatensaetze.
+    """
+    (job_dir / "urteile-2026-08-21-101010.json").write_text(
+        json.dumps({"artifact_type": "shorts-urteile", "schema_version": 1, "kandidaten": []}),
+        encoding="utf-8",
+    )
+
+
+def test_stufe_sechs_laeuft_durch_wenn_kein_index_umgedeutet_wird(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Urteile UND kandidaten.json liegen vor - aber Lauf 2 bringt nur Neues.
+
+    Nach der Regel aus ``auswahl.fuehre_zusammen`` ist das der Normalfall:
+    Index 1 behaelt seinen Inhalt, Lauf 2 haengt Index 2 an. Ein Urteil auf
+    1 meint danach denselben Ausschnitt, also darf geschrieben werden.
+    """
+    job_dir = _job_dir(tmp_path)
+    _lege_ausgaben_an(job_dir, "auftrag", "avatar_cut", "transcript", "wortliste", "zerlegung")
+    _urteilsdatei(job_dir)
+    # Der Stand, auf den die Urteile zeigen: Lauf 1 allein.
+    kette.fuehre_zusammen(job_dir)
+    (job_dir / "kandidaten-lauf2.json").write_text(
+        json.dumps(kandidatensatz(2, start_ms=60_000)), encoding="utf-8"
+    )
+
+    # ``--neu-ab``, weil ``kandidaten.json`` schon daliegt - sonst gaelte
+    # Stufe 6 als erledigt und die Sperre kaeme gar nicht erst zum Zug.
+    code = kette.main(
+        ["--aufnahme", AUFNAHME, "--wurzel", str(tmp_path), "--neu-ab", "zusammenfuehrung"]
+    )
+    ausgabe = capsys.readouterr().out
+
+    assert code == 0
+    assert "ANGEHALTEN" not in ausgabe
+    ergebnis = json.loads((job_dir / "kandidaten.json").read_text(encoding="utf-8"))
+    assert [k["index"] for k in ergebnis["kandidaten"]] == [1, 2]
+    assert ergebnis["kandidaten"][0]["titel"] == "Titel aus Lauf 1"
+
+
+def test_stufe_sechs_haelt_mit_code_neun_an_wenn_ein_index_umgedeutet_wird(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Wuerde ein beurteilter Index anderes bedeuten, wird nichts geschrieben.
+
+    Hergestellt wird der Fall ueber eine ``kandidaten.json``, die nicht aus
+    den heutigen Laufdateien stammt - genau das, was passiert, wenn nach
+    einer Zusammenfuehrung eine Laufdatei ersetzt wird.
+    """
+    job_dir = _job_dir(tmp_path)
+    _lege_ausgaben_an(job_dir, "auftrag", "avatar_cut", "transcript", "wortliste", "zerlegung")
+    _urteilsdatei(job_dir)
+    vorher = kandidatensatz(1)
+    vorher["kandidaten"][0]["titel"] = "So stand es, als geurteilt wurde"
+    (job_dir / "kandidaten.json").write_text(json.dumps(vorher), encoding="utf-8")
+
+    code = kette.main(
+        ["--aufnahme", AUFNAHME, "--wurzel", str(tmp_path), "--neu-ab", "zusammenfuehrung"]
+    )
+    ausgabe = capsys.readouterr().out
+
+    assert code == kette.CODE_URTEILE_VORHANDEN == 9
+    assert "ANGEHALTEN [urteile_vorhanden]" in ausgabe
+    assert "Indizes 1" in ausgabe
+    # Nichts geschrieben: der Stand, auf den die Urteile zeigen, steht noch da.
+    danach = json.loads((job_dir / "kandidaten.json").read_text(encoding="utf-8"))
+    assert danach["kandidaten"][0]["titel"] == "So stand es, als geurteilt wurde"
+
+
+def test_stufe_sechs_schreibt_ohne_urteilsdatei_ohne_vergleich(tmp_path: Path) -> None:
+    """Ohne Urteile gibt es nichts zu schuetzen - auch ein umgedeuteter Index geht durch."""
+    job_dir = _job_dir(tmp_path)
+    job_dir.mkdir(parents=True)
+    (job_dir / "kandidaten-lauf1.json").write_text(
+        json.dumps(kandidatensatz(1)), encoding="utf-8"
+    )
+    vorher = kandidatensatz(1)
+    vorher["kandidaten"][0]["titel"] = "Etwas ganz anderes"
+    (job_dir / "kandidaten.json").write_text(json.dumps(vorher), encoding="utf-8")
+
+    ziel = kette.fuehre_zusammen(job_dir)
+    ergebnis = json.loads(ziel.read_text(encoding="utf-8"))
+
+    assert ergebnis["kandidaten"][0]["titel"] == "Titel aus Lauf 1"
+
+
 # --------------------------------------------------------------------------
 # Aufnahmename
 # --------------------------------------------------------------------------

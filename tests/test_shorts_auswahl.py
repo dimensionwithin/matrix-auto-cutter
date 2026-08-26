@@ -316,7 +316,14 @@ def test_zwei_saetze_ohne_ueberschneidung_geben_alle_kandidaten(tmp_path: Path) 
 
 
 def test_sechzig_prozent_ueberlappung_gilt_als_derselbe_kandidat(tmp_path: Path) -> None:
-    """Kuerzere Dauer 10 s, Ueberlappung 6 s - mehr als die Haelfte, also derselbe."""
+    """Kuerzere Dauer 10 s, Ueberlappung 6 s - mehr als die Haelfte, also derselbe.
+
+    Ersetzt am 26.8. den gleichnamigen Test, der die alte Regel prueft:
+    dort ueberschrieb die laengere Fassung Index 1 (``start_ms`` 4000,
+    Titel "Zweiter, laenger", ``aus_laeufen == [1, 2]``). Dieselbe
+    Ueberlappungsrechnung, dieselbe Aussage "das ist derselbe Ausschnitt" -
+    nur die Folge ist jetzt eine andere: anhaengen statt ersetzen.
+    """
     _laufdatei(tmp_path, 1, [_kandidat(1, start_ms=0, end_ms=10_000, titel="Erster")])
     _laufdatei(
         tmp_path,
@@ -328,12 +335,128 @@ def test_sechzig_prozent_ueberlappung_gilt_als_derselbe_kandidat(tmp_path: Path)
     kandidaten = ergebnis["kandidaten"]
     assert isinstance(kandidaten, list)
 
-    assert len(kandidaten) == 1
-    # Der Index bleibt der des ersten Satzes, die laengere Fassung gewinnt.
+    # Zwei Eintraege: der kurze bleibt, der laengere kommt dazu.
+    assert len(kandidaten) == 2
     assert kandidaten[0]["index"] == 1
-    assert (kandidaten[0]["start_ms"], kandidaten[0]["end_ms"]) == (4_000, 18_000)
-    assert kandidaten[0]["titel"] == "Zweiter, laenger"
-    assert kandidaten[0]["aus_laeufen"] == [1, 2]
+    assert (kandidaten[0]["start_ms"], kandidaten[0]["end_ms"]) == (0, 10_000)
+    assert kandidaten[0]["titel"] == "Erster"
+    assert "laengere_fassung_von" not in kandidaten[0]
+    assert kandidaten[1]["index"] == 2
+    assert (kandidaten[1]["start_ms"], kandidaten[1]["end_ms"]) == (4_000, 18_000)
+    assert kandidaten[1]["titel"] == "Zweiter, laenger"
+    assert kandidaten[1]["laengere_fassung_von"] == 1
+    assert kandidaten[1]["aus_lauf"] == 2
+    # ``aus_laeufen`` gibt es nicht mehr - kein Eintrag stammt aus zwei Laeufen.
+    assert all("aus_laeufen" not in eintrag for eintrag in kandidaten)
+
+
+def test_kuerzere_fassung_aus_spaeterem_lauf_faellt_weg(tmp_path: Path) -> None:
+    """Gleicher Ausschnitt, aber nicht laenger - dann kommt nichts dazu."""
+    _laufdatei(tmp_path, 1, [_kandidat(1, start_ms=0, end_ms=20_000, titel="Lang")])
+    _laufdatei(tmp_path, 2, [_kandidat(1, start_ms=2_000, end_ms=14_000, titel="Kurz")])
+
+    kandidaten = auswahl.fuehre_zusammen(auswahl.lade_laufdateien(tmp_path))["kandidaten"]
+    assert isinstance(kandidaten, list)
+
+    assert [k["index"] for k in kandidaten] == [1]
+    assert kandidaten[0]["titel"] == "Lang"
+    assert (kandidaten[0]["start_ms"], kandidaten[0]["end_ms"]) == (0, 20_000)
+
+
+def test_laengere_fassungen_kommen_hinter_die_neuen_kandidaten(tmp_path: Path) -> None:
+    """Erst die neuen Ausschnitte eines Laufs, dann seine laengeren Fassungen.
+
+    Das ist die Reihenfolge, in der der Bestand ``2026-08-25 15-14-00``
+    steht: 1-39 aus Lauf 1, 40-63 die neuen aus Lauf 2, danach die
+    laengeren Fassungen. Waeren sie verschraenkt, verschoeben sich die
+    Indizes der neuen Kandidaten je nachdem, an welcher Stelle im Lauf ein
+    Doppelgaenger auftaucht.
+    """
+    _laufdatei(
+        tmp_path,
+        1,
+        [
+            _kandidat(1, start_ms=0, end_ms=10_000, titel="A"),
+            _kandidat(2, start_ms=100_000, end_ms=110_000, titel="B"),
+        ],
+    )
+    _laufdatei(
+        tmp_path,
+        2,
+        [
+            # Laengere Fassung von 1 - steht VORN im Lauf, landet trotzdem hinten.
+            _kandidat(1, start_ms=0, end_ms=25_000, titel="A lang"),
+            _kandidat(2, start_ms=300_000, end_ms=310_000, titel="Neu"),
+            _kandidat(3, start_ms=100_000, end_ms=130_000, titel="B lang"),
+        ],
+    )
+
+    kandidaten = auswahl.fuehre_zusammen(auswahl.lade_laufdateien(tmp_path))["kandidaten"]
+    assert isinstance(kandidaten, list)
+
+    assert [k["index"] for k in kandidaten] == [1, 2, 3, 4, 5]
+    assert [k["titel"] for k in kandidaten] == ["A", "B", "Neu", "A lang", "B lang"]
+    assert [k.get("laengere_fassung_von") for k in kandidaten] == [None, None, None, 1, 2]
+
+
+def test_urteile_bleiben_nach_zusammenfuehrung_gueltig(tmp_path: Path) -> None:
+    """Die eigentliche Probe: kein Urteil des Grundsatzes weicht danach ab.
+
+    Vor dem 26.8. meldete ``pruefe_uebereinstimmung`` hier drei
+    Abweichungen (``start_ms``, ``end_ms``, ``titel`` von Kandidat 2), weil
+    die laengere Fassung in Index 2 hineingeschrieben wurde.
+    """
+    _laufdatei(
+        tmp_path,
+        1,
+        [
+            _kandidat(1, start_ms=0, end_ms=10_000, titel="Erster"),
+            _kandidat(2, start_ms=50_000, end_ms=60_000, titel="Zweiter"),
+        ],
+    )
+    _laufdatei(
+        tmp_path,
+        2,
+        [
+            _kandidat(1, start_ms=48_000, end_ms=75_000, titel="Zweiter, laenger"),
+            _kandidat(2, start_ms=200_000, end_ms=210_000, titel="Neu"),
+        ],
+    )
+    urteile = {
+        1: _urteil(1, "ja", start_ms=0, end_ms=10_000, titel="Erster"),
+        2: _urteil(2, "nein", start_ms=50_000, end_ms=60_000, titel="Zweiter"),
+    }
+
+    auswahl.schreibe_kandidatensatz(
+        tmp_path / "kandidaten.json",
+        auswahl.fuehre_zusammen(auswahl.lade_laufdateien(tmp_path)),
+    )
+    danach = load_candidates(tmp_path / "kandidaten.json")
+
+    assert auswahl.pruefe_uebereinstimmung(danach, urteile) == []
+    assert [k.index for k in danach] == [1, 2, 3, 4]
+    assert [k.titel for k in danach] == ["Erster", "Zweiter", "Neu", "Zweiter, laenger"]
+
+
+def test_veraenderte_indizes_meldet_nur_umgedeutete_indizes() -> None:
+    """Neue Indizes sind unbedenklich, umgedeutete und fehlende nicht."""
+    alt = [
+        _kandidat(1, start_ms=0, end_ms=10_000, titel="A"),
+        _kandidat(2, start_ms=50_000, end_ms=60_000, titel="B"),
+        _kandidat(3, start_ms=90_000, end_ms=99_000, titel="C"),
+    ]
+    neu = [
+        # 1 unveraendert, nur die Buchfuehrung kommt dazu.
+        {**_kandidat(1, start_ms=0, end_ms=10_000, titel="A"), "aus_lauf": 1},
+        # 2 umgedeutet.
+        _kandidat(2, start_ms=48_000, end_ms=75_000, titel="B, laenger"),
+        # 3 fehlt ganz.
+        # 4 ist neu - kein Urteil kann darauf zeigen.
+        {**_kandidat(4, start_ms=200_000, end_ms=210_000), "laengere_fassung_von": 2},
+    ]
+
+    assert auswahl.veraenderte_indizes(alt, neu) == [2, 3]
+    assert auswahl.veraenderte_indizes(alt, alt) == []
 
 
 def test_vierzig_prozent_ueberlappung_gilt_als_verschieden(tmp_path: Path) -> None:

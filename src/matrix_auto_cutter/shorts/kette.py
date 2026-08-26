@@ -74,6 +74,10 @@ SCHEMA_VERSION = "1.0"
 CODE_ERFOLG = 0
 CODE_KEINE_AUFNAHME = 2
 CODE_STUFE_GESCHEITERT = 5
+# Dieselbe Zahl wie ``auswahl._CODE_URTEILE_VORHANDEN``: derselbe Grund,
+# dieselbe Meldung - egal ob ueber Stufe 6 oder ueber
+# ``auswahl --zusammenfuehren`` zusammengefuehrt wird.
+CODE_URTEILE_VORHANDEN = 9
 
 # Belegt in ORCHESTRATOR-UEBERGABE-2026-08-25.md: die Transkription mit vier
 # Threads braucht rund das 1,27-fache der Audiodauer. Der Wert ist eine
@@ -547,8 +551,62 @@ def fuehre_zusammen(job_dir: Path) -> Path:
             f"Zusammenfuehrung in {job_dir} gescheitert - {fehler}",
             CODE_STUFE_GESCHEITERT,
         ) from fehler
+    _pruefe_urteile_bleiben_gueltig(job_dir, ziel, payload)
     auswahl.schreibe_kandidatensatz(ziel, payload)
     return ziel
+
+
+def _pruefe_urteile_bleiben_gueltig(
+    job_dir: Path, ziel: Path, payload: dict[str, object]
+) -> None:
+    r"""Halte an, wenn die neue ``kandidaten.json`` einen beurteilten Index umdeutet.
+
+    Bis zum 26.8. hatte nur der Weg ueber ``auswahl --zusammenfuehren``
+    diese Sperre (Code 9); Stufe 6 schrieb ``kandidaten.json`` ungefragt
+    neu. Damit fuehrte derselbe Bestand je nach Weg zu einem anderen
+    Ergebnis - und der bequemere Weg war der gefaehrlichere.
+
+    Gesperrt wird aber nicht pauschal, sondern nach Befund. Der Weg ueber
+    die Befehlszeile kennt den kuenftigen Inhalt nicht und muss deshalb
+    beim blossen Zusammentreffen von Datei und Urteilen anhalten; hier
+    liegt die neue Fassung bereits gerechnet vor, also laesst sich die
+    eigentliche Frage stellen: bedeutet jeder Index, den es schon gab,
+    danach noch dasselbe? Das beantwortet
+    :func:`auswahl.veraenderte_indizes`, indem es Alt und Neu je Index
+    inhaltlich vergleicht (ohne die Buchfuehrungsfelder ``aus_lauf``,
+    ``aus_laeufen``, ``laengere_fassung_von``). Ist die Liste leer, laeuft
+    die Stufe durch - nach der Regel aus ``auswahl.fuehre_zusammen`` ist
+    das der Normalfall, denn ein vorhandener Kandidat wird dort nicht mehr
+    angefasst. Nur wenn sie es nicht ist, endet die Kette.
+
+    Ohne Urteilsdatei oder ohne vorhandene ``kandidaten.json`` gibt es
+    nichts zu schuetzen - dann wird ohne Vergleich geschrieben.
+    """
+    if not ziel.is_file():
+        return
+    urteilsdatei = auswahl.juengste_urteilsdatei(job_dir)
+    if urteilsdatei is None:
+        return
+    alt, _ = auswahl.lies_kandidaten_rohdaten(ziel)
+    neu = payload.get("kandidaten")
+    if not isinstance(neu, list):
+        raise KetteFehlschlag(
+            "stufe_gescheitert",
+            f"Zusammenfuehrung in {job_dir} ergab keine Kandidatenliste",
+            CODE_STUFE_GESCHEITERT,
+        )
+    veraendert = auswahl.veraenderte_indizes(
+        alt, [eintrag for eintrag in neu if isinstance(eintrag, dict)]
+    )
+    if not veraendert:
+        return
+    namen = ", ".join(str(index) for index in veraendert)
+    raise KetteFehlschlag(
+        "urteile_vorhanden",
+        f"{ziel.name} liegt vor und {urteilsdatei.name} zeigt auf dessen Nummerierung, "
+        f"aber die neue Zusammenfuehrung deutet die Indizes {namen} um - nichts geschrieben",
+        CODE_URTEILE_VORHANDEN,
+    )
 
 
 # --------------------------------------------------------------------------

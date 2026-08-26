@@ -138,16 +138,35 @@ def fuehre_zusammen(saetze: list[tuple[int, dict[str, object]]]) -> dict[str, ob
     (``judge_server.Urteil``, ``auswahl.pruefe_uebereinstimmung``). Wer bei
     der Zusammenfuehrung neu nummeriert, laesst jedes vorhandene Urteil auf
     einen fremden Kandidaten zeigen - und zwar lautlos, denn eine Zahl
-    passt immer auf eine Zahl. Deshalb:
+    passt immer auf eine Zahl.
 
-    * Der Satz mit der KLEINSTEN Laufnummer gibt die Nummerierung vor;
-      seine Kandidaten behalten ihren ``index`` unveraendert.
-    * Ein Kandidat aus einem spaeteren Lauf, der einem vorhandenen gleicht
-      (:func:`gleicher_kandidat`), wird NICHT neu aufgenommen. Ist seine
-      Fassung laenger, ersetzt er ``start_ms``, ``end_ms``, ``titel`` und
-      ``begruendung`` des vorhandenen - der ``index`` bleibt.
-    * Ein Kandidat ohne Entsprechung wird hinten angehaengt und bekommt den
+    Ein Index ist ein Versprechen. Wer seinen Inhalt aendert, macht jedes
+    Urteil darauf ungueltig - und Urteilszeit ist das einzige Artefakt
+    dieser Kette, das sich nicht neu erzeugen laesst: Aufnahme, Transkript,
+    Wortliste, Zerlegung und Bau laufen jederzeit wieder, ein einmal
+    gefaelltes Urteil nicht. Deshalb wird ein Kandidat aus dem Grundsatz
+    NIE inhaltlich veraendert - weder Grenzen noch Titel noch Begruendung.
+    Bis zum 26.8. ersetzte diese Stelle die laengere Fassung in den
+    vorhandenen Eintrag hinein; sechs beurteilte Indizes (10, 14, 16, 18,
+    33, 34) meinten danach einen anderen Ausschnitt als das Urteil auf
+    ihnen. Das ist der Fehler, den die folgende Regel abstellt:
+
+    * Der Satz mit der KLEINSTEN Laufnummer gibt den Grundsatz vor; seine
+      Kandidaten behalten ``index`` UND Inhalt unveraendert.
+    * Ein Kandidat aus einem spaeteren Lauf ohne Entsprechung
+      (:func:`gleicher_kandidat`) wird hinten angehaengt und bekommt den
       naechsten freien Index.
+    * Gleicht er einem vorhandenen und ist seine Fassung LAENGER, wird er
+      ebenfalls hinten angehaengt - als eigener Kandidat mit eigenem Index
+      und dem Feld ``laengere_fassung_von`` (Index des Gegenstuecks). Der
+      kuerzere behaelt Index, Inhalt und Urteil; der Nutzer sieht beide und
+      entscheidet.
+    * Gleicht er einem vorhandenen und ist nicht laenger, faellt er weg.
+
+    Die laengeren Fassungen eines Laufs kommen dabei hinter dessen neue
+    Kandidaten - erst die 24 neuen, dann die 6 laengeren, nicht
+    verschraenkt. So bleibt die Reihenfolge dieselbe, gleich ob ein Lauf in
+    einem Rutsch oder nachtraeglich zusammengefuehrt wird.
 
     Bei EINEM Satz ist das Ergebnis eine Kopie mit Wurzelfeldern - kein
     Sonderfall im Code, sondern derselbe Weg mit einer leeren zweiten
@@ -169,6 +188,7 @@ def fuehre_zusammen(saetze: list[tuple[int, dict[str, object]]]) -> dict[str, ob
         ergebnis.append(kandidat)
 
     for nummer, satz in geordnet[1:]:
+        nachtraege: list[tuple[dict[str, object], int]] = []
         for roh in _kandidatenliste(satz):
             vorhanden = next(
                 (eintrag for eintrag in ergebnis if gleicher_kandidat(eintrag, roh)), None
@@ -180,8 +200,18 @@ def fuehre_zusammen(saetze: list[tuple[int, dict[str, object]]]) -> dict[str, ob
                 kandidat["aus_lauf"] = nummer
                 ergebnis.append(kandidat)
                 continue
-            if _ist_laenger(roh, vorhanden):
-                _ersetze_fassung(vorhanden, roh, nummer)
+            if not _ist_laenger(roh, vorhanden):
+                continue
+            gegenstueck = vorhanden.get("index")
+            if not isinstance(gegenstueck, int) or isinstance(gegenstueck, bool):
+                raise CandidatesSchemaError("Kandidat ohne ganzzahligen 'index'")
+            nachtraege.append((dict(roh), gegenstueck))
+        for kandidat, gegenstueck in nachtraege:
+            hoechster_index += 1
+            kandidat["index"] = hoechster_index
+            kandidat["aus_lauf"] = nummer
+            kandidat["laengere_fassung_von"] = gegenstueck
+            ergebnis.append(kandidat)
 
     laeufe = [nummer for nummer, _ in geordnet]
     payload: dict[str, object] = {
@@ -206,32 +236,59 @@ def _kandidatenliste(satz: dict[str, object]) -> list[dict[str, object]]:
     return [eintrag for eintrag in liste if isinstance(eintrag, dict)]
 
 
-def _ersetze_fassung(
-    vorhanden: dict[str, object], laenger: dict[str, object], nummer: int
-) -> None:
-    """Uebernimm die laengere Fassung - Zeiten, Titel, Begruendung; der Index bleibt.
+_BUCHFUEHRUNGSFELDER = frozenset({"aus_lauf", "aus_laeufen", "laengere_fassung_von"})
 
-    ``dauer_ms`` wird mitgezogen, wo es dasteht: der Zerlegungslauf
-    schreibt es als abgeleitete Zahl neben ``start_ms``/``end_ms``, und ein
-    stehengebliebenes ``dauer_ms`` widerspraeche nach dem Ersetzen den
-    beiden Zeiten, aus denen es stammt.
+
+def _inhalt(kandidat: dict[str, object]) -> dict[str, object]:
+    """Der Kandidat ohne die Felder, die nur die Zusammenfuehrung selbst fuehrt.
+
+    ``aus_lauf``, ``aus_laeufen`` und ``laengere_fassung_von`` sagen, WOHER
+    ein Eintrag kommt, nicht WAS er meint. Sie duerfen sich aendern, ohne
+    dass ein Urteil darauf falsch wird - alles andere nicht.
     """
-    start, ende = _zeitbereich(laenger)
-    vorhanden["start_ms"] = start
-    vorhanden["end_ms"] = ende
-    for feld in ("titel", "begruendung"):
-        if feld in laenger:
-            vorhanden[feld] = laenger[feld]
-    if "dauer_ms" in vorhanden or "dauer_ms" in laenger:
-        vorhanden["dauer_ms"] = ende - start
-    bisher = vorhanden.get("aus_laeufen")
-    laeufe = list(bisher) if isinstance(bisher, list) else []
-    erster = vorhanden.get("aus_lauf")
-    if not laeufe and isinstance(erster, int):
-        laeufe = [erster]
-    if nummer not in laeufe:
-        laeufe.append(nummer)
-    vorhanden["aus_laeufen"] = laeufe
+    return {
+        schluessel: wert
+        for schluessel, wert in kandidat.items()
+        if schluessel not in _BUCHFUEHRUNGSFELDER
+    }
+
+
+def veraenderte_indizes(
+    alt: list[dict[str, object]], neu: list[dict[str, object]]
+) -> list[int]:
+    r"""Melde jeden Index, den ``neu`` gegenueber ``alt`` inhaltlich anfasst.
+
+    Gefragt ist nicht "sind die beiden Saetze gleich", sondern die engere
+    Frage, an der ein Urteil haengt: bedeutet jeder Index, den es schon
+    gab, danach noch dasselbe? Ein Index, der in ``neu`` dazukommt, ist
+    unbedenklich - auf ihn zeigt kein Urteil. Ein Index, der in ``neu``
+    FEHLT, ist es nicht: das Urteil darauf zeigt danach ins Leere.
+
+    Verglichen wird der Inhalt ohne Buchfuehrungsfelder
+    (:func:`_inhalt`); die Reihenfolge in der Liste spielt keine Rolle.
+    """
+    alt_nach_index = _nach_index(alt)
+    neu_nach_index = _nach_index(neu)
+    veraendert: list[int] = []
+    for index in sorted(alt_nach_index):
+        gegenstueck = neu_nach_index.get(index)
+        if gegenstueck is None or _inhalt(gegenstueck) != _inhalt(alt_nach_index[index]):
+            veraendert.append(index)
+    return veraendert
+
+
+def _nach_index(kandidaten: list[dict[str, object]]) -> dict[int, dict[str, object]]:
+    """Die Kandidaten nach ``index``; Eintraege ohne ganzzahligen Index fallen weg.
+
+    Sie fallen weg statt zu werfen: hier wird verglichen, nicht geprueft -
+    das Schema durchzusetzen ist Sache von ``candidates.parse_candidates``.
+    """
+    nach_index: dict[int, dict[str, object]] = {}
+    for kandidat in kandidaten:
+        index = kandidat.get("index")
+        if isinstance(index, int) and not isinstance(index, bool):
+            nach_index[index] = kandidat
+    return nach_index
 
 
 def juengste_urteilsdatei(job_dir: Path) -> Path | None:
@@ -406,7 +463,7 @@ def _polarisierend_paar(
     return paar
 
 
-def _lies_kandidaten_rohdaten(pfad: Path) -> tuple[list[dict[str, object]], dict[str, object]]:
+def lies_kandidaten_rohdaten(pfad: Path) -> tuple[list[dict[str, object]], dict[str, object]]:
     """Lies ``kandidaten.json`` roh - fuer Wurzelfelder und Kandidaten-Zusatzfelder.
 
     ``load_candidates``/``parse_candidates`` schneiden sowohl Wurzelfelder wie
@@ -656,7 +713,7 @@ def main(argv: list[str] | None = None) -> int:
     schreibe_bauliste(output_path, payload)
 
     if not args.keine_trefferquote:
-        kandidaten_roh, wurzelfelder = _lies_kandidaten_rohdaten(kandidaten_path)
+        kandidaten_roh, wurzelfelder = lies_kandidaten_rohdaten(kandidaten_path)
         video_name = str(wurzelfelder["video_name"])
         lauf = wurzelfelder["lauf"]
         assert isinstance(lauf, int | str) or lauf is None
