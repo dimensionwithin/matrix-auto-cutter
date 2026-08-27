@@ -42,6 +42,11 @@ BAULISTE_FILE_NAME = "bauliste.json"
 BUENDEL_FILE_NAME = "buendel.json"
 BUENDEL_ARTIFACT_TYPE = "matrix_auto_cutter_shorts_buendel"
 BUENDEL_SCHEMA_VERSION = "1.0"
+# So viele Gruppen traegt die Vorauswahl der Urteilsseite. Der Nutzer
+# veroeffentlicht 4 bis 10 Shorts je Aufnahme und hat dafuer 48 Stunden -
+# 15 Gruppen sind genug Auswahl dafuer und wenig genug, um sie in dem
+# Fenster wirklich durchzusehen.
+VORAUSWAHL_GROESSE = 15
 LAUFDATEI_GLOB = "kandidaten-lauf*.json"
 _LAUFDATEI_MUSTER = re.compile(r"^kandidaten-lauf(\d+)\.json$")
 TREFFERQUOTE_PFAD = Path("labels/repeat/trefferquote.json")
@@ -300,12 +305,26 @@ def fuehre_zusammen(saetze: list[tuple[int, dict[str, object]]]) -> dict[str, ob
     payload["kandidaten"] = ergebnis
     payload["lauf"] = erste_nummer
     payload["laeufe"] = laeufe
-    payload["modelle"] = {
-        str(nummer): satz.get("modell", "unbekannt") for nummer, satz in geordnet
-    }
+    modelle = {str(nummer): _modellname(satz) for nummer, satz in geordnet}
+    payload["modelle"] = modelle
+    # ``modell`` bleibt zusaetzlich stehen, obwohl ``modelle`` dasselbe genauer
+    # sagt: alles, was nach der Zusammenfuehrung kommt, sucht das Wurzelfeld
+    # und nicht die Abbildung. Ohne diese Zeile hiessen die Sicherungen unter
+    # ``labels/repeat/`` ``…-unbekannt.json`` (siehe
+    # ``urteilslauf.sicherungsnamen``) - zwei solche Dateien liegen als Beleg
+    # im Bestand.
+    payload["modell"] = "+".join(modelle[str(nummer)] for nummer, _ in geordnet)
     payload["verworfene_verweise"] = verworfene_verweise
     payload["zusammengefuehrt_am"] = _jetzt()
     return payload
+
+
+def _modellname(satz: dict[str, object]) -> str:
+    """Das Modell eines Laufs - ``unbekannt``, wenn das Feld fehlt oder leer ist."""
+    wert = satz.get("modell")
+    if isinstance(wert, str) and wert.strip():
+        return wert.strip()
+    return "unbekannt"
 
 
 def _kandidatenliste(satz: dict[str, object]) -> list[dict[str, object]]:
@@ -467,6 +486,145 @@ def _ganzzahl(wert: object) -> int | None:
     return wert if isinstance(wert, int) and not isinstance(wert, bool) else None
 
 
+def _pruefe_vorauswahl(
+    gruppen: dict[int, list[tuple[int, dict[str, object]]]],
+) -> list[str]:
+    """Melde jede Unstimmigkeit an ``gruppen_rang`` und ``vorauswahl``.
+
+    Beide Felder sind FREIWILLIG: eine ``buendel.json`` aus der Zeit vor der
+    Vorauswahl traegt sie gar nicht, und das ist keine Abweichung - dann
+    zeigt die Urteilsseite wie bisher alle Gruppen in Nummernfolge. Erst
+    wenn EINE Gruppe sie traegt, muessen alle sie tragen: eine halbe
+    Vorauswahl waere schlimmer als keine, weil die Seite dann eine
+    Reihenfolge zeigte, die nur fuer einen Teil des Bestandes gilt.
+
+    Geprueft wird gegen ``gruppen``, die schon nach ``gruppe`` gebuendelte
+    Sicht aus :func:`pruefe_buendel` - so bleibt die Frage "tragen alle
+    Kandidaten einer Gruppe denselben Wert" ohne zweiten Durchlauf zu haben.
+    """
+    if not gruppen:
+        return []
+    meldungen: list[str] = []
+
+    mit_feld = [
+        gruppe
+        for gruppe, eintraege in gruppen.items()
+        if any("gruppen_rang" in eintrag for _, eintrag in eintraege)
+    ]
+    if not mit_feld:
+        return []
+    ohne_feld = sorted(set(gruppen) - set(mit_feld))
+    if ohne_feld:
+        namen = ", ".join(str(gruppe) for gruppe in ohne_feld)
+        meldungen.append(
+            f"Gruppe {namen}: 'gruppen_rang' fehlt, andere Gruppen tragen ihn - "
+            f"entweder alle oder keine"
+        )
+
+    # Je Gruppe genau ein Wert. Uneinheitliche Gruppen fallen fuer die
+    # Eindeutigkeits- und Lueckenpruefung heraus: ihr "der" Rang ist nicht
+    # bestimmt, und ein geratener Wert erzeugte Folgemeldungen, die vom
+    # eigentlichen Befund ablenken.
+    rang_je_gruppe: dict[int, int] = {}
+    for gruppe in sorted(gruppen):
+        eintraege = gruppen[gruppe]
+        raenge = [_ganzzahl(eintrag.get("gruppen_rang")) for _, eintrag in eintraege]
+        if any(rang is None for rang in raenge):
+            ohne = [
+                index
+                for (index, _), rang in zip(eintraege, raenge, strict=True)
+                if rang is None
+            ]
+            namen = ", ".join(str(index) for index in ohne)
+            meldungen.append(f"Gruppe {gruppe}: kein ganzzahliger 'gruppen_rang' bei {namen}")
+            continue
+        verschieden = sorted({rang for rang in raenge if rang is not None})
+        if len(verschieden) != 1:
+            namen = ", ".join(str(rang) for rang in verschieden)
+            meldungen.append(
+                f"Gruppe {gruppe}: 'gruppen_rang' uneinheitlich - {namen}; "
+                f"alle Kandidaten einer Gruppe tragen denselben Wert"
+            )
+            continue
+        rang_je_gruppe[gruppe] = verschieden[0]
+
+    vergeben = list(rang_je_gruppe.values())
+    doppelt = sorted({rang for rang in vergeben if vergeben.count(rang) > 1})
+    if doppelt:
+        namen = ", ".join(str(rang) for rang in doppelt)
+        meldungen.append(f"'gruppen_rang' {namen} doppelt vergeben")
+    fehlend = sorted(set(range(1, len(gruppen) + 1)) - set(vergeben))
+    if fehlend and not meldungen:
+        namen = ", ".join(str(rang) for rang in fehlend)
+        meldungen.append(
+            f"'gruppen_rang' {namen} fehlt - erwartet 1 bis {len(gruppen)}, lueckenlos"
+        )
+
+    meldungen.extend(_pruefe_vorauswahl_grenze(gruppen, rang_je_gruppe))
+    return meldungen
+
+
+def _pruefe_vorauswahl_grenze(
+    gruppen: dict[int, list[tuple[int, dict[str, object]]]],
+    rang_je_gruppe: dict[int, int],
+) -> list[str]:
+    """Melde eine Vorauswahl falscher Groesse oder mit einer schlechter gerangten Gruppe.
+
+    Der zweite Befund ist der wichtigere: eine Vorauswahl, die eine Gruppe
+    mit ``gruppen_rang`` 30 enthaelt und eine mit 4 auslaesst, ist kein
+    Zaehlfehler, sondern widerspricht sich selbst - dann sagt die Datei zwei
+    verschiedene Dinge darueber, was die besten Gruppen sind.
+    """
+    meldungen: list[str] = []
+    vorausgewaehlt: set[int] = set()
+    for gruppe in sorted(gruppen):
+        eintraege = gruppen[gruppe]
+        werte = {eintrag.get("vorauswahl") is True for _, eintrag in eintraege}
+        if len(werte) != 1:
+            meldungen.append(
+                f"Gruppe {gruppe}: 'vorauswahl' uneinheitlich - alle Kandidaten einer "
+                f"Gruppe tragen denselben Wert"
+            )
+            continue
+        if werte.pop():
+            vorausgewaehlt.add(gruppe)
+
+    erwartet = min(VORAUSWAHL_GROESSE, len(gruppen))
+    if len(vorausgewaehlt) != erwartet:
+        meldungen.append(
+            f"{len(vorausgewaehlt)} Gruppen mit 'vorauswahl' statt {erwartet} - "
+            f"erwartet min({VORAUSWAHL_GROESSE}, {len(gruppen)})"
+        )
+
+    uebrige = set(gruppen) - vorausgewaehlt
+    if vorausgewaehlt and uebrige and rang_je_gruppe:
+        schlechtester = max(
+            (rang_je_gruppe[gruppe] for gruppe in vorausgewaehlt if gruppe in rang_je_gruppe),
+            default=None,
+        )
+        bester_uebriger = min(
+            (rang_je_gruppe[gruppe] for gruppe in uebrige if gruppe in rang_je_gruppe),
+            default=None,
+        )
+        if (
+            schlechtester is not None
+            and bester_uebriger is not None
+            and schlechtester > bester_uebriger
+        ):
+            drinnen = sorted(
+                gruppe
+                for gruppe in vorausgewaehlt
+                if rang_je_gruppe.get(gruppe, 0) > bester_uebriger
+            )
+            namen = ", ".join(str(gruppe) for gruppe in drinnen)
+            meldungen.append(
+                f"Gruppe {namen} steht in der Vorauswahl, hat aber einen groesseren "
+                f"'gruppen_rang' als die nicht vorausgewaehlte Gruppe mit "
+                f"'gruppen_rang' {bester_uebriger}"
+            )
+    return meldungen
+
+
 def pruefe_buendel(
     kandidaten: list[dict[str, object]], buendel: list[dict[str, object]]
 ) -> list[str]:
@@ -479,9 +637,10 @@ def pruefe_buendel(
     Buendelung, die einen Index erfindet oder auslaesst, waere fuer die
     Auswahl unbrauchbar.
 
-    Fuenf Befunde, in dieser Reihenfolge: fehlende Indizes, ueberzaehlige
+    Sechs Befunde, in dieser Reihenfolge: fehlende Indizes, ueberzaehlige
     Indizes, Gruppen ohne genau eine Empfehlung, Raenge die doppelt
-    vorkommen oder fehlen, und Paare mit ``laengere_fassung_von``, die
+    vorkommen oder fehlen, eine unstimmige Vorauswahl
+    (:func:`_pruefe_vorauswahl`), und Paare mit ``laengere_fassung_von``, die
     auseinandergerissen wurden. Der letzte Befund ist der wichtigste - genau
     solche Paare zeigen dasselbe Material, und sie zu trennen hiesse den
     Nutzer zweimal ueber dieselbe Sache entscheiden zu lassen.
@@ -549,6 +708,8 @@ def pruefe_buendel(
             meldungen.append(
                 f"Gruppe {gruppe}: Rang {namen} fehlt - erwartet 1 bis {len(eintraege)}"
             )
+
+    meldungen.extend(_pruefe_vorauswahl(gruppen))
 
     for index in sorted(kandidaten_index):
         ziel = _ganzzahl(kandidaten_index[index].get("laengere_fassung_von"))
@@ -690,6 +851,7 @@ def lies_kandidaten_rohdaten(pfad: Path) -> tuple[list[dict[str, object]], dict[
         "kriterien_fassung": "unbekannt",
         "video_name": "unbekannt",
         "lauf": None,
+        "laeufe": [],
     }
     if isinstance(roh, dict):
         for feld in ("modell", "kriterien_fassung", "video_name"):
@@ -697,13 +859,33 @@ def lies_kandidaten_rohdaten(pfad: Path) -> tuple[list[dict[str, object]], dict[
             if isinstance(wert, str) and wert.strip():
                 wurzelfelder[feld] = wert
         wurzelfelder["lauf"] = roh.get("lauf")
+        wurzelfelder["laeufe"] = laeufe_kennung(roh)
     return kandidaten_roh, wurzelfelder
+
+
+def laeufe_kennung(wurzel: dict[str, object]) -> list[object]:
+    """Die Kennung eines Kandidatensatzes: ``laeufe``, ersatzweise ``[lauf]``.
+
+    Ein zusammengefuehrter Satz traegt ``laeufe`` (``fuehre_zusammen``), ein
+    einzelner Zerlegungslauf nur ``lauf``. Beides muss dieselbe Frage
+    beantworten koennen - "aus welchen Laeufen stammt das hier" -, sonst galt
+    der zusammengefuehrte Satz als Doppelgaenger des Laufes, dessen kleinste
+    Nummer er geerbt hat. Genau daran fehlte der Trefferquote-Eintrag vom
+    26. August 2026.
+    """
+    laeufe = wurzel.get("laeufe")
+    if isinstance(laeufe, list) and laeufe:
+        return list(laeufe)
+    lauf = wurzel.get("lauf")
+    return [] if lauf is None else [lauf]
 
 
 def trefferquote_eintrag(
     *,
     video_name: str,
     lauf: int | str | None,
+    laeufe: list[object] | None = None,
+    notiz: str = "",
     modell: str,
     kriterien_fassung: str,
     kandidaten: list[Candidate],
@@ -732,6 +914,10 @@ def trefferquote_eintrag(
     return {
         "video_name": video_name,
         "lauf": lauf,
+        # Beide Felder: ``laeufe`` ist die Kennung, ``lauf`` bleibt stehen,
+        # damit die zwei Alteintraege und die neuen dasselbe Schema haben.
+        "laeufe": list(laeufe) if laeufe is not None else ([] if lauf is None else [lauf]),
+        "notiz": notiz,
         "modell": modell,
         "kriterien_fassung": kriterien_fassung,
         "kandidaten_gesamt": gesamt,
@@ -752,9 +938,10 @@ def schreibe_trefferquote(pfad: Path, eintrag: dict[str, object]) -> None:
     """Haenge ``eintrag`` an ``trefferquote.json`` an - atomar, nie ueberschreibend.
 
     Existiert bereits ein Eintrag mit derselben Kombination aus
-    ``video_name`` und ``lauf``, passiert nichts - der Aufrufer (``main``)
+    ``video_name`` und ``laeufe``, passiert nichts - der Aufrufer (``main``)
     prueft das vorab und meldet es, damit ein Doppellauf nicht zweimal
-    zaehlt.
+    zaehlt. Die Kennung ist ``laeufe`` und nicht ``lauf``, siehe
+    :func:`_hat_bestehenden_eintrag`.
     """
     if pfad.is_file():
         try:
@@ -766,11 +953,12 @@ def schreibe_trefferquote(pfad: Path, eintrag: dict[str, object]) -> None:
     eintraege = bestehend.get("eintraege") if isinstance(bestehend, dict) else None
     if not isinstance(eintraege, list):
         eintraege = []
+    kennung = laeufe_kennung(eintrag)
     for vorhanden in eintraege:
         if (
             isinstance(vorhanden, dict)
             and vorhanden.get("video_name") == eintrag.get("video_name")
-            and vorhanden.get("lauf") == eintrag.get("lauf")
+            and laeufe_kennung(vorhanden) == kennung
         ):
             return
     eintraege.append(eintrag)
@@ -781,7 +969,21 @@ def schreibe_trefferquote(pfad: Path, eintrag: dict[str, object]) -> None:
     _write_json_atomically(pfad, payload)
 
 
-def _hat_bestehenden_eintrag(pfad: Path, *, video_name: str, lauf: int | str | None) -> bool:
+def _hat_bestehenden_eintrag(
+    pfad: Path, *, video_name: str, laeufe: list[object]
+) -> bool:
+    """Sage, ob fuer diese Aufnahme und diese Laufkombination schon ein Eintrag liegt.
+
+    Verglichen wird ``laeufe``, nicht ``lauf``: ein zusammengefuehrter Satz
+    aus Lauf 1 und 2 traegt ``lauf`` 1 (die kleinste Nummer) und waere sonst
+    nicht vom reinen Lauf 1 zu unterscheiden - er misst aber einen anderen
+    Kandidatenbestand und gehoert als eigener Eintrag in die Reihe.
+
+    Ein Alteintrag ohne ``laeufe`` gilt als ``[lauf]`` und blockiert damit
+    weiterhin genau seinen eigenen Fall. Umgeschrieben wird er nicht: die
+    Trefferquote ist eine Reihe von Messungen, und eine nachtraeglich
+    ergaenzte Messung waere keine mehr.
+    """
     if not pfad.is_file():
         return False
     try:
@@ -794,7 +996,7 @@ def _hat_bestehenden_eintrag(pfad: Path, *, video_name: str, lauf: int | str | N
     return any(
         isinstance(vorhanden, dict)
         and vorhanden.get("video_name") == video_name
-        and vorhanden.get("lauf") == lauf
+        and laeufe_kennung(vorhanden) == laeufe
         for vorhanden in eintraege
     )
 
@@ -852,6 +1054,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--urteile", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--keine-trefferquote", action="store_true")
+    parser.add_argument(
+        "--notiz",
+        default="",
+        metavar="TEXT",
+        help=(
+            "Freitext am Trefferquote-Eintrag, etwa um einen Lauf als nicht "
+            "repraesentativ zu vermerken. Wird nur durchgereicht, nicht ausgewertet."
+        ),
+    )
     parser.add_argument(
         "--zusammenfuehren",
         action="store_true",
@@ -918,9 +1129,11 @@ def main(argv: list[str] | None = None) -> int:
         video_name = str(wurzelfelder["video_name"])
         lauf = wurzelfelder["lauf"]
         assert isinstance(lauf, int | str) or lauf is None
-        if _hat_bestehenden_eintrag(TREFFERQUOTE_PFAD, video_name=video_name, lauf=lauf):
+        laeufe = wurzelfelder["laeufe"]
+        assert isinstance(laeufe, list)
+        if _hat_bestehenden_eintrag(TREFFERQUOTE_PFAD, video_name=video_name, laeufe=laeufe):
             print(
-                f"Trefferquote-Eintrag fuer video_name={video_name!r} lauf={lauf!r} "
+                f"Trefferquote-Eintrag fuer video_name={video_name!r} laeufe={laeufe!r} "
                 f"existiert bereits in {TREFFERQUOTE_PFAD} - nichts angehaengt"
             )
         else:
@@ -934,6 +1147,8 @@ def main(argv: list[str] | None = None) -> int:
             eintrag = trefferquote_eintrag(
                 video_name=video_name,
                 lauf=lauf,
+                laeufe=laeufe,
+                notiz=str(args.notiz),
                 modell=str(wurzelfelder["modell"]),
                 kriterien_fassung=str(wurzelfelder["kriterien_fassung"]),
                 kandidaten=kandidaten,

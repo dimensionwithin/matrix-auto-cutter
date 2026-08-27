@@ -355,6 +355,8 @@ class BuendelGruppe:
     empfohlen: int
     begruendung: str
     indizes: tuple[int, ...]
+    gruppen_rang: int | None = None
+    vorauswahl: bool = True
 
     @property
     def weitere(self) -> tuple[int, ...]:
@@ -380,6 +382,15 @@ def baue_gruppen(buendel: Sequence[Mapping[str, object]]) -> list[BuendelGruppe]
     ``projekt``, ``thema`` und ``begruendung`` der Ueberschrift stammen vom
     EMPFOHLENEN Eintrag: er ist der, den der Nutzer zuerst sieht, und seine
     ``begruendung`` sagt, warum gerade er vorgeschlagen wird.
+
+    Traegt die Buendelung ``gruppen_rang`` (Auftrag vorauswahl-verfall), wird
+    stattdessen danach sortiert: die staerkste Gruppe zuerst. Das ist der
+    ganze Unterschied - die Gruppennummer bleibt unveraendert an der Gruppe
+    haengen und wird weiterhin angezeigt, damit ein Verweis auf "Gruppe 12"
+    dieselbe Gruppe meint wie in ``buendel.json``. Fehlt das Feld auch nur
+    bei einer Gruppe, bleibt es bei der Nummernfolge: eine halb gerangte
+    Anzeige waere schlechter als die alte, weil ihre Reihenfolge dann nichts
+    mehr bedeutete.
     """
     nach_gruppe: dict[int, list[Mapping[str, object]]] = {}
     for eintrag in buendel:
@@ -410,8 +421,12 @@ def baue_gruppen(buendel: Sequence[Mapping[str, object]]) -> list[BuendelGruppe]
                 empfohlen=empfohlen,
                 begruendung=str(empfohlen_eintrag.get("begruendung", "")),
                 indizes=tuple(indizes),
+                gruppen_rang=_ganzzahl(empfohlen_eintrag.get("gruppen_rang")),
+                vorauswahl=empfohlen_eintrag.get("vorauswahl") is not False,
             )
         )
+    if all(gruppe.gruppen_rang is not None for gruppe in gruppen):
+        gruppen.sort(key=lambda gruppe: (gruppe.gruppen_rang or 0, gruppe.nummer))
     return gruppen
 
 
@@ -423,6 +438,8 @@ def _gruppe_to_js_dict(gruppe: BuendelGruppe) -> dict[str, object]:
         "empfohlen": gruppe.empfohlen,
         "begruendung": html.escape(gruppe.begruendung),
         "indizes": list(gruppe.indizes),
+        "gruppen_rang": gruppe.gruppen_rang,
+        "vorauswahl": gruppe.vorauswahl,
     }
 
 
@@ -694,6 +711,18 @@ _TEMPLATE = """<!doctype html>
     border: 1px dashed var(--niedrig);
     border-radius: 8px;
   }
+  /* Vorauswahl (Auftrag vorauswahl-verfall): der Rest steht aufklappbar
+     unter der Vorauswahl, sichtbar als eigene Zeile - nicht versteckt. */
+  .uebrige-gruppen > summary {
+    cursor: pointer;
+    padding: 0.7rem 1rem;
+    font-size: 0.9rem;
+    color: var(--muted);
+    border: 1px dashed var(--border);
+    border-radius: 10px;
+  }
+  .uebrige-gruppen[open] > summary { margin-bottom: 1rem; }
+  .uebrige-gruppen > .gruppe { margin-bottom: 1rem; }
   .gruppe {
     border: 1px solid var(--border);
     border-radius: 12px;
@@ -798,6 +827,24 @@ ENTRIES.forEach((entry, i) => { posByIndex[entry.index] = i; });
 
 function gruppenModus() { return GRUPPEN.length > 0; }
 
+// Vorauswahl (Auftrag vorauswahl-verfall): eine aeltere buendel.json kennt
+// weder gruppen_rang noch vorauswahl. Dann ist die Vorauswahl NICHT aktiv,
+// und Anzeige, Zaehler und gefuehrte Sitzung verhalten sich genau wie vorher
+// - alle Gruppen, in Nummernfolge, kein Aufklapper.
+function vorauswahlAktiv() {
+  return GRUPPEN.some((g) => g.gruppen_rang !== null && g.gruppen_rang !== undefined);
+}
+
+// Die Gruppen, ueber die gezaehlt und gefuehrt wird. Ohne Vorauswahl sind
+// das alle - so muss keine der drei Stellen unten zwei Faelle kennen.
+function vorauswahlGruppen() {
+  return vorauswahlAktiv() ? GRUPPEN.filter((g) => g.vorauswahl) : GRUPPEN;
+}
+
+function uebrigeGruppen() {
+  return vorauswahlAktiv() ? GRUPPEN.filter((g) => !g.vorauswahl) : [];
+}
+
 // Gefuehrte Sitzung (Auftrag 24): eine Warteschlange offener Kandidaten in
 // Anzeige-Reihenfolge. "Spaeter" reiht einmal ans Ende ein - deferCount haelt
 // das je Kandidat fest, nur fuer die Dauer dieser Sitzung (kein Serverfeld).
@@ -814,7 +861,12 @@ function buildInitialQueue() {
     // hiesse, zu einer unsichtbaren Karte zu scrollen und ein Video
     // abzuspielen, das niemand sieht. Von Hand bedienbar bleiben sie
     // vollstaendig - aufgeklappt wie jede andere Karte.
-    return GRUPPEN
+    // Nur die VORAUSGEWAEHLTEN offenen Gruppen: der Nutzer veroeffentlicht
+    // 4 bis 10 Shorts und hat 48 Stunden. Eine Sitzung, die ihn durch alle
+    // 47 Gruppen fuehrt, verbraucht das Fenster fuer Entscheidungen, die er
+    // am Ende nicht braucht. Die uebrigen bleiben aufklappbar und von Hand
+    // vollstaendig bedienbar.
+    return vorauswahlGruppen()
       .filter((g) => !gruppeEntschieden(g))
       .map((g) => posByIndex[g.empfohlen])
       .filter((i) => i !== undefined);
@@ -926,11 +978,20 @@ function updateProgress() {
     // Im Gruppenmodus zaehlt die Gruppe, nicht der Kandidat: der Nutzer
     // faellt je Gruppe EINE Entscheidung, und "47 von 69 beurteilt" saehe
     // nach Rueckstand aus, wo keiner ist.
-    const entschieden = GRUPPEN.filter(gruppeEntschieden).length;
-    const offen = GRUPPEN.length - entschieden;
-    document.getElementById("progress").textContent =
-      entschieden + " von " + GRUPPEN.length + " Gruppen entschieden, " + offen + " offen"
-      + " (" + judged + " von " + ENTRIES.length + " Kandidaten beurteilt)";
+    // Gezaehlt wird die VORAUSWAHL, nicht der ganze Bestand: "3 von 47" saehe
+    // nach Rueckstand aus, wo der Nutzer in Wahrheit schon ein Fuenftel
+    // seines Arbeitsvorrats erledigt hat. Die Gesamtzahl steht trotzdem
+    // daneben, damit niemand meint, es gaebe nur 15 Gruppen.
+    const vorauswahl = vorauswahlGruppen();
+    const entschieden = vorauswahl.filter(gruppeEntschieden).length;
+    const offen = vorauswahl.length - entschieden;
+    let text =
+      entschieden + " von " + vorauswahl.length + " Gruppen entschieden, " + offen + " offen";
+    if (vorauswahlAktiv()) {
+      text += " (Vorauswahl; " + GRUPPEN.length + " Gruppen insgesamt)";
+    }
+    text += " (" + judged + " von " + ENTRIES.length + " Kandidaten beurteilt)";
+    document.getElementById("progress").textContent = text;
     GRUPPEN.forEach((gruppe) => {
       const el = document.getElementById("gruppe-" + gruppe.nummer);
       if (el) el.classList.toggle("entschieden", gruppeEntschieden(gruppe));
@@ -1272,12 +1333,36 @@ function buildGruppe(gruppe) {
   return box;
 }
 
+function buildUebrige(uebrige) {
+  // Aufklappbar, nicht weggelassen: die Vorauswahl ist eine Lesereihenfolge
+  // und keine Aussortierung. Die Karten werden ERST BEIM AUFKLAPPEN gebaut -
+  // 32 Gruppen mit je einem <video> im Vorrat kosten Ladezeit fuer etwas,
+  // das der Nutzer in den meisten Sitzungen gar nicht ansieht.
+  const details = document.createElement("details");
+  details.className = "uebrige-gruppen";
+  const summary = document.createElement("summary");
+  summary.textContent = uebrige.length === 1
+    ? "1 weitere Gruppe anzeigen"
+    : uebrige.length + " weitere Gruppen anzeigen";
+  details.appendChild(summary);
+  let gebaut = false;
+  details.addEventListener("toggle", () => {
+    if (!details.open || gebaut) return;
+    gebaut = true;
+    uebrige.forEach((gruppe) => details.appendChild(buildGruppe(gruppe)));
+    updateProgress();
+  });
+  return details;
+}
+
 async function render() {
   const restored = await loadRestoredUrteile();
   applyRestored(restored);
   const container = document.getElementById("cards");
   if (gruppenModus()) {
-    GRUPPEN.forEach((gruppe) => container.appendChild(buildGruppe(gruppe)));
+    vorauswahlGruppen().forEach((gruppe) => container.appendChild(buildGruppe(gruppe)));
+    const uebrige = uebrigeGruppen();
+    if (uebrige.length > 0) container.appendChild(buildUebrige(uebrige));
   } else {
     ENTRIES.forEach((entry, index) => {
       container.appendChild(buildCard(entry, index));

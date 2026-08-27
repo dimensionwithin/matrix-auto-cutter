@@ -60,6 +60,9 @@ Wurzelobjekt mit dem Feld `buendel` (eine Liste) und zusaetzlich:
 - `kandidaten_gesamt` -- Ganzzahl, die Zahl der Eintraege in `buendel`.
   Sie muss der Zahl der Kandidaten in `kandidaten.json` gleichen.
 - `gruppen_gesamt` -- Ganzzahl, die Zahl verschiedener `gruppe`-Werte.
+- `vorauswahl_groesse` -- Ganzzahl, immer `15`. So viele Gruppen traegt die
+  Vorauswahl. Hat die Aufnahme weniger als 15 Gruppen, steht hier trotzdem
+  `15`, und alle Gruppen sind vorausgewaehlt.
 - `modell` -- das Modell, mit dem dieser Lauf gefahren wurde. Es wird dir
   beim Start genannt. Ohne dieses Feld laesst sich spaeter nicht mehr sagen,
   welches Modell welche Buendelung vorgeschlagen hat.
@@ -83,6 +86,14 @@ Je Kandidat GENAU EIN Eintrag in `buendel`, ueber `index` zugeordnet:
 - `empfohlen` -- Wahrheitswert. Je Gruppe steht er bei GENAU EINEM Eintrag
   auf wahr, bei allen anderen auf falsch. Der empfohlene Eintrag ist der mit
   `rang` 1.
+- `gruppen_rang` -- Ganzzahl ab 1, EINDEUTIG ueber ALLE Gruppen hinweg.
+  Nicht zu verwechseln mit `rang`: `rang` ordnet die Kandidaten INNERHALB
+  einer Gruppe, `gruppen_rang` ordnet die GRUPPEN untereinander. Alle
+  Kandidaten derselben Gruppe tragen denselben `gruppen_rang`. Bei 47
+  Gruppen werden die Werte 1 bis 47 vergeben, jeder genau einmal.
+- `vorauswahl` -- Wahrheitswert. Wahr bei allen Kandidaten der Gruppen mit
+  `gruppen_rang` 1 bis 15, falsch bei allen uebrigen. Hat die Aufnahme
+  weniger als 15 Gruppen, ist er ueberall wahr.
 - `begruendung` -- nicht leer. Beim empfohlenen Kandidaten: warum er der
   beste seiner Gruppe ist. Bei den uebrigen: warum er zuruecksteht.
 
@@ -113,10 +124,11 @@ Je Kandidat GENAU EIN Eintrag in `buendel`, ueber `index` zugeordnet:
   Ausschnitt steht am besten fuer sich, welche Grenzen sitzen sauber, wie
   liegt die Laenge zur Vorgabe. Die YAML-Datei sagt, worauf es dabei
   ankommt -- lies sie und wende sie an.
-- **ZWISCHEN Gruppen wird NICHT gerangt.** Du sagst nicht, welches Thema
-  wichtiger ist als ein anderes. Welches Thema es wert ist, veroeffentlicht
-  zu werden, entscheidet der Nutzer -- deine Arbeit ist, ihm je Thema den
-  besten Ausschnitt hinzulegen, nicht die Themen zu sortieren.
+- **ZWISCHEN Gruppen wird gerangt -- aber nur nach der Staerke des
+  Ausschnitts, nie nach der Wichtigkeit des Themas.** Siehe den naechsten
+  Abschnitt. Welches Thema es wert ist, veroeffentlicht zu werden,
+  entscheidet weiterhin der Nutzer; du sagst ihm nur, in welcher Reihenfolge
+  er hinsehen soll.
 
 ## Die Gruppennummern
 
@@ -133,9 +145,62 @@ Reihenfolge, in der die Aufnahme sie bringt.
 Alle Kandidaten einer Gruppe tragen dasselbe `projekt`. Waehle das Projekt
 also so, dass es fuer die ganze Gruppe stimmt.
 
+## Die Vorauswahl: `gruppen_rang` und `vorauswahl`
+
+Wozu das gut ist -- woertlich: **Der Nutzer veroeffentlicht 4 bis 10 Shorts
+je Aufnahme und hat dafuer 48 Stunden Zeit.** Danach ist die Aufnahme fuer
+Shorts wertlos. 47 Gruppenentscheidungen sind in diesem Fenster zu viel. Die
+Vorauswahl nennt ihm die 15 Gruppen, bei denen es sich zuerst lohnt
+hinzusehen.
+
+Die Vorauswahl ist eine **Lesereihenfolge, keine Aussortierung.** Es faellt
+nichts weg: jeder Kandidat bleibt in `kandidaten.json`, jede Gruppe bleibt in
+`buendel.json`, und die Urteilsseite haelt die uebrigen Gruppen einen Klick
+entfernt bereit. Du entscheidest nicht, was der Nutzer sehen darf, sondern
+womit er anfaengt.
+
+**Wonach du rangst.** Nach der Staerke des BESTEN Kandidaten der Gruppe --
+also des empfohlenen, des mit `rang` 1 --, gemessen an der Kriteriendatei.
+Drei Fragen, dieselben, nach denen du auch innerhalb der Gruppe rangst:
+
+1. Steht der Ausschnitt fuer sich? Versteht ihn jemand, der die Aufnahme
+   nicht kennt und mitten hineinfaellt?
+2. Sitzen die Grenzen sauber? Faengt er an einem Satzanfang an und hoert an
+   einem Satzende auf, ohne angeschnittenes Wort und ohne toten Vorlauf?
+3. Traegt er eine eigene Aussage? Sagt er etwas, das jemand behalten oder
+   widersprechen kann -- oder plaetschert er nur mit?
+
+**Wonach du ausdruecklich NICHT rangst.** Diese drei Dinge fliessen NICHT
+ein, auch nicht als Nebengewicht:
+
+- **Wie oft ein Thema vorkommt.** Zehn Bitcoin-Gruppen machen keine davon
+  besser und keine schlechter. Ein Projekt, das nur einmal vorkommt, wird
+  nicht zurueckgesetzt, damit die Vorauswahl bunter aussieht -- und ein
+  Projekt, das oft vorkommt, wird nicht bevorzugt, weil es wohl wichtig sein
+  muesse.
+- **Wie lang der Ausschnitt ist.** Die Laenge gehoert in den Rang INNERHALB
+  der Gruppe, wo sie gegen die Vorgabe der Kriteriendatei zaehlt. Zwischen
+  Gruppen sagt sie nichts: ein starker Ausschnitt von 9 Sekunden steht ueber
+  einem schwachen von 13.
+- **An welcher Stelle der Aufnahme er liegt.** Nicht der Anfang ist besser,
+  nicht das Ende. `start_ms` ordnet die Gruppennummern (siehe oben), den
+  `gruppen_rang` ordnet es nicht.
+
+**Wie du die Werte vergibst.** Bilde eine Reihenfolge ueber ALLE Gruppen und
+vergib `gruppen_rang` 1 fuer die staerkste, 2 fuer die zweitstaerkste, und so
+weiter bis zur letzten -- lueckenlos, jeden Wert genau einmal. Trage den Wert
+bei JEDEM Kandidaten der Gruppe ein, nicht nur beim empfohlenen. Setze dann
+`vorauswahl` bei den Kandidaten der Gruppen mit `gruppen_rang` 1 bis 15 auf
+wahr und bei allen uebrigen auf falsch. Hat die Aufnahme weniger als 15
+Gruppen, tragen alle `vorauswahl` wahr.
+
+Der `gruppen_rang` ist von der Gruppennummer unabhaengig: `gruppe` folgt
+Projekt und Zeit, `gruppen_rang` folgt der Staerke. Gruppe 1 kann
+`gruppen_rang` 30 tragen, Gruppe 44 den `gruppen_rang` 1.
+
 ## Bevor du schreibst: pruefe selbst
 
-Gehe die Datei durch, bevor du sie ablegst. Diese fuenf Punkte werden nach
+Gehe die Datei durch, bevor du sie ablegst. Diese sieben Punkte werden nach
 deinem Lauf maschinell geprueft, und jede Abweichung laesst die Stufe
 scheitern:
 
@@ -144,6 +209,12 @@ scheitern:
 3. Je Gruppe genau ein `empfohlen` auf wahr.
 4. Je Gruppe die Raenge 1 bis n, jeder genau einmal.
 5. Jedes Paar mit `laengere_fassung_von` in derselben Gruppe.
+6. `gruppen_rang` lueckenlos von 1 bis zur Gruppenzahl, jeder Wert genau
+   einmal, und alle Kandidaten einer Gruppe mit demselben Wert.
+7. Genau `min(15, Gruppenzahl)` Gruppen mit `vorauswahl` wahr, und zwar
+   genau die mit den kleinsten `gruppen_rang`-Werten -- keine
+   vorausgewaehlte Gruppe darf einen groesseren `gruppen_rang` haben als
+   eine nicht vorausgewaehlte.
 
 ## Was dieser Lauf NICHT tun darf
 

@@ -73,6 +73,11 @@ from matrix_auto_cutter.shorts.candidates import (
     CANDIDATES_FILE_NAME,
     CandidatesSchemaError,
 )
+from matrix_auto_cutter.shorts.urteilslauf import (
+    VERFALL_STUNDEN,
+    alter_stunden,
+    ist_verfallen,
+)
 
 JOBS_ROOT = Path("artefakte") / "repeat" / "shorts"
 ZUSTAND_FILE_NAME = "kette.json"
@@ -339,6 +344,13 @@ def bestimme_aufnahme(jobs_root: Path, name: str | None) -> tuple[str, dict[str,
     """
     if name is not None:
         pfad = jobs_root / name / ZUSTAND_FILE_NAME
+        if ist_verfallen(name):
+            alter = alter_stunden(name)
+            print(
+                f"  WARNUNG: {name} ist {int(alter or 0)} h alt und damit aelter als "
+                f"{VERFALL_STUNDEN} Stunden - ausdruecklich angegeben, deshalb wird "
+                f"fortgefahren."
+            )
         return name, lies_zustand(pfad) if pfad.is_file() else None
     gefunden = finde_laufende_kette(jobs_root)
     if gefunden is not None:
@@ -351,6 +363,19 @@ def bestimme_aufnahme(jobs_root: Path, name: str | None) -> tuple[str, dict[str,
         row = waehle_aufnahme(sammle_aufnahmen(probe_duration=False), None)
     except AuftragFehlschlag as fehler:
         raise KetteFehlschlag("keine_aufnahme", fehler.text, CODE_KEINE_AUFNAHME) from fehler
+    # Dieselbe Pruefung wie in ``urteilslauf.finde_aufnahme`` und an derselben
+    # Stelle: eine verfallene Aufnahme wird nicht von SELBST gewaehlt. Genannt
+    # wird sie trotzdem, mitsamt dem Weg, sie doch zu nehmen - sonst saehe der
+    # Kettenlauf so aus, als gaebe es gar keine Aufnahme.
+    if ist_verfallen(row.name):
+        alter = alter_stunden(row.name)
+        raise KetteFehlschlag(
+            "nur_verfallen",
+            f"die juengste Aufnahme {row.name} ist {int(alter or 0)} h alt und damit "
+            f"aelter als {VERFALL_STUNDEN} Stunden - Shorts daraus lohnen nicht mehr. "
+            f"Fuer Nacharbeit: --aufnahme {row.name} ausdruecklich angeben.",
+            CODE_KEINE_AUFNAHME,
+        )
     return row.name, None
 
 

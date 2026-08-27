@@ -36,6 +36,7 @@ import threading
 import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, suppress
+from datetime import datetime
 from pathlib import Path
 
 from matrix_auto_cutter.shorts import auswahl
@@ -44,6 +45,7 @@ from matrix_auto_cutter.shorts.candidates import (
     CandidatesSchemaError,
     load_candidates,
 )
+from matrix_auto_cutter.shorts.inventory import parse_name_timestamp
 from matrix_auto_cutter.shorts.judge_server import load_urteile
 
 SICHERUNG_DIR = Path("labels/repeat")
@@ -51,9 +53,17 @@ AUFNAHMEN_UNTERPFAD = Path("artefakte/repeat/shorts")
 JOB_FILE_NAME = "shorts-job.json"
 RENDER_WURZEL = r"F:\MatrixMarketAutoEdit\Shorts Rendered"
 NACHSCHLAG_MODELL = "opus"
+# Ein Short lebt vom Tagesgespraech: 48 Stunden nach der AUFNAHME ist der
+# Markt weitergelaufen, und was der Sprecher damals erwartet hat, ist
+# entschieden. Danach lohnt keine Urteilszeit mehr. Gemessen wird ab der
+# Aufnahmezeit im Ordnernamen (``inventory.parse_name_timestamp``), nicht ab
+# der Aenderungszeit einer Datei: eine zweite Zerlegung macht eine alte
+# Aufnahme nicht wieder jung.
+VERFALL_STUNDEN = 48
 
 _CODE_ERFOLG = 0
 _CODE_KEINE_AUFNAHME = 2
+_CODE_NUR_VERFALLEN = 2
 _CODE_AUFTRAG_UNLESBAR = 2
 _CODE_URTEILE_ABWEICHUNG = 5
 _CODE_SICHERUNG_FEHLGESCHLAGEN = 6
@@ -69,13 +79,41 @@ _KANDIDATENORDNER = re.compile(r"kandidat-\d+")
 _SHORT_NAME = "short.mp4"
 
 
-def finde_aufnahme(wurzel: Path) -> Path | None:
+def alter_stunden(name: str, jetzt: datetime | None = None) -> float | None:
+    """Das Alter der Aufnahme in Stunden - ``None``, wenn der Name keine Zeit traegt.
+
+    Der Ordnername ist die Quelle: ``JJJJ-MM-TT HH-MM-SS``, gelesen von
+    ``inventory.parse_name_timestamp``. Traegt ein Ordner keine lesbare Zeit,
+    gilt er als nicht verfallen - lieber eine Aufnahme zu viel anbieten als
+    eine, die es noch gibt, wegen eines unerwarteten Namens verschweigen.
+    """
+    zeitpunkt = parse_name_timestamp(name)
+    if zeitpunkt is None:
+        return None
+    bezug = jetzt if jetzt is not None else datetime.now()
+    return (bezug - zeitpunkt).total_seconds() / 3600.0
+
+
+def ist_verfallen(name: str, jetzt: datetime | None = None) -> bool:
+    """Sage, ob die Aufnahme aelter als :data:`VERFALL_STUNDEN` ist."""
+    alter = alter_stunden(name, jetzt)
+    return alter is not None and alter > VERFALL_STUNDEN
+
+
+def finde_aufnahme(
+    wurzel: Path, *, auch_verfallen: bool = False, jetzt: datetime | None = None
+) -> Path | None:
     """Der Aufnahmeordner mit der juengsten ``kandidaten.json``, falls es einen gibt.
 
     "Juengster" heisst nach Aenderungszeit der ``kandidaten.json``, nicht
     nach Ordnernamen: die Ordner tragen den Aufnahmezeitpunkt im Namen,
     und eine zweite Zerlegung einer aelteren Aufnahme ist genau der Fall,
     in dem der Name in die Irre fuehrt.
+
+    Verfallene Aufnahmen werden uebergangen und dabei GENANNT - stillschweigen
+    saehe aus wie "es gibt nichts", und der Nutzer suchte den Fehler an der
+    falschen Stelle. Geloescht wird nichts, geschrieben auch nichts:
+    ``--auch-verfallen`` holt jede davon zurueck.
     """
     basis = wurzel / AUFNAHMEN_UNTERPFAD
     if not basis.is_dir():
@@ -86,6 +124,10 @@ def finde_aufnahme(wurzel: Path) -> Path | None:
             continue
         kandidaten_pfad = ordner / CANDIDATES_FILE_NAME
         if not kandidaten_pfad.is_file():
+            continue
+        if not auch_verfallen and ist_verfallen(ordner.name, jetzt):
+            alter = alter_stunden(ordner.name, jetzt)
+            print(f"  uebergangen: {ordner.name} (verfallen, {int(alter or 0)} h alt)")
             continue
         treffer.append((kandidaten_pfad.stat().st_mtime_ns, ordner))
     if not treffer:
@@ -278,15 +320,30 @@ def _namensteil(wurzel: dict[str, object], feld: str) -> str:
     return "unbekannt"
 
 
+def _laufteil(kandidaten_wurzel: dict[str, object]) -> str:
+    """``1`` bei einem Lauf, ``1+2`` bei zweien - aus ``laeufe``, sonst ``lauf``.
+
+    Ein zusammengefuehrter Satz traegt ``lauf`` auf der KLEINSTEN Nummer;
+    stuende nur die im Namen, hiessen die Sicherung eines Satzes aus Lauf 1
+    und 2 genauso wie die des reinen Laufes 1 - und die zweite waere dann
+    nicht abzulegen, weil eine vorhandene Sicherung nie ueberschrieben wird.
+    """
+    laeufe = auswahl.laeufe_kennung(kandidaten_wurzel)
+    if not laeufe:
+        return _namensteil(kandidaten_wurzel, "lauf")
+    return "+".join(_namensteil({"wert": eintrag}, "wert") for eintrag in laeufe)
+
+
 def sicherungsnamen(kandidaten_wurzel: dict[str, object]) -> tuple[str, str]:
     """Die beiden Zielnamen unter ``labels/repeat/``: (Urteile, Kandidaten).
 
-    Fehlt eines der drei Felder ``video_name``, ``lauf``, ``modell``,
-    steht an seiner Stelle ``unbekannt`` - ein unvollstaendig benannter
-    Beleg ist besser als gar keiner.
+    Bei einem Lauf wie bisher ``…-lauf1-sonnet.json``, bei mehreren
+    ``…-lauf1+2-sonnet+opus.json``. Fehlt eines der Felder ``video_name``,
+    ``laeufe``/``lauf``, ``modell``, steht an seiner Stelle ``unbekannt`` -
+    ein unvollstaendig benannter Beleg ist besser als gar keiner.
     """
     video_name = _namensteil(kandidaten_wurzel, "video_name")
-    lauf = _namensteil(kandidaten_wurzel, "lauf")
+    lauf = _laufteil(kandidaten_wurzel)
     modell = _namensteil(kandidaten_wurzel, "modell")
     kern = f"{video_name}-lauf{lauf}-{modell}"
     return f"urteile-{kern}.json", f"kandidaten-{kern}.json"
@@ -485,6 +542,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--wurzel", type=Path, default=None)
     parser.add_argument(
+        "--auch-verfallen",
+        action="store_true",
+        help=(
+            f"auch Aufnahmen anbieten, die aelter als {VERFALL_STUNDEN} Stunden sind - "
+            "fuer Nacharbeit an einer Aufnahme, deren Shorts nicht mehr aktuell sind."
+        ),
+    )
+    parser.add_argument(
         "--platzhalter-server",
         nargs="?",
         type=float,
@@ -519,8 +584,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"ANGEHALTEN [auftrag_unlesbar]: {job_arg} ist weder Datei noch Ordner")
         return _CODE_AUFTRAG_UNLESBAR
     else:
-        gefunden = finde_aufnahme(wurzel)
+        gefunden = finde_aufnahme(wurzel, auch_verfallen=args.auch_verfallen)
         if gefunden is None:
+            # Zwei verschiedene Lagen, zwei verschiedene Saetze: "es gibt
+            # keine Aufnahme" schickt den Nutzer zur Zerlegung, "alle sind
+            # verfallen" zu ``--auch-verfallen``. Ein gemeinsamer Satz waere
+            # in beiden Faellen der falsche Rat.
+            if not args.auch_verfallen and finde_aufnahme(wurzel, auch_verfallen=True):
+                print(
+                    f"ANGEHALTEN [nur_verfallen]: jede Aufnahme unter "
+                    f"{wurzel / AUFNAHMEN_UNTERPFAD} ist aelter als {VERFALL_STUNDEN} "
+                    f"Stunden - Shorts daraus lohnen nicht mehr. Fuer Nacharbeit: "
+                    f"--auch-verfallen, oder den Auftragsordner unmittelbar angeben."
+                )
+                return _CODE_NUR_VERFALLEN
             print(
                 "ANGEHALTEN [keine_aufnahme]: kein Ordner mit "
                 f"{CANDIDATES_FILE_NAME} unter {wurzel / AUFNAHMEN_UNTERPFAD}"
@@ -534,6 +611,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _CODE_KEINE_AUFNAHME
     print(f"  Auftragsordner: {job_dir}")
     print(f"  Auftragsdatei:  {job_path}")
+    # Ausdruecklich benannt heisst gewaehlt: der Verfall haelt hier nicht auf,
+    # er warnt nur. Wer den Ordner tippt, weiss, welche Aufnahme er meint.
+    if job_arg is not None and ist_verfallen(job_dir.name):
+        alter = alter_stunden(job_dir.name)
+        print(
+            f"  WARNUNG: {job_dir.name} ist {int(alter or 0)} h alt und damit aelter als "
+            f"{VERFALL_STUNDEN} Stunden - ausdruecklich angegeben, deshalb wird "
+            f"fortgefahren."
+        )
 
     # ---- Schritt 2: Urteile gegen Kandidaten pruefen ----------------------
     print("Schritt 2: vorhandene Urteile gegen die Kandidaten pruefen")

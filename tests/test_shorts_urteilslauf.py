@@ -116,7 +116,11 @@ def test_finde_aufnahme_nimmt_juengste_kandidatendatei(tmp_path: Path) -> None:
     os.utime(alt / "kandidaten.json", (1_000_000, 1_000_000))
     os.utime(neu / "kandidaten.json", (2_000_000, 2_000_000))
 
-    assert urteilslauf.finde_aufnahme(tmp_path) == neu
+    # ``auch_verfallen`` schaltet allein den Verfall ab (Auftrag
+    # vorauswahl-verfall): die beiden Ordnernamen liegen einen Monat
+    # auseinander und koennen gar nicht beide frisch sein, geprueft wird hier
+    # aber die Aenderungszeit und nicht das Alter.
+    assert urteilslauf.finde_aufnahme(tmp_path, auch_verfallen=True) == neu
 
 
 def test_kein_ordner_mit_kandidaten_gibt_code_2(tmp_path: Path) -> None:
