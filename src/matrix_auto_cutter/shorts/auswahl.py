@@ -133,6 +133,52 @@ def _jetzt() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _bilde_verweise_ab(
+    kandidaten: list[dict[str, object]], zuordnung: dict[int, int]
+) -> int:
+    """Schreibe ``enthaelt`` auf die neue Nummerierung um; melde die weggefallenen Verweise.
+
+    Ein Kandidat aus einem spaeteren Lauf traegt in ``enthaelt`` die Indizes
+    SEINES Laufs. Die Zusammenfuehrung gibt ihm einen neuen Index - und bis
+    zum 27.8. blieben seine Verweise trotzdem stehen. Sie zeigten danach auf
+    irgendwelche Kandidaten des Grundsatzes: bei der Aufnahme vom 25.8.
+    traegt Kandidat 67 ``"enthaelt": [36]``, obwohl der zusammengefuehrte
+    Kandidat 36 sechs Minuten entfernt liegt. Heute ist das folgenlos, weil
+    die Urteilsseite ``enthaelt`` nur zum Gruppieren nutzt; sobald ein
+    Verweis auf einen Index zeigt, den es NICHT gibt, bricht
+    ``parse_candidates`` den Bau mit einer Schemameldung ab.
+
+    Ein Verweis ohne Entsprechung im Zielsatz faellt WEG statt falsch
+    stehenzubleiben. Ein falscher Verweis behauptet etwas; ein fehlender
+    behauptet nichts - und ``enthaelt`` ist eine Zusatzangabe, kein
+    Pflichtfeld. Damit das nicht stillschweigend geschieht, zaehlt diese
+    Funktion die Faelle; die Summe steht als Wurzelfeld
+    ``verworfene_verweise`` in der Ausgabe.
+
+    Ein Verweis auf den eigenen neuen Index faellt ebenfalls weg: er kann
+    entstehen, wenn zwei Kandidaten eines Laufs auf denselben Eintrag des
+    Grundsatzes abgebildet werden, und ``parse_candidates`` weist eine
+    Selbstreferenz zurueck.
+    """
+    verworfen = 0
+    for kandidat in kandidaten:
+        roh = kandidat.get("enthaelt")
+        if not isinstance(roh, list):
+            continue
+        eigener = kandidat.get("index")
+        neu: list[int] = []
+        for verweis in roh:
+            ziel = zuordnung.get(verweis) if isinstance(verweis, int) else None
+            if isinstance(verweis, bool):
+                ziel = None
+            if ziel is None or ziel == eigener or ziel in neu:
+                verworfen += 1
+                continue
+            neu.append(ziel)
+        kandidat["enthaelt"] = neu
+    return verworfen
+
+
 def fuehre_zusammen(saetze: list[tuple[int, dict[str, object]]]) -> dict[str, object]:
     """Vereinige mehrere Zerlegungslaeufe zu einem Kandidatensatz.
 
@@ -171,6 +217,13 @@ def fuehre_zusammen(saetze: list[tuple[int, dict[str, object]]]) -> dict[str, ob
     verschraenkt. So bleibt die Reihenfolge dieselbe, gleich ob ein Lauf in
     einem Rutsch oder nachtraeglich zusammengefuehrt wird.
 
+    ``enthaelt`` wird dabei auf die neue Nummerierung abgebildet
+    (:func:`_bilde_verweise_ab`), und was keine Entsprechung hat, faellt
+    weg statt falsch stehenzubleiben. Die Zahl der weggefallenen Verweise
+    steht als Wurzelfeld ``verworfene_verweise``. Die Kandidaten des
+    Grundsatzes bleiben davon unberuehrt: ihre Indizes aendern sich nicht,
+    also aendern sich ihre Verweise nicht.
+
     Bei EINEM Satz ist das Ergebnis eine Kopie mit Wurzelfeldern - kein
     Sonderfall im Code, sondern derselbe Weg mit einer leeren zweiten
     Runde.
@@ -190,9 +243,19 @@ def fuehre_zusammen(saetze: list[tuple[int, dict[str, object]]]) -> dict[str, ob
             hoechster_index = max(hoechster_index, index)
         ergebnis.append(kandidat)
 
+    verworfene_verweise = 0
     for nummer, satz in geordnet[1:]:
-        nachtraege: list[tuple[dict[str, object], int]] = []
+        nachtraege: list[tuple[dict[str, object], int, int | None]] = []
+        # Was in DIESEM Lauf welche Nummer hatte und im Ergebnis welche
+        # bekommt. Erst wenn der ganze Lauf durch ist, steht die Abbildung
+        # vollstaendig - ein ``enthaelt`` darf auf einen Kandidaten zeigen,
+        # der weiter hinten in derselben Laufdatei steht.
+        zuordnung: dict[int, int] = {}
+        aus_diesem_lauf: list[dict[str, object]] = []
         for roh in _kandidatenliste(satz):
+            alt_index = roh.get("index")
+            if not isinstance(alt_index, int) or isinstance(alt_index, bool):
+                alt_index = None
             vorhanden = next(
                 (eintrag for eintrag in ergebnis if gleicher_kandidat(eintrag, roh)), None
             )
@@ -201,20 +264,32 @@ def fuehre_zusammen(saetze: list[tuple[int, dict[str, object]]]) -> dict[str, ob
                 hoechster_index += 1
                 kandidat["index"] = hoechster_index
                 kandidat["aus_lauf"] = nummer
+                if alt_index is not None:
+                    zuordnung[alt_index] = hoechster_index
                 ergebnis.append(kandidat)
-                continue
-            if not _ist_laenger(roh, vorhanden):
+                aus_diesem_lauf.append(kandidat)
                 continue
             gegenstueck = vorhanden.get("index")
             if not isinstance(gegenstueck, int) or isinstance(gegenstueck, bool):
                 raise CandidatesSchemaError("Kandidat ohne ganzzahligen 'index'")
-            nachtraege.append((dict(roh), gegenstueck))
-        for kandidat, gegenstueck in nachtraege:
+            if not _ist_laenger(roh, vorhanden):
+                # Er faellt weg, sein Material aber nicht: es steht schon
+                # unter ``gegenstueck``. Ein Verweis auf ihn zeigt danach
+                # dorthin - sonst ginge er verloren, obwohl es ihn gibt.
+                if alt_index is not None:
+                    zuordnung[alt_index] = gegenstueck
+                continue
+            nachtraege.append((dict(roh), gegenstueck, alt_index))
+        for kandidat, gegenstueck, alt_index in nachtraege:
             hoechster_index += 1
             kandidat["index"] = hoechster_index
             kandidat["aus_lauf"] = nummer
             kandidat["laengere_fassung_von"] = gegenstueck
+            if alt_index is not None:
+                zuordnung[alt_index] = hoechster_index
             ergebnis.append(kandidat)
+            aus_diesem_lauf.append(kandidat)
+        verworfene_verweise += _bilde_verweise_ab(aus_diesem_lauf, zuordnung)
 
     laeufe = [nummer for nummer, _ in geordnet]
     payload: dict[str, object] = {
@@ -228,6 +303,7 @@ def fuehre_zusammen(saetze: list[tuple[int, dict[str, object]]]) -> dict[str, ob
     payload["modelle"] = {
         str(nummer): satz.get("modell", "unbekannt") for nummer, satz in geordnet
     }
+    payload["verworfene_verweise"] = verworfene_verweise
     payload["zusammengefuehrt_am"] = _jetzt()
     return payload
 

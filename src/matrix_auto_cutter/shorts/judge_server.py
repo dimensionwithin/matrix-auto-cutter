@@ -44,7 +44,9 @@ from matrix_auto_cutter.shorts.candidates import (
 )
 from matrix_auto_cutter.shorts.judge import (
     DEFAULT_KRITERIEN_PATH,
+    BuendelGruppe,
     JudgeEntry,
+    baue_gruppen,
     build_judge_entries,
     build_judge_html,
     load_transcript_segments,
@@ -310,6 +312,50 @@ def parse_range(header: str | None, file_size: int) -> tuple[int, int] | None:
 # Der Server selbst
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Buendelung laden (Auftrag urteilsseite-gruppiert)
+# ---------------------------------------------------------------------------
+
+
+def lade_buendel_gruppen(job_dir: Path) -> tuple[tuple[BuendelGruppe, ...], str | None]:
+    r"""``(Gruppen, Rueckfallgrund)`` fuer den Auftragsordner.
+
+    Zwei Ergebnisse, nie ein Fehlschlag: entweder eine geprüfte Buendelung -
+    dann sind die Gruppen da und der Grund ist ``None`` -, oder eine leere
+    Gruppenliste samt deutschem Satz, warum die Seite flach bleibt. Aeltere
+    Aufnahmen haben keine ``buendel.json``, und der Nutzer soll sie trotzdem
+    beurteilen koennen.
+
+    Gruppiert wird NUR bei fehlerfreier Pruefung. Eine Buendelung, die einen
+    Index auslaesst, verstecke genau den Kandidaten, ueber den nie
+    entschieden wird - die flache Liste zeigt in dem Fall alle 69 und ist
+    damit das sicherere Ergebnis, auch wenn sie das unbequemere ist.
+
+    ``auswahl`` wird erst hier importiert und nicht im Modulkopf:
+    ``auswahl`` selbst importiert ``judge_server`` (fuer ``Urteil`` und
+    ``load_urteile``), ein Import im Kopf ergaebe einen Zyklus.
+    """
+    from matrix_auto_cutter.shorts import auswahl
+
+    pfad = job_dir / auswahl.BUENDEL_FILE_NAME
+    if not pfad.is_file():
+        return (), f"{auswahl.BUENDEL_FILE_NAME} liegt nicht im Auftragsordner."
+    try:
+        buendel = auswahl.lies_buendel(pfad)
+    except (OSError, json.JSONDecodeError) as fehler:
+        return (), f"{pfad.name} ist nicht lesbar ({fehler})."
+    kandidaten, _ = auswahl.lies_kandidaten_rohdaten(job_dir / CANDIDATES_FILE_NAME)
+    meldungen = auswahl.pruefe_buendel(kandidaten, buendel)
+    if meldungen:
+        erste = meldungen[0]
+        rest = f", und {len(meldungen) - 1} weitere" if len(meldungen) > 1 else ""
+        return (), (
+            f"{pfad.name} passt nicht zu {CANDIDATES_FILE_NAME}: {erste}{rest}. "
+            f"Es werden alle Kandidaten einzeln gezeigt."
+        )
+    return tuple(baue_gruppen(buendel)), None
+
+
 _KNOWN_PATHS = frozenset({"/", "/video", "/urteile"})
 
 
@@ -528,8 +574,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         except AmbiguousUrteileStateError as exc:
             print(f"ANGEHALTEN: {exc}")
             return 1
+        gruppen, rueckfall_grund = lade_buendel_gruppen(job_dir)
         html_bytes = build_judge_html(
-            entries, kriterien_text=kriterien_text, urteile_path=urteile_path
+            entries,
+            kriterien_text=kriterien_text,
+            urteile_path=urteile_path,
+            gruppen=gruppen,
+            rueckfall_grund=rueckfall_grund,
         ).encode("utf-8")
 
         server = build_server(
@@ -539,10 +590,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             entries=entries,
         )
         url = server_url(server)
+        ansicht = (
+            f"{len(gruppen)} Gruppen aus {len(entries)} Kandidaten"
+            if gruppen
+            else f"{len(entries)} Kandidaten"
+        )
         print(
-            f"Urteilsserver läuft: {url} ({len(entries)} Kandidaten, Strg+C zum Beenden) - "
+            f"Urteilsserver läuft: {url} ({ansicht}, Strg+C zum Beenden) - "
             f"Urteile werden gespeichert in {urteile_path}"
         )
+        if rueckfall_grund is not None:
+            print(f"  Ungruppierte Ansicht: {rueckfall_grund}")
         webbrowser.open(url, new=2)
         try:
             server.serve_forever()

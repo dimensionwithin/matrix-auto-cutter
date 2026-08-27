@@ -594,3 +594,162 @@ def test_urteil_zeigt_nach_der_zusammenfuehrung_auf_denselben_kandidaten(
     assert auswahl.pruefe_uebereinstimmung(danach, {5: urteil_auf_fuenf}) == []
     assert [k.index for k in danach] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     assert [k.titel for k in danach][-2:] == ["Neu A", "Neu B"]
+
+
+# --------------------------------------------------------------------------
+# enthaelt beim Zusammenfuehren (Auftrag urteilsseite-gruppiert, Teil 2)
+# --------------------------------------------------------------------------
+
+
+def _mit_enthaelt(kandidat: dict[str, object], enthaelt: list[int]) -> dict[str, object]:
+    kandidat["enthaelt"] = enthaelt
+    return kandidat
+
+
+def test_enthaelt_eines_spaeteren_laufs_wird_auf_die_neue_nummerierung_abgebildet(
+    tmp_path: Path,
+) -> None:
+    """Der Fehler vom 27.8.: Lauf-2-Nummern blieben stehen und zeigten ins Leere.
+
+    Beide Verweisenden stammen aus Lauf 2 und tragen dort die Nummern 1 und
+    2. Im Ergebnis heissen sie 3 und 4 - also muss der Verweis von 3 auf 4
+    zeigen, nicht mehr auf die 2 des Grundsatzes.
+    """
+    _laufdatei(tmp_path, 1, [_kandidat(1), _kandidat(2, start_ms=20_000, end_ms=30_000)])
+    _laufdatei(
+        tmp_path,
+        2,
+        [
+            _mit_enthaelt(_kandidat(1, start_ms=100_000, end_ms=110_000), [2]),
+            _kandidat(2, start_ms=200_000, end_ms=210_000),
+        ],
+        modell="opus",
+    )
+
+    ergebnis = auswahl.fuehre_zusammen(auswahl.lade_laufdateien(tmp_path))
+    kandidaten = ergebnis["kandidaten"]
+    assert isinstance(kandidaten, list)
+    nach_index = {k["index"]: k for k in kandidaten}
+
+    assert nach_index[3]["enthaelt"] == [4]
+    assert ergebnis["verworfene_verweise"] == 0
+
+
+def test_verweis_ohne_entsprechung_faellt_weg_und_wird_gezaehlt(tmp_path: Path) -> None:
+    """Ein falscher Verweis behauptet etwas; ein fehlender behauptet nichts."""
+    _laufdatei(tmp_path, 1, [_kandidat(1)])
+    _laufdatei(
+        tmp_path,
+        2,
+        [_mit_enthaelt(_kandidat(1, start_ms=40_000, end_ms=50_000), [99])],
+        modell="opus",
+    )
+
+    ergebnis = auswahl.fuehre_zusammen(auswahl.lade_laufdateien(tmp_path))
+    kandidaten = ergebnis["kandidaten"]
+    assert isinstance(kandidaten, list)
+
+    assert kandidaten[1]["enthaelt"] == []
+    assert ergebnis["verworfene_verweise"] == 1
+
+
+def test_verworfene_verweise_steht_auch_bei_null_in_der_ausgabe(tmp_path: Path) -> None:
+    """Damit die Null eine Auskunft ist und kein fehlendes Feld."""
+    _laufdatei(tmp_path, 1, [_kandidat(1)])
+
+    ergebnis = auswahl.fuehre_zusammen(auswahl.lade_laufdateien(tmp_path))
+
+    assert ergebnis["verworfene_verweise"] == 0
+
+
+def test_kandidaten_des_grundsatzes_behalten_ihre_verweise(tmp_path: Path) -> None:
+    """Ihre Indizes aendern sich nicht, also aendern sich ihre Verweise nicht."""
+    _laufdatei(
+        tmp_path,
+        1,
+        [
+            _mit_enthaelt(_kandidat(1, start_ms=0, end_ms=30_000), [2]),
+            _kandidat(2, start_ms=5_000, end_ms=15_000),
+        ],
+    )
+    _laufdatei(tmp_path, 2, [_kandidat(1, start_ms=60_000, end_ms=70_000)], modell="opus")
+
+    ergebnis = auswahl.fuehre_zusammen(auswahl.lade_laufdateien(tmp_path))
+    kandidaten = ergebnis["kandidaten"]
+    assert isinstance(kandidaten, list)
+
+    assert kandidaten[0]["enthaelt"] == [2]
+    assert ergebnis["verworfene_verweise"] == 0
+
+
+def test_verweis_auf_einen_weggefallenen_kandidaten_zeigt_auf_sein_gegenstueck(
+    tmp_path: Path,
+) -> None:
+    """Er faellt weg, sein Material nicht: es steht schon unter dem vorhandenen Index."""
+    _laufdatei(tmp_path, 1, [_kandidat(1, start_ms=0, end_ms=10_000)])
+    _laufdatei(
+        tmp_path,
+        2,
+        [
+            # Deckungsgleich mit Kandidat 1 des Grundsatzes und nicht laenger:
+            # faellt weg. Sein Material steht unter Index 1.
+            _kandidat(1, start_ms=0, end_ms=10_000),
+            _mit_enthaelt(_kandidat(2, start_ms=40_000, end_ms=50_000), [1]),
+        ],
+        modell="opus",
+    )
+
+    ergebnis = auswahl.fuehre_zusammen(auswahl.lade_laufdateien(tmp_path))
+    kandidaten = ergebnis["kandidaten"]
+    assert isinstance(kandidaten, list)
+    nach_index = {k["index"]: k for k in kandidaten}
+
+    assert nach_index[2]["enthaelt"] == [1]
+    assert ergebnis["verworfene_verweise"] == 0
+
+
+def test_verweis_auf_den_eigenen_neuen_index_faellt_weg(tmp_path: Path) -> None:
+    """``parse_candidates`` weist eine Selbstreferenz zurueck - sie darf nicht entstehen."""
+    _laufdatei(tmp_path, 1, [_kandidat(1, start_ms=0, end_ms=10_000)])
+    _laufdatei(
+        tmp_path,
+        2,
+        [
+            # Beide gleichen Kandidat 1 des Grundsatzes; der laengere wird
+            # angehaengt und verweist auf den kuerzeren, der wegfaellt -
+            # beide bildeten sonst auf denselben neuen Index ab.
+            _kandidat(1, start_ms=0, end_ms=10_000),
+            _mit_enthaelt(_kandidat(2, start_ms=0, end_ms=16_000), [2]),
+        ],
+        modell="opus",
+    )
+
+    ergebnis = auswahl.fuehre_zusammen(auswahl.lade_laufdateien(tmp_path))
+    kandidaten = ergebnis["kandidaten"]
+    assert isinstance(kandidaten, list)
+    nach_index = {k["index"]: k for k in kandidaten}
+
+    assert nach_index[2]["enthaelt"] == []
+    assert ergebnis["verworfene_verweise"] == 1
+
+
+def test_zusammengefuehrter_satz_ueberlebt_parse_candidates(tmp_path: Path) -> None:
+    """Der eigentliche Punkt: der Bau bricht an den Verweisen nicht mehr ab."""
+    _laufdatei(tmp_path, 1, [_kandidat(1), _kandidat(2, start_ms=20_000, end_ms=30_000)])
+    _laufdatei(
+        tmp_path,
+        2,
+        [
+            _mit_enthaelt(_kandidat(1, start_ms=100_000, end_ms=110_000), [2, 99]),
+            _kandidat(2, start_ms=200_000, end_ms=210_000),
+        ],
+        modell="opus",
+    )
+    ergebnis = auswahl.fuehre_zusammen(auswahl.lade_laufdateien(tmp_path))
+    ziel = tmp_path / "kandidaten.json"
+    auswahl.schreibe_kandidatensatz(ziel, ergebnis)
+
+    geladen = load_candidates(ziel)
+
+    assert {k.index: k.enthaelt for k in geladen}[3] == (4,)
+    assert ergebnis["verworfene_verweise"] == 1

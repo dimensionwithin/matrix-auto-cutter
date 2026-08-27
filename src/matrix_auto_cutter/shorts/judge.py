@@ -17,6 +17,27 @@ nicht (dasselbe Prinzip, das ``review_app`` für seine HTML-Review-Brücke
 schon nutzt). Der Ton-Ausschnitt entfällt damit - er war der Rückfall dafür,
 den es nicht mehr braucht; die Videofunktionen dazu liegen in
 :mod:`matrix_auto_cutter.shorts.judge_server`.
+
+**Gruppen statt flacher Liste (Auftrag urteilsseite-gruppiert).** Liegt
+``buendel.json`` im Auftragsordner und besteht sie ``auswahl.pruefe_buendel``,
+zeigt die Seite die Kandidaten in Themengruppen: je Gruppe der empfohlene
+Kandidat vorn, die uebrigen Fassungen eingeklappt dahinter. Der Anlass ist
+belegt - am 26.8. hat der Nutzer in der flachen Liste drei Paare angenommen,
+die dasselbe Material zeigen (64/10, 67/18, 66/16). Fehlt die Datei oder
+meldet die Pruefung auch nur eine Abweichung, faellt die Seite auf die flache
+Liste zurueck und sagt das im Kopf; aeltere Aufnahmen haben keine Buendelung,
+und das ist kein Fehlschlag.
+
+**Die Urteilsdatei bleibt kandidatenbezogen.** Eine Gruppenentscheidung
+erzeugt mehrere Urteile, kein Gruppenurteil: je Kandidat eines, mit denselben
+sieben Feldern wie bisher (``index``, ``titel``, ``start_ms``, ``end_ms``,
+``ist_kind``, ``urteil``, ``notiz``). ``buendel.json`` ist ANZEIGE, nicht
+Wahrheit - geht sie verloren oder wird sie neu gerechnet, sind die Urteile
+vollstaendig und gueltig, denn sie haengen am ``index`` des Kandidaten und an
+sonst nichts. Ein Gruppenurteil haenge dagegen an einer Gruppennummer, die
+eine zweite Buendelung anders vergeben darf; damit waere Urteilszeit
+vernichtet - das einzige Artefakt dieser Kette, das sich nicht neu erzeugen
+laesst.
 """
 
 from __future__ import annotations
@@ -308,6 +329,103 @@ def build_judge_entries(
     return entries
 
 
+# ---------------------------------------------------------------------------
+# Buendelung: die Gruppen aus ``buendel.json`` fuer die Anzeige
+#
+# Warum die Urteilsdatei trotzdem kandidatenbezogen bleibt (Auftrag
+# urteilsseite-gruppiert, Teil 4): ``buendel.json`` ist ANZEIGE, nicht
+# Wahrheit. Eine Gruppenentscheidung erzeugt mehrere Urteile, kein
+# Gruppenurteil - je Kandidat eines, mit denselben sieben Feldern wie bisher.
+# Geht die Buendelung verloren oder wird sie neu gerechnet, sind die Urteile
+# vollstaendig und gueltig: sie haengen am ``index`` des Kandidaten und an
+# sonst nichts. Ein Gruppenurteil waere dagegen an eine Gruppennummer
+# gebunden, die eine zweite Buendelung anders vergeben darf - und damit
+# waere Urteilszeit vernichtet, das einzige Artefakt dieser Kette, das sich
+# nicht neu erzeugen laesst.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class BuendelGruppe:
+    """Eine Themengruppe der Urteilsseite: ein Empfohlener, die uebrigen dahinter."""
+
+    nummer: int
+    projekt: str
+    thema: str
+    empfohlen: int
+    begruendung: str
+    indizes: tuple[int, ...]
+
+    @property
+    def weitere(self) -> tuple[int, ...]:
+        """Die Indizes hinter dem Empfohlenen - leer bei einer Einzelgruppe."""
+        return tuple(index for index in self.indizes if index != self.empfohlen)
+
+
+def _ganzzahl(wert: object) -> int | None:
+    """Der Wert als Ganzzahl - oder ``None``, wenn er keine ist (``True`` ist keine)."""
+    return wert if isinstance(wert, int) and not isinstance(wert, bool) else None
+
+
+def baue_gruppen(buendel: Sequence[Mapping[str, object]]) -> list[BuendelGruppe]:
+    """Fasse die Eintraege aus ``buendel.json`` zu Gruppen in Nummernfolge zusammen.
+
+    Rein rechnend, ohne Datei und ohne Pruefung: geprueft hat vorher
+    ``auswahl.pruefe_buendel``, und nur eine Buendelung ohne Meldung kommt
+    ueberhaupt bis hierher (:func:`judge_server.lade_buendel_gruppen`).
+    Innerhalb der Gruppe wird nach ``rang`` sortiert, die Gruppen selbst nach
+    ``gruppe`` - der Lauf vergibt die Nummern bereits nach ``projekt``
+    sortiert und darin chronologisch, hier wird nichts umsortiert.
+
+    ``projekt``, ``thema`` und ``begruendung`` der Ueberschrift stammen vom
+    EMPFOHLENEN Eintrag: er ist der, den der Nutzer zuerst sieht, und seine
+    ``begruendung`` sagt, warum gerade er vorgeschlagen wird.
+    """
+    nach_gruppe: dict[int, list[Mapping[str, object]]] = {}
+    for eintrag in buendel:
+        nummer = _ganzzahl(eintrag.get("gruppe"))
+        index = _ganzzahl(eintrag.get("index"))
+        if nummer is None or index is None:
+            continue
+        nach_gruppe.setdefault(nummer, []).append(eintrag)
+    gruppen: list[BuendelGruppe] = []
+    for nummer in sorted(nach_gruppe):
+        eintraege = sorted(nach_gruppe[nummer], key=lambda e: (_ganzzahl(e.get("rang")) or 0))
+        empfohlen_eintrag = next(
+            (e for e in eintraege if e.get("empfohlen") is True), eintraege[0]
+        )
+        empfohlen = _ganzzahl(empfohlen_eintrag.get("index"))
+        assert empfohlen is not None
+        indizes = [empfohlen]
+        indizes.extend(
+            index
+            for e in eintraege
+            if (index := _ganzzahl(e.get("index"))) is not None and index != empfohlen
+        )
+        gruppen.append(
+            BuendelGruppe(
+                nummer=nummer,
+                projekt=str(empfohlen_eintrag.get("projekt", "")),
+                thema=str(empfohlen_eintrag.get("thema", "")),
+                empfohlen=empfohlen,
+                begruendung=str(empfohlen_eintrag.get("begruendung", "")),
+                indizes=tuple(indizes),
+            )
+        )
+    return gruppen
+
+
+def _gruppe_to_js_dict(gruppe: BuendelGruppe) -> dict[str, object]:
+    return {
+        "nummer": gruppe.nummer,
+        "projekt": html.escape(gruppe.projekt),
+        "thema": html.escape(gruppe.thema),
+        "empfohlen": gruppe.empfohlen,
+        "begruendung": html.escape(gruppe.begruendung),
+        "indizes": list(gruppe.indizes),
+    }
+
+
 def _entry_to_js_dict(entry: JudgeEntry) -> dict[str, object]:
     return {
         "index": entry.index,
@@ -566,6 +684,78 @@ _TEMPLATE = """<!doctype html>
     word-break: break-all;
   }
   #session-status-close { margin-top: 0.6rem; }
+  /* Gruppen (Auftrag urteilsseite-gruppiert) */
+  #rueckfall-hinweis {
+    max-width: 860px;
+    margin: 1rem auto 0 auto;
+    padding: 0.6rem 1rem;
+    font-size: 0.85rem;
+    color: var(--niedrig);
+    border: 1px dashed var(--niedrig);
+    border-radius: 8px;
+  }
+  .gruppe {
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 0.75rem 0.75rem 1rem 0.75rem;
+    background: transparent;
+  }
+  .gruppe.entschieden { border-color: var(--accent); }
+  .gruppe-kopf { margin: 0 0.5rem 0.5rem 0.5rem; }
+  .gruppe-kopf h2 {
+    margin: 0;
+    font-size: 1rem;
+    letter-spacing: 0.01em;
+  }
+  .gruppe-nummer {
+    font-size: 0.75rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+  }
+  .gruppe-thema { font-size: 0.9rem; color: var(--muted); margin-top: 0.15rem; }
+  .empfehlung {
+    margin: 0.5rem 0 0.25rem 0;
+    padding: 0.5rem 0.75rem;
+    border-left: 3px solid var(--accent);
+    background: var(--child-bg);
+    border-radius: 0 6px 6px 0;
+    font-size: 0.9rem;
+  }
+  .empfehlung .label {
+    display: block;
+    font-size: 0.7rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    margin-bottom: 0.2rem;
+  }
+  details.weitere { margin-top: 0.75rem; }
+  details.weitere > summary {
+    cursor: pointer;
+    font-size: 0.85rem;
+    color: var(--muted);
+    padding: 0.35rem 0.5rem;
+  }
+  details.weitere > summary:hover { color: var(--accent); }
+  details.weitere .weitere-liste {
+    margin: 0.1rem 0 0.6rem 1.4rem;
+    font-size: 0.8rem;
+    color: var(--muted);
+  }
+  details.weitere .kandidaten {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+  button.fassung-nehmen {
+    border-color: var(--accent);
+    color: var(--accent);
+    font-weight: 600;
+  }
+  button.fassung-nehmen:hover { background: var(--accent); color: white; }
 </style>
 </head>
 <body>
@@ -580,6 +770,7 @@ _TEMPLATE = """<!doctype html>
   __URTEILE_PFAD_HTML__
   <button id="session-status-close">Schlie&szlig;en</button>
 </div>
+__RUECKFALL_HTML__
 <p id="sicherheit-legende">
   <strong>Sicherheit (hoch/mittel/niedrig):</strong> die Selbsteinschätzung
   des zerlegenden Sprachmodells aus <code>kandidaten.json</code> - kein
@@ -593,9 +784,19 @@ _TEMPLATE = """<!doctype html>
 
 <script>
 const ENTRIES = __ENTRIES_JSON__;
+// Leer heisst: keine gueltige buendel.json - die Seite bleibt flach.
+const GRUPPEN = __GRUPPEN_JSON__;
 
 const state = ENTRIES.map(() => ({ urteil: null, notiz: "" }));
 const saveTimers = {};
+
+// Kandidatenindex -> Position in ENTRIES. Karten, Zustand und Video-Element
+// haengen an der POSITION, buendel.json redet dagegen vom INDEX; ohne diese
+// Bruecke zeigte jede Gruppe auf die falsche Karte.
+const posByIndex = {};
+ENTRIES.forEach((entry, i) => { posByIndex[entry.index] = i; });
+
+function gruppenModus() { return GRUPPEN.length > 0; }
 
 // Gefuehrte Sitzung (Auftrag 24): eine Warteschlange offener Kandidaten in
 // Anzeige-Reihenfolge. "Spaeter" reiht einmal ans Ende ein - deferCount haelt
@@ -606,9 +807,28 @@ const deferCount = ENTRIES.map(() => 0);
 let autoplayBlocked = false;
 
 function buildInitialQueue() {
+  if (gruppenModus()) {
+    // Im Gruppenmodus fuehrt die Sitzung nur ueber die EMPFOHLENEN
+    // Kandidaten offener Gruppen, in Gruppenreihenfolge. Die uebrigen
+    // Fassungen stehen eingeklappt: sie in die Warteschlange zu nehmen
+    // hiesse, zu einer unsichtbaren Karte zu scrollen und ein Video
+    // abzuspielen, das niemand sieht. Von Hand bedienbar bleiben sie
+    // vollstaendig - aufgeklappt wie jede andere Karte.
+    return GRUPPEN
+      .filter((g) => !gruppeEntschieden(g))
+      .map((g) => posByIndex[g.empfohlen])
+      .filter((i) => i !== undefined);
+  }
   return ENTRIES
     .map((_entry, i) => i)
     .filter((i) => state[i].urteil === null || state[i].urteil === "spaeter");
+}
+
+function gruppeEntschieden(gruppe) {
+  return gruppe.indizes.some((index) => {
+    const pos = posByIndex[index];
+    return pos !== undefined && state[pos].urteil !== null;
+  });
 }
 
 function showAutoplayHint() {
@@ -702,6 +922,21 @@ function fmtHms(ms) {
 
 function updateProgress() {
   const judged = state.filter((s) => s.urteil !== null).length;
+  if (gruppenModus()) {
+    // Im Gruppenmodus zaehlt die Gruppe, nicht der Kandidat: der Nutzer
+    // faellt je Gruppe EINE Entscheidung, und "47 von 69 beurteilt" saehe
+    // nach Rueckstand aus, wo keiner ist.
+    const entschieden = GRUPPEN.filter(gruppeEntschieden).length;
+    const offen = GRUPPEN.length - entschieden;
+    document.getElementById("progress").textContent =
+      entschieden + " von " + GRUPPEN.length + " Gruppen entschieden, " + offen + " offen"
+      + " (" + judged + " von " + ENTRIES.length + " Kandidaten beurteilt)";
+    GRUPPEN.forEach((gruppe) => {
+      const el = document.getElementById("gruppe-" + gruppe.nummer);
+      if (el) el.classList.toggle("entschieden", gruppeEntschieden(gruppe));
+    });
+    return;
+  }
   document.getElementById("progress").textContent =
     judged + " von " + ENTRIES.length + " beurteilt";
 }
@@ -776,10 +1011,32 @@ function buildVergleich(entry) {
   return wrap;
 }
 
-function buildCard(entry, index) {
+function nimmFassung(gruppe, gewaehlt) {
+  // Ein Angebot, keine Automatik: erst dieser Klick setzt ueberhaupt etwas.
+  // Er setzt fuer den gewaehlten Kandidaten "ja" und fuer die uebrigen der
+  // Gruppe "nein" - je Kandidat ein eigenes Urteil, kein Gruppenurteil.
+  // Jedes davon bleibt danach einzeln aenderbar.
+  gruppe.indizes.forEach((index) => {
+    const pos = posByIndex[index];
+    if (pos === undefined) return;
+    state[pos].urteil = index === gewaehlt ? "ja" : "nein";
+    renderCardButtons(pos);
+    saveUrteil(pos);
+  });
+  updateProgress();
+  if (sessionActive !== null && gruppe.indizes.indexOf(ENTRIES[sessionActive].index) !== -1) {
+    advanceSession();
+  }
+}
+
+function buildCard(entry, index, gruppe) {
   const card = document.createElement("div");
   card.className = "card" + (entry.is_child ? " child" : "");
   card.id = "card-" + index;
+  // Die Position, nicht der Kandidatenindex: im Gruppenmodus stimmt die
+  // DOM-Reihenfolge nicht mehr mit ENTRIES ueberein, und currentCardIndex
+  // liest den Zustand ueber die Position.
+  card.dataset.pos = String(index);
 
   const head = document.createElement("div");
   head.className = "card-head";
@@ -896,6 +1153,13 @@ function buildCard(entry, index) {
     });
     buttons.appendChild(btn);
   });
+  if (gruppe && gruppe.indizes.length > 1) {
+    const nehmen = document.createElement("button");
+    nehmen.className = "fassung-nehmen";
+    nehmen.textContent = "Diese Fassung nehmen";
+    nehmen.addEventListener("click", () => nimmFassung(gruppe, entry.index));
+    buttons.appendChild(nehmen);
+  }
   card.appendChild(buttons);
 
   const note = document.createElement("input");
@@ -937,14 +1201,89 @@ function applyRestored(restored) {
   });
 }
 
+function haengeKarteAn(container, pos, gruppe) {
+  if (pos === undefined) return;
+  container.appendChild(buildCard(ENTRIES[pos], pos, gruppe));
+  if (state[pos].urteil !== null) renderCardButtons(pos);
+}
+
+function buildGruppe(gruppe) {
+  const box = document.createElement("section");
+  box.className = "gruppe";
+  box.id = "gruppe-" + gruppe.nummer;
+
+  const kopf = document.createElement("div");
+  kopf.className = "gruppe-kopf";
+  const nummer = document.createElement("div");
+  nummer.className = "gruppe-nummer";
+  nummer.textContent = "Gruppe " + gruppe.nummer + " von " + GRUPPEN.length;
+  kopf.appendChild(nummer);
+  const titel = document.createElement("h2");
+  titel.textContent = gruppe.projekt;
+  kopf.appendChild(titel);
+  const thema = document.createElement("div");
+  thema.className = "gruppe-thema";
+  thema.textContent = gruppe.thema;
+  kopf.appendChild(thema);
+  box.appendChild(kopf);
+
+  if (gruppe.begruendung) {
+    const warum = document.createElement("div");
+    warum.className = "empfehlung";
+    const label = document.createElement("span");
+    label.className = "label";
+    label.textContent = "Warum diese Fassung vorgeschlagen wird";
+    warum.appendChild(label);
+    warum.appendChild(document.createTextNode(gruppe.begruendung));
+    box.appendChild(warum);
+  }
+
+  haengeKarteAn(box, posByIndex[gruppe.empfohlen], gruppe);
+
+  const weitere = gruppe.indizes.filter((index) => index !== gruppe.empfohlen);
+  if (weitere.length > 0) {
+    const details = document.createElement("details");
+    details.className = "weitere";
+    const summary = document.createElement("summary");
+    summary.textContent = weitere.length === 1
+      ? "1 weitere Fassung"
+      : weitere.length + " weitere Fassungen";
+    details.appendChild(summary);
+    // Titel und Dauer stehen schon im zugeklappten Zustand da: der Nutzer
+    // soll sehen koennen, WAS er hier uebergeht, ohne aufzuklappen.
+    const liste = document.createElement("ul");
+    liste.className = "weitere-liste";
+    weitere.forEach((index) => {
+      const pos = posByIndex[index];
+      if (pos === undefined) return;
+      const entry = ENTRIES[pos];
+      const dauerS = Math.round((entry.end_ms - entry.start_ms) / 1000);
+      const zeile = document.createElement("li");
+      zeile.textContent = "#" + entry.index + " " + entry.titel + " (" + dauerS + " s)";
+      liste.appendChild(zeile);
+    });
+    details.appendChild(liste);
+    const kandidaten = document.createElement("div");
+    kandidaten.className = "kandidaten";
+    weitere.forEach((index) => haengeKarteAn(kandidaten, posByIndex[index], gruppe));
+    details.appendChild(kandidaten);
+    box.appendChild(details);
+  }
+  return box;
+}
+
 async function render() {
   const restored = await loadRestoredUrteile();
   applyRestored(restored);
   const container = document.getElementById("cards");
-  ENTRIES.forEach((entry, index) => {
-    container.appendChild(buildCard(entry, index));
-    if (state[index].urteil !== null) renderCardButtons(index);
-  });
+  if (gruppenModus()) {
+    GRUPPEN.forEach((gruppe) => container.appendChild(buildGruppe(gruppe)));
+  } else {
+    ENTRIES.forEach((entry, index) => {
+      container.appendChild(buildCard(entry, index));
+      if (state[index].urteil !== null) renderCardButtons(index);
+    });
+  }
   updateProgress();
   startSession();
 }
@@ -954,14 +1293,19 @@ function currentCardIndex() {
   const scrollMid = window.scrollY + window.innerHeight / 2;
   let closest = 0;
   let closestDist = Infinity;
-  cards.forEach((card, i) => {
+  cards.forEach((card) => {
     const rect = card.getBoundingClientRect();
     const top = rect.top + window.scrollY;
     const mid = top + rect.height / 2;
     const dist = Math.abs(mid - scrollMid);
-    if (dist < closestDist) {
+    // Die Position aus dem Datenfeld, nicht die Schleifenzahl: im
+    // Gruppenmodus steht die dritte Karte im Dokument nicht mehr an der
+    // dritten Stelle von ENTRIES, und eine Taste setzte sonst das Urteil
+    // auf einen fremden Kandidaten.
+    const pos = Number(card.dataset.pos);
+    if (dist < closestDist && Number.isInteger(pos)) {
       closestDist = dist;
-      closest = i;
+      closest = pos;
     }
   });
   return closest;
@@ -1063,11 +1407,29 @@ def _urteile_pfad_html(urteile_path: Path | None) -> str:
     )
 
 
+def _rueckfall_html(grund: str | None) -> str:
+    """Die Zeile im Kopf, die den Rueckfall auf die flache Liste begruendet.
+
+    Sie steht nur, wenn es einen Grund gibt. Eine Seite, die stillschweigend
+    flach bleibt, sieht aus wie eine Seite ohne Buendelung - und der Nutzer
+    beurteilt dann wieder 69 Kandidaten einzeln, ohne zu wissen, warum.
+    """
+    if grund is None:
+        return ""
+    return (
+        '<p id="rueckfall-hinweis"><strong>Ungruppierte Ansicht:</strong> '
+        + html.escape(grund)
+        + "</p>"
+    )
+
+
 def build_judge_html(
     entries: Sequence[JudgeEntry],
     *,
     kriterien_text: str | None,
     urteile_path: Path | None = None,
+    gruppen: Sequence[BuendelGruppe] = (),
+    rueckfall_grund: str | None = None,
 ) -> str:
     """Render die eigenständige Urteilsseite für ``entries``.
 
@@ -1077,12 +1439,20 @@ def build_judge_html(
 
     ``urteile_path`` nennt in der Abschlussmeldung, wohin der Server die
     Urteile schreibt. Ohne Angabe bleibt die Meldung ohne Pfadzeile.
+
+    ``gruppen`` schaltet die gruppierte Ansicht ein. Leer heißt: flache
+    Liste wie bisher - entweder weil es keine ``buendel.json`` gibt oder
+    weil sie die Prüfung nicht besteht. ``rueckfall_grund`` sagt dann im
+    Kopf, welcher der beiden Fälle vorliegt.
     """
     entries_json = json.dumps([_entry_to_js_dict(entry) for entry in entries])
+    gruppen_json = json.dumps([_gruppe_to_js_dict(gruppe) for gruppe in gruppen])
     return (
         _TEMPLATE.replace("__ENTRIES_JSON__", entries_json)
+        .replace("__GRUPPEN_JSON__", gruppen_json)
         .replace("__KRITERIEN_HTML__", _kriterien_html(kriterien_text))
         .replace("__URTEILE_PFAD_HTML__", _urteile_pfad_html(urteile_path))
+        .replace("__RUECKFALL_HTML__", _rueckfall_html(rueckfall_grund))
     )
 
 

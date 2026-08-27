@@ -434,6 +434,11 @@ def test_build_judge_html_is_self_contained_and_embeds_entries() -> None:
     assert "cdn." not in html_text
     assert '"titel": "Titel"' in html_text
     assert "urteile.json" in html_text
+    # Ohne Buendelung bleibt die Seite flach - der Rueckfall ist der
+    # Normalfall fuer jede Aufnahme vor dem 27.8. (Auftrag
+    # urteilsseite-gruppiert). Ohne Grund steht auch kein Hinweis im Kopf.
+    assert "const GRUPPEN = [];" in html_text
+    assert 'id="rueckfall-hinweis"' not in html_text
 
 
 def test_build_judge_html_has_no_external_references() -> None:
