@@ -61,6 +61,42 @@
         }
       },
       "video_name": "2026-08-25 15-14-00"
+    },
+    {
+      "abgelehnt": 27,
+      "angenommen": 42,
+      "im_zielbereich_ja": 33,
+      "im_zielbereich_nein": 9,
+      "kandidaten_gesamt": 69,
+      "kriterien_fassung": "0.8",
+      "laeufe": [
+        1,
+        2
+      ],
+      "lauf": 1,
+      "modell": "unbekannt",
+      "notiz": "",
+      "ohne_urteil": 0,
+      "polarisierend": {
+        "falsch": 26,
+        "wahr": 16
+      },
+      "quote": 0.609,
+      "sicherheit": {
+        "hoch": {
+          "ja": 13,
+          "nein": 8
+        },
+        "mittel": {
+          "ja": 26,
+          "nein": 15
+        },
+        "niedrig": {
+          "ja": 3,
+          "nein": 4
+        }
+      },
+      "video_name": "2026-08-25 15-14-00"
     }
   ],
   "schema_version": "1.0"
