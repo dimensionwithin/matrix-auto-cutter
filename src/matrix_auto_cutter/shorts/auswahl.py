@@ -854,10 +854,13 @@ def lies_kandidaten_rohdaten(pfad: Path) -> tuple[list[dict[str, object]], dict[
         "laeufe": [],
     }
     if isinstance(roh, dict):
-        for feld in ("modell", "kriterien_fassung", "video_name"):
+        for feld in ("kriterien_fassung", "video_name"):
             wert = roh.get(feld)
             if isinstance(wert, str) and wert.strip():
                 wurzelfelder[feld] = wert
+        # ``modell`` nicht wie die uebrigen Felder: fehlt es, tritt ``modelle``
+        # an seine Stelle (siehe :func:`modell_kennung`).
+        wurzelfelder["modell"] = modell_kennung(roh)
         wurzelfelder["lauf"] = roh.get("lauf")
         wurzelfelder["laeufe"] = laeufe_kennung(roh)
     return kandidaten_roh, wurzelfelder
@@ -878,6 +881,47 @@ def laeufe_kennung(wurzel: dict[str, object]) -> list[object]:
         return list(laeufe)
     lauf = wurzel.get("lauf")
     return [] if lauf is None else [lauf]
+
+
+def modell_kennung(wurzel: dict[str, object]) -> str:
+    """Das Modell eines Kandidatensatzes: ``modell``, ersatzweise aus ``modelle``.
+
+    ``fuehre_zusammen`` schreibt seit dem 27. August 2026 beides - das
+    Wurzelfeld ``modell`` und die genauere Abbildung ``modelle`` (Laufnummer
+    -> Modell). Aeltere zusammengefuehrte Dateien tragen nur ``modelle``, und
+    fuer die hiess das Modell bis dahin ueberall ``unbekannt``: im
+    Sicherungsnamen unter ``labels/repeat/`` und im Trefferquote-Eintrag.
+    Hier wird es aus ``modelle`` gebildet - dieselbe Form, die
+    ``fuehre_zusammen`` heute schreibt: die Werte in Laufreihenfolge mit
+    ``+`` verbunden. Fehlt auch ``modelle``, bleibt es bei ``unbekannt``:
+    geraten wird nicht.
+    """
+    wert = wurzel.get("modell")
+    if isinstance(wert, str) and wert.strip():
+        return wert.strip()
+    modelle = wurzel.get("modelle")
+    if not isinstance(modelle, dict) or not modelle:
+        return "unbekannt"
+    namen = [
+        _modellname({"modell": modelle[schluessel]})
+        for schluessel in sorted(modelle, key=_laufschluessel)
+    ]
+    return "+".join(namen)
+
+
+def _laufschluessel(schluessel: object) -> tuple[int, str]:
+    """Ordne Laufnummern numerisch, alles Uebrige danach alphabetisch.
+
+    Die Schluessel von ``modelle`` sind Zeichenketten (``"1"``, ``"2"``, so
+    schreibt es JSON). Alphabetisch sortiert stuende ``"10"`` vor ``"2"`` -
+    bei zehn Laeufen waere die Reihenfolge eine andere als die, die
+    ``fuehre_zusammen`` schreibt.
+    """
+    text = str(schluessel)
+    try:
+        return (int(text), "")
+    except ValueError:
+        return (2**31, text)
 
 
 def trefferquote_eintrag(

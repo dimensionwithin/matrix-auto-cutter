@@ -21,6 +21,7 @@ from typing import Any
 import pytest
 
 from matrix_auto_cutter.shorts import auswahl, urteilslauf
+from matrix_auto_cutter.shorts.candidates import load_candidates
 from matrix_auto_cutter.shorts.judge_server import Urteil, write_urteile
 
 
@@ -68,17 +69,41 @@ _STANDARD_WURZEL: dict[str, object] = {
 }
 
 
+def _ohne_kandidaten(satz: dict[str, object]) -> dict[str, object]:
+    """Die Wurzelfelder ohne die Kandidatenliste - zum Vergleich zweier Baulisten."""
+    return {schluessel: wert for schluessel, wert in satz.items() if schluessel != "kandidaten"}
+
+
 def _baue_aufnahme(
     job_dir: Path,
     *,
     wurzelfelder: dict[str, object] | None = _STANDARD_WURZEL,
     urteile: dict[int, Urteil] | None = None,
+    indizes: list[int] | None = None,
 ) -> Path:
-    """Lege einen vollständigen Auftragsordner an: Kandidaten, Auftrag, Urteile."""
+    """Lege einen vollständigen Auftragsordner an: Kandidaten, Auftrag, Urteile.
+
+    ``indizes`` legt einen Satz mit frei gewählten, nicht lückenlosen
+    Kandidatennummern an - alle angenommen. So sehen die Teilbau-Tests
+    dieselbe Lage wie der echte Bestand, dessen Bauliste bei 1 beginnt und
+    Lücken hat.
+    """
     job_dir.mkdir(parents=True, exist_ok=True)
-    payload: dict[str, object] = {
-        "kandidaten": [_kandidat(0, titel="Erster"), _kandidat(1, titel="Zweiter")]
-    }
+    if indizes is None:
+        kandidaten = [_kandidat(0, titel="Erster"), _kandidat(1, titel="Zweiter")]
+    else:
+        kandidaten = [
+            _kandidat(index, start_ms=index * 20_000, end_ms=index * 20_000 + 10_000)
+            for index in indizes
+        ]
+        if urteile is None:
+            urteile = {
+                index: _urteil(
+                    index, "ja", start_ms=index * 20_000, end_ms=index * 20_000 + 10_000
+                )
+                for index in indizes
+            }
+    payload: dict[str, object] = {"kandidaten": kandidaten}
     payload.update(wurzelfelder or {})
     (job_dir / "kandidaten.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -203,6 +228,61 @@ def test_fehlende_wurzelfelder_geben_unbekannt_im_namen(
     ziel_dir = tmp_path / urteilslauf.SICHERUNG_DIR
     assert (ziel_dir / "urteile-unbekannt-laufunbekannt-unbekannt.json").is_file()
     assert (ziel_dir / "kandidaten-unbekannt-laufunbekannt-unbekannt.json").is_file()
+
+
+def test_nur_modelle_gibt_die_modelle_im_namen_und_in_der_trefferquote(
+    tmp_path: Path, trefferquote_umgebogen: Path
+) -> None:
+    """Aeltere zusammengefuehrte Saetze tragen nur ``modelle`` - das genuegt.
+
+    ``fuehre_zusammen`` schreibt das Wurzelfeld ``modell`` erst seit dem
+    27.8.; davor stand dort nur die Abbildung ``modelle``. Bis dahin hiess
+    das Modell in beiden Verbrauchern ``unbekannt`` - im Sicherungsnamen und
+    im Trefferquote-Eintrag. Gebildet wird es jetzt genauso, wie
+    ``fuehre_zusammen`` es heute schreibt: die Werte in Laufreihenfolge mit
+    ``+`` verbunden.
+    """
+    job_dir = tmp_path / "auftrag"
+    job_path = _baue_aufnahme(
+        job_dir,
+        wurzelfelder={
+            "video_name": "2026-08-21 10-46-08",
+            "lauf": 1,
+            "laeufe": [1, 2],
+            "modelle": {"1": "sonnet", "2": "opus"},
+        },
+    )
+
+    code = urteilslauf.main(
+        [str(job_path), "--kein-server", "--kein-bau", "--wurzel", str(tmp_path)]
+    )
+
+    assert code == 0
+    ziel_dir = tmp_path / urteilslauf.SICHERUNG_DIR
+    assert (ziel_dir / "urteile-2026-08-21 10-46-08-lauf1+2-sonnet+opus.json").is_file()
+    assert (ziel_dir / "kandidaten-2026-08-21 10-46-08-lauf1+2-sonnet+opus.json").is_file()
+    eintraege = json.loads(trefferquote_umgebogen.read_text(encoding="utf-8"))["eintraege"]
+    assert [eintrag["modell"] for eintrag in eintraege] == ["sonnet+opus"]
+
+
+def test_weder_modell_noch_modelle_bleibt_unbekannt(
+    tmp_path: Path, trefferquote_umgebogen: Path
+) -> None:
+    """Geraten wird nicht: fehlt beides, steht ``unbekannt`` da wie bisher."""
+    job_dir = tmp_path / "auftrag"
+    job_path = _baue_aufnahme(
+        job_dir, wurzelfelder={"video_name": "2026-08-21 10-46-08", "lauf": 1}
+    )
+
+    code = urteilslauf.main(
+        [str(job_path), "--kein-server", "--kein-bau", "--wurzel", str(tmp_path)]
+    )
+
+    assert code == 0
+    ziel_dir = tmp_path / urteilslauf.SICHERUNG_DIR
+    assert (ziel_dir / "urteile-2026-08-21 10-46-08-lauf1-unbekannt.json").is_file()
+    eintraege = json.loads(trefferquote_umgebogen.read_text(encoding="utf-8"))["eintraege"]
+    assert [eintrag["modell"] for eintrag in eintraege] == ["unbekannt"]
 
 
 def test_keine_sicherung_laesst_labels_unberuehrt(
@@ -456,31 +536,264 @@ def test_kein_bau_gibt_die_bauzeile_nur_aus(
     assert not bauziel_umgebogen.exists()
 
 
-def test_vorhandener_kandidatenordner_haelt_mit_code_7_an(
+def test_vorhandener_kandidatenordner_wird_nicht_neu_gebaut(
     tmp_path: Path,
     trefferquote_umgebogen: Path,
     bauziel_umgebogen: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``build`` ueberspringt nichts - liegt schon etwas im Ziel, wird nicht gebaut."""
+    """Ersatz fuer den frueheren Code-7-Test: belegtes Ziel haelt nicht mehr an.
 
-    def _kein_prozess(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError("bei belegtem Ziel darf kein Bau starten")
-
-    monkeypatch.setattr(urteilslauf.subprocess, "Popen", _kein_prozess)
+    Bis zum 27.8. hielt ein belegter Zielordner den Lauf mit Code 7 an,
+    weil ``build`` vorhandene Ausgaben nicht ueberspringt. Diese Aufgabe hat
+    jetzt die Teilbauliste: gebaut wird nur, was noch offen ist. Die
+    Zusicherung des Vorgaengers bleibt dieselbe - die vorhandene
+    ``short.mp4`` wird nicht angeruehrt.
+    """
     job_dir = tmp_path / "auftrag"
-    job_path = _baue_aufnahme(job_dir)
+    job_path = _baue_aufnahme(job_dir, urteile=_beide_ja())
     fertig = bauziel_umgebogen / "kandidat-00"
     fertig.mkdir(parents=True)
     (fertig / "short.mp4").write_text("fertiger Short", encoding="utf-8")
 
+    gebaute_listen: list[list[int]] = []
+
+    def _baue_nur_offene(job_path_: Path, bauliste_pfad: Path, ziel_dir: Path) -> int:
+        indizes = urteilslauf.bauliste_indizes(urteilslauf.lies_bauliste(bauliste_pfad))
+        gebaute_listen.append(indizes)
+        for index in indizes:
+            ordner = ziel_dir / f"kandidat-{index:02d}"
+            ordner.mkdir(parents=True, exist_ok=True)
+            (ordner / "short.mp4").write_text("neuer Short", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(urteilslauf, "fuehre_bau_aus", _baue_nur_offene)
+
     code = urteilslauf.main([str(job_path), "--kein-server", "--wurzel", str(tmp_path)])
     ausgabe = capsys.readouterr().out
 
-    assert code == 7
-    assert "ANGEHALTEN [ziel_belegt]" in ausgabe
+    assert code == 0
+    assert "ANGEHALTEN" not in ausgabe
+    assert gebaute_listen == [[1]]
     assert (fertig / "short.mp4").read_text(encoding="utf-8") == "fertiger Short"
+
+
+def test_teilbauliste_traegt_nur_die_offenen_mit_gleichen_indizes(
+    tmp_path: Path,
+    trefferquote_umgebogen: Path,
+    bauziel_umgebogen: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fuenf Eintraege, drei schon gebaut - die Teilbauliste nennt genau die zwei offenen.
+
+    Die ``index``-Werte bleiben unveraendert: ``build`` bildet daraus die
+    Ordnernamen, und eine Neunummerierung schriebe den Teilbau in die Ordner
+    der schon gebauten Shorts.
+    """
+    job_dir = tmp_path / "auftrag"
+    job_path = _baue_aufnahme(job_dir, indizes=[1, 4, 7, 12, 25])
+    for index in (4, 12, 25):
+        ordner = bauziel_umgebogen / f"kandidat-{index:02d}"
+        ordner.mkdir(parents=True)
+        (ordner / "short.mp4").write_text("fertig", encoding="utf-8")
+
+    gesehen: list[dict[str, object]] = []
+
+    def _merke_bauliste(job_path_: Path, bauliste_pfad: Path, ziel_dir: Path) -> int:
+        gesehen.append(urteilslauf.lies_bauliste(bauliste_pfad))
+        for index in (1, 7):
+            ordner = ziel_dir / f"kandidat-{index:02d}"
+            ordner.mkdir(parents=True, exist_ok=True)
+            (ordner / "short.mp4").write_text("neu", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(urteilslauf, "fuehre_bau_aus", _merke_bauliste)
+
+    code = urteilslauf.main([str(job_path), "--kein-server", "--wurzel", str(tmp_path)])
+
+    assert code == 0
+    teil = json.loads((job_dir / urteilslauf.TEILBAULISTE_FILE_NAME).read_text(encoding="utf-8"))
+    assert urteilslauf.bauliste_indizes(teil) == [1, 7]
+    assert gesehen and urteilslauf.bauliste_indizes(gesehen[0]) == [1, 7]
+    # Dieselbe Wurzel wie die Bauliste - nur die Kandidatenliste ist kuerzer.
+    bauliste = json.loads((job_dir / auswahl.BAULISTE_FILE_NAME).read_text(encoding="utf-8"))
+    assert _ohne_kandidaten(teil) == _ohne_kandidaten(bauliste)
+
+
+def test_verweis_auf_einen_schon_gebauten_kandidaten_faellt_weg(
+    tmp_path: Path,
+    trefferquote_umgebogen: Path,
+    bauziel_umgebogen: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Der Fall, an dem der erste echte Teilbau abbrach.
+
+    ``parse_candidates`` weist einen ``enthaelt``-Verweis auf einen
+    unbekannten Index zurueck. In der Teilbauliste fehlen die schon
+    gebauten Kandidaten - ein Verweis auf einen von ihnen liesse ``build``
+    mit ``candidates_unreadable`` anhalten, bevor er den ersten Short
+    anfasst. Genau das geschah am 27.8. mit Kandidat 67, der auf den
+    bereits gebauten 36 verweist.
+    """
+    job_dir = tmp_path / "auftrag"
+    job_path = _baue_aufnahme(job_dir, indizes=[4, 7])
+    kandidaten_pfad = job_dir / "kandidaten.json"
+    satz = json.loads(kandidaten_pfad.read_text(encoding="utf-8"))
+    satz["kandidaten"][1]["enthaelt"] = [4]
+    kandidaten_pfad.write_text(json.dumps(satz, ensure_ascii=False, indent=2), encoding="utf-8")
+    fertig = bauziel_umgebogen / "kandidat-04"
+    fertig.mkdir(parents=True)
+    (fertig / "short.mp4").write_text("fertig", encoding="utf-8")
+
+    def _baue_offene(job_path_: Path, bauliste_pfad: Path, ziel_dir: Path) -> int:
+        # So streng wie build: eine unlesbare Kandidatenliste haelt an.
+        load_candidates(bauliste_pfad)
+        ordner = ziel_dir / "kandidat-07"
+        ordner.mkdir(parents=True, exist_ok=True)
+        (ordner / "short.mp4").write_text("neu", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(urteilslauf, "fuehre_bau_aus", _baue_offene)
+
+    code = urteilslauf.main([str(job_path), "--kein-server", "--wurzel", str(tmp_path)])
+
+    assert code == 0
+    teil = json.loads((job_dir / urteilslauf.TEILBAULISTE_FILE_NAME).read_text(encoding="utf-8"))
+    assert urteilslauf.bauliste_indizes(teil) == [7]
+    assert teil["kandidaten"][0]["enthaelt"] == []
+    # Die Bauliste selbst behaelt ihren Verweis - gekuerzt wird nur die Kopie.
+    bauliste = json.loads((job_dir / auswahl.BAULISTE_FILE_NAME).read_text(encoding="utf-8"))
+    assert [eintrag["enthaelt"] for eintrag in bauliste["kandidaten"]] == [[], [4]]
+
+
+def test_alles_gebaut_baut_nichts_und_endet_mit_null(
+    tmp_path: Path,
+    trefferquote_umgebogen: Path,
+    bauziel_umgebogen: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Kein offener Kandidat heisst kein Bau - und kein Fehlschlag."""
+
+    def _kein_bau(job_path_: Path, bauliste_pfad: Path, ziel_dir: Path) -> int:
+        raise AssertionError("ist alles gebaut, darf kein Bau starten")
+
+    monkeypatch.setattr(urteilslauf, "fuehre_bau_aus", _kein_bau)
+    job_dir = tmp_path / "auftrag"
+    job_path = _baue_aufnahme(job_dir, urteile=_beide_ja())
+    for index in (0, 1):
+        ordner = bauziel_umgebogen / f"kandidat-{index:02d}"
+        ordner.mkdir(parents=True)
+        (ordner / "short.mp4").write_text("fertig", encoding="utf-8")
+
+    code = urteilslauf.main([str(job_path), "--kein-server", "--wurzel", str(tmp_path)])
+    ausgabe = capsys.readouterr().out
+
+    assert code == 0
+    assert "ist bereits gebaut - nichts zu tun" in ausgabe
+    assert "0 neu gebaut, 2 insgesamt" in ausgabe
+    assert not (job_dir / urteilslauf.TEILBAULISTE_FILE_NAME).exists()
+
+
+def test_ordner_ohne_short_gilt_als_offen(
+    tmp_path: Path,
+    trefferquote_umgebogen: Path,
+    bauziel_umgebogen: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Der Ordner allein ist kein Nachweis - erst die ``short.mp4`` ist einer.
+
+    Ein abgebrochener Bau laesst ``kandidat-NN`` mit Zwischenstufen zurueck.
+    Zaehlte der Ordner als fertig, fiele dieser Kandidat still aus dem
+    Teilbau heraus und fehlte am Ende, ohne dass es jemand meldet. Geloescht
+    wird der Ordner nicht - ``build`` schreibt hinein.
+    """
+    job_dir = tmp_path / "auftrag"
+    job_path = _baue_aufnahme(job_dir, urteile=_beide_ja())
+    unfertig = bauziel_umgebogen / "kandidat-00"
+    unfertig.mkdir(parents=True)
+    (unfertig / "avatar-cut.mp4").write_text("Zwischenstufe", encoding="utf-8")
+
+    def _baue_offene(job_path_: Path, bauliste_pfad: Path, ziel_dir: Path) -> int:
+        for index in urteilslauf.bauliste_indizes(urteilslauf.lies_bauliste(bauliste_pfad)):
+            ordner = ziel_dir / f"kandidat-{index:02d}"
+            ordner.mkdir(parents=True, exist_ok=True)
+            (ordner / "short.mp4").write_text("Short", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(urteilslauf, "fuehre_bau_aus", _baue_offene)
+
+    code = urteilslauf.main([str(job_path), "--kein-server", "--wurzel", str(tmp_path)])
+
+    assert code == 0
+    teil = json.loads((job_dir / urteilslauf.TEILBAULISTE_FILE_NAME).read_text(encoding="utf-8"))
+    assert urteilslauf.bauliste_indizes(teil) == [0, 1]
+    assert (unfertig / "avatar-cut.mp4").read_text(encoding="utf-8") == "Zwischenstufe"
+
+
+def test_weniger_neue_shorts_als_offene_eintraege_ist_code_8(
+    tmp_path: Path,
+    trefferquote_umgebogen: Path,
+    bauziel_umgebogen: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gezaehlt wird der ZUWACHS, nicht der Bestand.
+
+    Ein schon vorhandener Short darf einen ausgefallenen Teilbau nicht
+    ausgleichen: zwei offene Eintraege, nur einer neu gebaut - Code 8,
+    obwohl danach zwei ``short.mp4`` im Ziel liegen.
+    """
+    job_dir = tmp_path / "auftrag"
+    job_path = _baue_aufnahme(job_dir, indizes=[1, 4, 7])
+    fertig = bauziel_umgebogen / "kandidat-01"
+    fertig.mkdir(parents=True)
+    (fertig / "short.mp4").write_text("fertig", encoding="utf-8")
+
+    def _halber_teilbau(job_path_: Path, bauliste_pfad: Path, ziel_dir: Path) -> int:
+        ordner = ziel_dir / "kandidat-04"
+        ordner.mkdir(parents=True, exist_ok=True)
+        (ordner / "short.mp4").write_text("ein Short", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(urteilslauf, "fuehre_bau_aus", _halber_teilbau)
+
+    code = urteilslauf.main([str(job_path), "--kein-server", "--wurzel", str(tmp_path)])
+    zeilen = capsys.readouterr().out.splitlines()
+
+    assert code == 8
+    assert "ANGEHALTEN [bau_unvollstaendig]: 1 neue short.mp4 statt 2 - " in zeilen[-1]
+
+
+def test_nur_offene_zeigen_baut_nichts(
+    tmp_path: Path,
+    trefferquote_umgebogen: Path,
+    bauziel_umgebogen: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Die Fahne nennt die offenen Indizes - und ruehrt weder Ziel noch Teilbauliste an."""
+
+    def _kein_prozess(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("mit --nur-offene-zeigen darf kein Prozess starten")
+
+    monkeypatch.setattr(urteilslauf.subprocess, "Popen", _kein_prozess)
+    job_dir = tmp_path / "auftrag"
+    job_path = _baue_aufnahme(job_dir, indizes=[1, 4, 7])
+    fertig = bauziel_umgebogen / "kandidat-04"
+    fertig.mkdir(parents=True)
+    (fertig / "short.mp4").write_text("fertig", encoding="utf-8")
+
+    code = urteilslauf.main(
+        [str(job_path), "--kein-server", "--nur-offene-zeigen", "--wurzel", str(tmp_path)]
+    )
+    ausgabe = capsys.readouterr().out
+
+    assert code == 0
+    assert "  offene Indizes (2): 1, 7" in ausgabe
+    assert not (job_dir / urteilslauf.TEILBAULISTE_FILE_NAME).exists()
+    assert sorted(eintrag.name for eintrag in bauziel_umgebogen.iterdir()) == ["kandidat-04"]
 
 
 def test_weniger_shorts_als_baulisteneintraege_ist_code_8(
@@ -510,8 +823,11 @@ def test_weniger_shorts_als_baulisteneintraege_ist_code_8(
     zeilen = capsys.readouterr().out.splitlines()
 
     assert code == 8
-    assert any(zeile.startswith("Fertig: ") and " 1 von 2 Shorts in " in zeile for zeile in zeilen)
-    assert "ANGEHALTEN [bau_unvollstaendig]: 1 short.mp4 statt 2 - " in zeilen[-1]
+    assert any(
+        zeile.startswith("Fertig: ") and " 1 von 2 offenen Shorts neu gebaut " in zeile
+        for zeile in zeilen
+    )
+    assert "ANGEHALTEN [bau_unvollstaendig]: 1 neue short.mp4 statt 2 - " in zeilen[-1]
 
 
 def test_vollstaendiger_bau_endet_mit_code_0(
@@ -538,8 +854,8 @@ def test_vollstaendiger_bau_endet_mit_code_0(
     zeilen = capsys.readouterr().out.splitlines()
 
     assert code == 0
-    assert zeilen[-1].startswith(f"Fertig: {bauziel_umgebogen} - 2 von 2 Shorts in ")
-    assert zeilen[-1].endswith(" s")
+    assert zeilen[-1].startswith(f"Fertig: {bauziel_umgebogen} - 2 von 2 offenen Shorts neu ")
+    assert zeilen[-1].endswith(", 2 insgesamt im Zielordner")
 
 
 # --------------------------------------------------------------------------

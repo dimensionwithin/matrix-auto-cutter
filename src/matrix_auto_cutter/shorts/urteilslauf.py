@@ -20,6 +20,15 @@ am 14.8. kostete ein ueberschreibender Probelauf schon einmal einen
 echten Urteilsstand (siehe ``judge_server``, sitzungseigene
 Urteilsdatei).
 
+Der Bau ist ein TEILBAU: ``build`` ueberspringt vorhandene Ausgaben nicht,
+deshalb ermittelt Schritt 7 vorher, zu welchen Indizes der Bauliste im
+Zielordner schon eine ``short.mp4`` liegt, und laesst nur den Rest bauen
+(``bauliste-offen.json``, siehe :func:`offene_indizes`). Bis zum 27.8. hielt
+ein belegter Zielordner den Lauf stattdessen mit Code 7 an - dieser Code ist
+ersatzlos entfallen. Gezaehlt wird danach der ZUWACHS an ``short.mp4``, nicht
+der Bestand: im Ziel koennen Shorts liegen, die eine aeltere Auswahl gebaut
+hat und die diese Bauliste gar nicht mehr nennt.
+
 Zu Strg+C siehe :func:`starte_urteilsseite`.
 """
 
@@ -67,7 +76,9 @@ _CODE_NUR_VERFALLEN = 2
 _CODE_AUFTRAG_UNLESBAR = 2
 _CODE_URTEILE_ABWEICHUNG = 5
 _CODE_SICHERUNG_FEHLGESCHLAGEN = 6
-_CODE_ZIEL_BELEGT = 7
+# Code 7 (ziel_belegt) ist ersatzlos entfallen: ein belegter Zielordner haelt
+# den Lauf nicht mehr an, sondern schraenkt ihn auf die offenen Kandidaten ein
+# (Teilbau, siehe :func:`offene_indizes`).
 _CODE_BAU_UNVOLLSTAENDIG = 8
 
 _BEENDE_FRIST_SEKUNDEN = 5.0
@@ -77,6 +88,7 @@ _PLATZHALTER_SEKUNDEN = 4.0
 _ABBRUCH_SIGNALE = ("SIGINT", "SIGBREAK")
 _KANDIDATENORDNER = re.compile(r"kandidat-\d+")
 _SHORT_NAME = "short.mp4"
+TEILBAULISTE_FILE_NAME = "bauliste-offen.json"
 
 
 def alter_stunden(name: str, jetzt: datetime | None = None) -> float | None:
@@ -341,10 +353,14 @@ def sicherungsnamen(kandidaten_wurzel: dict[str, object]) -> tuple[str, str]:
     ``…-lauf1+2-sonnet+opus.json``. Fehlt eines der Felder ``video_name``,
     ``laeufe``/``lauf``, ``modell``, steht an seiner Stelle ``unbekannt`` -
     ein unvollstaendig benannter Beleg ist besser als gar keiner.
+
+    Fuer ``modell`` gilt das erst, wenn auch ``modelle`` fehlt: aeltere
+    zusammengefuehrte Kandidatendateien tragen nur die Abbildung, und
+    ``auswahl.modell_kennung`` bildet den Namen daraus.
     """
     video_name = _namensteil(kandidaten_wurzel, "video_name")
     lauf = _laufteil(kandidaten_wurzel)
-    modell = _namensteil(kandidaten_wurzel, "modell")
+    modell = auswahl.modell_kennung(kandidaten_wurzel)
     kern = f"{video_name}-lauf{lauf}-{modell}"
     return f"urteile-{kern}.json", f"kandidaten-{kern}.json"
 
@@ -482,6 +498,98 @@ def zaehle_baulisteneintraege(bauliste_pfad: Path) -> int:
     return len(eintraege) if isinstance(eintraege, list) else 0
 
 
+def lies_bauliste(bauliste_pfad: Path) -> dict[str, object]:
+    """Die Bauliste als rohes Woerterbuch - leer, wenn sie fehlt oder unlesbar ist.
+
+    Roh gelesen und nicht ueber ``load_candidates``, weil die Teilbauliste
+    die WURZEL der Bauliste unveraendert weiterreichen soll: ``stammt_aus``,
+    ``urteile_aus`` und die Zaehlungen gehoeren zur Herkunft des Satzes und
+    nicht zum Kandidaten-Kontrakt.
+    """
+    try:
+        roh = json.loads(bauliste_pfad.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return roh if isinstance(roh, dict) else {}
+
+
+def bauliste_indizes(bauliste: dict[str, object]) -> list[int]:
+    """Die Indizes der Bauliste in ihrer Reihenfolge - unveraendert, nicht neu vergeben."""
+    eintraege = bauliste.get("kandidaten")
+    if not isinstance(eintraege, list):
+        return []
+    return [
+        eintrag["index"]
+        for eintrag in eintraege
+        if isinstance(eintrag, dict) and isinstance(eintrag.get("index"), int)
+    ]
+
+
+def ist_gebaut(ziel_dir: Path, index: int) -> bool:
+    """Sage, ob zu diesem Index bereits eine ``short.mp4`` im Ziel liegt.
+
+    Der Ordner allein zaehlt nicht: ein abgebrochener Bau laesst
+    ``kandidat-NN`` mit Zwischenstufen zurueck, aber ohne Ergebnis. Erst die
+    ``short.mp4`` ist der Nachweis, und nur sie schuetzt vor dem Neubau.
+    """
+    return (ziel_dir / f"kandidat-{index:02d}" / _SHORT_NAME).is_file()
+
+
+def offene_indizes(bauliste: dict[str, object], ziel_dir: Path) -> list[int]:
+    """Die Indizes der Bauliste, zu denen im Ziel noch keine ``short.mp4`` liegt.
+
+    Ein vorhandener Ordner OHNE ``short.mp4`` gilt als unfertig und bleibt
+    offen - geloescht wird er nicht, ``build`` schreibt in ihn hinein.
+    """
+    return [index for index in bauliste_indizes(bauliste) if not ist_gebaut(ziel_dir, index)]
+
+
+def baue_teilbauliste(bauliste: dict[str, object], offene: Sequence[int]) -> dict[str, object]:
+    """Dieselbe Wurzel wie die Bauliste, nur die offenen Kandidaten.
+
+    Die ``index``-Werte bleiben UNVERAENDERT: ``build`` bildet daraus die
+    Ordnernamen (``kandidat-{index:02d}``), und eine Neunummerierung
+    schriebe die Teilbauten in die Ordner der schon gebauten.
+
+    Ein ``enthaelt``-Verweis auf einen Kandidaten, der in der Teilliste
+    fehlt, faellt WEG. Das ist keine Kosmetik: ``parse_candidates`` weist
+    einen Verweis auf einen unbekannten Index zurueck, und der erste echte
+    Teilbau vom 27.8. brach genau daran ab - Kandidat 67 verweist auf 36,
+    und 36 war bereits gebaut. ``enthaelt`` ist eine Zusatzangabe fuer die
+    Gruppierung auf der Urteilsseite, kein Pflichtfeld des Baus; ein
+    fehlender Verweis behauptet nichts, ein falscher behauptet etwas. Die
+    Bauliste selbst bleibt davon unberuehrt - gekuerzt wird nur die Kopie.
+    """
+    offen_satz = set(offene)
+    eintraege = bauliste.get("kandidaten")
+    gefiltert: list[dict[str, object]] = []
+    for eintrag in eintraege if isinstance(eintraege, list) else []:
+        if not isinstance(eintrag, dict) or eintrag.get("index") not in offen_satz:
+            continue
+        kopie = dict(eintrag)
+        verweise = kopie.get("enthaelt")
+        if isinstance(verweise, list):
+            kopie["enthaelt"] = [
+                verweis
+                for verweis in verweise
+                if not isinstance(verweis, bool) and verweis in offen_satz
+            ]
+        gefiltert.append(kopie)
+    teil = dict(bauliste)
+    teil["kandidaten"] = gefiltert
+    return teil
+
+
+def schreibe_teilbauliste(pfad: Path, teil: dict[str, object]) -> Path:
+    """Schreibe die Teilbauliste neben die Bauliste - dasselbe Format wie ``auswahl``."""
+    pfad.parent.mkdir(parents=True, exist_ok=True)
+    pfad.write_text(
+        json.dumps(teil, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return pfad
+
+
 def zaehle_shorts(ziel_dir: Path) -> int:
     """Wie viele ``short.mp4`` unter den Kandidatenordnern liegen.
 
@@ -538,6 +646,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         help=(
             "Schritt 7 gibt die Bauzeile nur aus, statt sie auszufuehren - fuer Aufnahmen, "
             "deren Shorts bereits gebaut sind."
+        ),
+    )
+    parser.add_argument(
+        "--nur-offene-zeigen",
+        action="store_true",
+        help=(
+            "Schritt 7 nennt nur die Indizes, zu denen im Zielordner noch keine "
+            "short.mp4 liegt, und baut nichts."
         ),
     )
     parser.add_argument("--wurzel", type=Path, default=None)
@@ -706,32 +822,53 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not bauliste_pfad.is_file():
         print(f"ANGEHALTEN [bau_unvollstaendig]: {bauliste_pfad} fehlt - nichts zu bauen")
         return _CODE_BAU_UNVOLLSTAENDIG
-    belegt = vorhandene_kandidatenordner(ziel_dir)
-    if belegt:
-        print(
-            f"ANGEHALTEN [ziel_belegt]: {ziel_dir} enthaelt bereits "
-            f"{len(belegt)} Kandidatenordner ({belegt[0]} ...)"
-        )
-        print("  build ueberspringt vorhandene Ausgaben nicht und baute Fertiges neu.")
-        print("  Nichts angefasst. Zielordner leeren oder umbenennen, dann erneut starten.")
-        return _CODE_ZIEL_BELEGT
-    erwartet = zaehle_baulisteneintraege(bauliste_pfad)
-    print(f"  {erwartet} Eintrag/Eintraege in der Bauliste")
+    bauliste = lies_bauliste(bauliste_pfad)
+    alle = bauliste_indizes(bauliste)
+    offene = offene_indizes(bauliste, ziel_dir)
+    vorher = zaehle_shorts(ziel_dir)
+    print(f"  {len(alle)} Eintrag/Eintraege in der Bauliste, davon {len(offene)} offene")
+    if vorher:
+        print(f"  {vorher} {_SHORT_NAME} liegen bereits im Zielordner - sie bleiben unberuehrt")
+    if args.nur_offene_zeigen:
+        print("  --nur-offene-zeigen: es wird nichts gebaut")
+        print(f"  offene Indizes ({len(offene)}): {', '.join(str(index) for index in offene)}")
+        return _CODE_ERFOLG
+    if not offene:
+        print("Fertig: jeder Kandidat der Bauliste ist bereits gebaut - nichts zu tun")
+        print(f"  0 neu gebaut, {vorher} insgesamt in {ziel_dir}")
+        return _CODE_ERFOLG
+    print(f"  offene Indizes: {', '.join(str(index) for index in offene)}")
+    teilbauliste_pfad = job_dir / TEILBAULISTE_FILE_NAME
+    try:
+        schreibe_teilbauliste(teilbauliste_pfad, baue_teilbauliste(bauliste, offene))
+    except OSError as exc:
+        print(f"ANGEHALTEN [bau_unvollstaendig]: {teilbauliste_pfad} nicht schreibbar: {exc}")
+        return _CODE_BAU_UNVOLLSTAENDIG
+    print(f"  Teilbauliste: {teilbauliste_pfad}")
+    erwartet = zaehle_baulisteneintraege(teilbauliste_pfad)
     try:
         ziel_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         print(f"ANGEHALTEN [bau_unvollstaendig]: {ziel_dir} nicht anlegbar: {exc}")
         return _CODE_BAU_UNVOLLSTAENDIG
     begonnen = time.monotonic()
-    bau_code = fuehre_bau_aus(job_path, bauliste_pfad, ziel_dir)
+    bau_code = fuehre_bau_aus(job_path, teilbauliste_pfad, ziel_dir)
     dauer = time.monotonic() - begonnen
-    gebaut = zaehle_shorts(ziel_dir)
+    gesamt_nachher = zaehle_shorts(ziel_dir)
+    # Gezaehlt wird der ZUWACHS, nicht der Bestand: im Zielordner koennen
+    # ``short.mp4`` liegen, die diese Bauliste gar nicht nennt (eine aeltere
+    # Auswahl hat sie gebaut). Gegen den Bestand geprueft schluege der Bau
+    # deswegen fehl, obwohl er alles Offene gebaut hat.
+    neu_gebaut = gesamt_nachher - vorher
     print(f"  build endete mit Rueckgabecode {bau_code}")
-    print(f"Fertig: {ziel_dir} - {gebaut} von {erwartet} Shorts in {dauer:.1f} s")
-    if gebaut != erwartet:
+    print(
+        f"Fertig: {ziel_dir} - {neu_gebaut} von {erwartet} offenen Shorts neu gebaut "
+        f"in {dauer:.1f} s, {gesamt_nachher} insgesamt im Zielordner"
+    )
+    if neu_gebaut != erwartet:
         print(
-            f"ANGEHALTEN [bau_unvollstaendig]: {gebaut} {_SHORT_NAME} statt {erwartet} - "
-            "der Rueckgabecode von build zaehlt dafuer nicht"
+            f"ANGEHALTEN [bau_unvollstaendig]: {neu_gebaut} neue {_SHORT_NAME} statt "
+            f"{erwartet} - der Rueckgabecode von build zaehlt dafuer nicht"
         )
         return _CODE_BAU_UNVOLLSTAENDIG
     return _CODE_ERFOLG
