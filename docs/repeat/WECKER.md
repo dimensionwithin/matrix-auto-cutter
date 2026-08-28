@@ -62,12 +62,38 @@ Lauf einmal ausfaellt, faengt ihn die naechste Nacht noch auf.
 
 ## 2. Einrichten
 
-Diesen Befehl fuehrst **du** aus, in einer PowerShell **als
-Administrator** (wegen `/RL HIGHEST`):
+Diesen Befehl fuehrst **du** aus, als **Administrator** (wegen
+`/RL HIGHEST`). Es gibt ihn in zwei Fassungen -- **welche du brauchst,
+haengt an der Schale**, in der du ihn eintippst.
+
+**Fassung fuer die Eingabeaufforderung (`cmd.exe`):**
 
 ```bash
 schtasks /Create /TN "Shorts-Kette naechtlich" /TR "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"P:\DimensionWithin-MatrixMarketAutoEditor\scripts\START-SHORTS-KETTE.ps1\"" /SC DAILY /ST 03:00 /RL HIGHEST /F
 ```
+
+**In einer PowerShell scheitert genau dieser Befehl** mit
+
+```
+FEHLER: Ungueltige Syntax. Erforderliche Option sc fehlt.
+```
+
+Die Ursache: PowerShell zerlegt die maskierten Anfuehrungszeichen
+(`\"`) im Wert von `/TR` anders als die Eingabeaufforderung, und
+`schtasks` bekommt am Ende nicht die Argumente, die dastehen. Der
+Befehl ist nicht falsch -- er ist fuer `cmd.exe` geschrieben.
+
+**Fassung fuer PowerShell.** Die Argumente werden als Liste uebergeben;
+dann setzt PowerShell sie selbst richtig zusammen, und es braucht keine
+Maskierung:
+
+```powershell
+$aufruf = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "P:\DimensionWithin-MatrixMarketAutoEditor\scripts\START-SHORTS-KETTE.ps1"'
+schtasks.exe @('/Create','/TN','Shorts-Kette naechtlich','/TR',$aufruf,'/SC','DAILY','/ST','03:00','/RL','HIGHEST','/F')
+```
+
+Gleichwertig ist, denselben Befehl der ersten Fassung ueber `cmd /c` zu
+schicken -- dann liest ihn die Schale, fuer die er geschrieben ist.
 
 Jeder Schalter, der Reihe nach:
 
@@ -89,6 +115,39 @@ Aufgabe ihn weckt. Das kann `schtasks` nicht; setze es hinterher in der
 grafischen Aufgabenplanung (`taskschd.msc`), Eigenschaften der Aufgabe,
 Reiter *Bedingungen*, Haken bei *Computer zum Ausfuehren dieser Aufgabe
 reaktivieren*.
+
+### Die Anmeldeart: es bleibt bei „Nur interaktiv"
+
+Im Reiter *Allgemein* steht die Wahl zwischen *Nur ausfuehren, wenn der
+Benutzer angemeldet ist* und *Unabhaengig von der Benutzeranmeldung
+ausfuehren*. Die zweite Einstellung verlangt beim Speichern das
+**Windows-Passwort**.
+
+**Bei einer Anmeldung ueber ein Microsoft-Konto ist das nicht die PIN.**
+Der Versuch am 28.8. schlug daran fehl.
+
+**Entschieden: es bleibt bei „Nur interaktiv".** Das genuegt fuer diesen
+Zweck -- der Rechner darf **gesperrt** sein, nur nicht **abgemeldet**.
+Wer nachts abmeldet, den Benutzer wechselt oder herunterfaehrt, bekommt
+keinen Lauf; erkennbar daran, dass unter
+`artefakte\repeat\kette-protokoll\` fuer die Nacht gar keine Datei
+liegt (Abschnitt 4).
+
+### Die Energieverwaltung muss aus dem Weg
+
+Die Aufgabenplanung unterbindet einen Lauf sonst stillschweigend. Vier
+Einstellungen, am 28.8. per PowerShell gesetzt:
+
+| Einstellung | Wert | Wirkung |
+| --- | --- | --- |
+| `DisallowStartIfOnBatteries` | `false` | startet auch im Akkubetrieb |
+| `StopIfGoingOnBatteries` | `false` | bricht nicht ab, wenn der Strom waehrend des Laufs ausfaellt |
+| `StartWhenAvailable` | `true` | holt einen versaeumten Lauf nach |
+| `WakeToRun` | `true` | weckt den Rechner (dasselbe wie der Haken oben) |
+
+Die beiden Batteriehaken sind die **Vorgabe** der Aufgabenplanung. Wer
+sie stehen laesst, bekommt auf einem Geraet im Akkubetrieb keinen Lauf
+und keine Fehlermeldung.
 
 ---
 
