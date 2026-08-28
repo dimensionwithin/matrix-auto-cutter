@@ -686,3 +686,47 @@ als flatterhaft. **Nachgesehen wurde er weiterhin nie**; ob er einen echten
 Fehler verdeckt, ist **nicht belegt**. Dateien unter `labels\repeat\` liegen im
 Repository mit LF, im Arbeitsbaum mit CRLF — wer einen Hash notiert, schreibt
 dazu, von welcher Seite er ihn genommen hat.
+
+---
+
+## 8 — Das naechste Vorhaben: eine Oberflaeche
+
+Der Auftraggeber hat am 28.8. entschieden, als Naechstes eine
+Oberflaeche zu bauen, nicht die Uploadstufe. Begruendung in seinen
+Worten: ohne eine Ansicht, in der er die Kette ueberwachen und
+Fehler einsehen kann, hat er keinen Ueberblick ueber den Prozess --
+und ohne den kann er die Linie auch nicht sinnvoll im Betrieb
+einfahren.
+
+Was sie zeigen soll:
+
+- Welche Aufnahme gerade verarbeitet wurde, und von welchem TAG sie
+  stammt. Dazu das heutige Datum, damit sich beides zuordnen laesst.
+- Welcher Schritt gerade laeuft. Ausdruecklich als Hilfe beim Testen
+  genannt.
+- Ein Fenster fuer Fehler: was schiefgelaufen ist, sichtbar an einer
+  Stelle, statt in den Protokollen gesucht werden zu muessen. Von
+  dort aus soll der Weg in die Protokolle kurz sein.
+
+Was sie koennen soll:
+
+- Die Kette von Hand anstossen. Die Kette laeuft nachts von selbst;
+  fuer einen Lauf ausser der Reihe braucht es einen Weg ueber die
+  Oberflaeche.
+- Ein Symbol auf dem Bildschirm, ueber das sich die Oberflaeche
+  starten laesst.
+
+Was der naechste Orchestrator zuerst tun sollte: einen rein lesenden
+Erkundungsauftrag. Der bisherige Orchestrator hat das bestehende
+Interface des Cutters NIE GESEHEN und kennt es nur aus Dokumenten.
+Zu klaeren ist, wie es gebaut ist, was sich uebernehmen laesst, und
+wo eine Shorts-Ansicht andocken kann, ohne `product_runner.py` und
+`review_app.py` zu beruehren -- beide stehen auf der Sperrliste.
+Erst danach ein Bauauftrag.
+
+Die Datenlage ist guenstig: `kette.json` traegt je Aufnahme den
+Stand jeder Stufe mit Zeitstempel und Dauer, die Protokolle unter
+`artefakte\repeat\kette-protokoll\` je Lauf eine Zeile mit
+Zeitstempel und am Ende eine Zusammenfassung, `buendel.json` die
+Gruppen, `trefferquote.json` die Reihe der Messungen. Eine
+Oberflaeche muesste nichts davon neu erzeugen, sondern nur lesen.
